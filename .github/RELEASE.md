@@ -39,7 +39,9 @@ sweety-{os}-{arch}[-{libc}][.exe]
 ## 构建矩阵
 
 - **build-primary**：发版必需；全部成功才会创建 Release。
-- **build-secondary**：`ppc64le`、`s390x`、`loong64`、`netbsd`；`continue-on-error`，失败不阻断发版。
+- **build-secondary**：`ppc64le`、`s390x`、`netbsd`；`continue-on-error`，失败不阻断发版。
+
+未纳入 CI 的平台（需自备工具链或 cross 镜像）：`loongarch64`、`freebsd-aarch64` 等。
 
 本地与 CI 共用 [.github/actions/build-release](actions/build-release/action.yml)。
 

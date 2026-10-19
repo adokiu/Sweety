@@ -82,10 +82,6 @@ jobs:
             target: x86_64-unknown-freebsd
             artifact: sweety-freebsd-amd64
             cross: true
-          - os: ubuntu-24.04
-            target: aarch64-unknown-freebsd
-            artifact: sweety-freebsd-aarch64
-            cross: true
 
           # Windows
           - os: windows-latest
@@ -140,9 +136,6 @@ jobs:
             cross: true
           - target: s390x-unknown-linux-gnu
             artifact: sweety-linux-s390x-gnu
-            cross: true
-          - target: loongarch64-unknown-linux-gnu
-            artifact: sweety-linux-loong64-gnu
             cross: true
           - target: x86_64-unknown-netbsd
             artifact: sweety-netbsd-amd64
@@ -290,7 +283,7 @@ jobs:
               echo "**Full Changelog**: https://github.com/${{ github.repository }}/commits/${TAG}"
             fi
             echo
-            echo "扩展架构（ppc64le / s390x / loong64 / netbsd）在 **build-secondary** 中尽力构建，可能未出现在 Assets 中。"
+            echo "扩展架构（ppc64le / s390x / netbsd）在 **build-secondary** 中尽力构建，可能未出现在 Assets 中。"
           } > "$BODY_FILE"
           echo "path=$BODY_FILE" >> "$GITHUB_OUTPUT"
 

@@ -118,10 +118,10 @@ mod inner {
             #[cfg(target_endian = "big")]
             {
                 Self {
-                    heap: Heap {
+                    heap: ManuallyDrop::new(Heap {
                         ptr: NonNull::dangling(),
                         len: 0,
-                    },
+                    }),
                 }
             }
         }
