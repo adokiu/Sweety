@@ -29,7 +29,7 @@ quinn        = { version = "0.11", default-features = false, features = ["rustls
 
 [package]
 name        = "sweety"
-version     = "0.2.7"
+version     = "0.2.8"
 edition     = "2021"
 description = "A high-performance, single-binary, multi-site web server.  "
 license     = "Apache-2.0"

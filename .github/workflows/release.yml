@@ -159,6 +159,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -183,10 +185,73 @@ jobs:
           if [[ "$TAG" == pre-* ]]; then
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
             echo "name=Pre-release $TAG" >> "$GITHUB_OUTPUT"
+            echo "version=${TAG#pre-}" >> "$GITHUB_OUTPUT"
+          elif [[ "$TAG" == v* ]]; then
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "name=Release $TAG" >> "$GITHUB_OUTPUT"
+            echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
           else
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
             echo "name=Release $TAG" >> "$GITHUB_OUTPUT"
+            echo "version=$TAG" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Build release notes (CHANGELOG + compare)
+        id: notes
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          mapfile -t tags < <(git tag -l 'pre-*' 'v*' --sort=-v:refname)
+          PREV=""
+          for i in "${!tags[@]}"; do
+            if [[ "${tags[$i]}" == "$TAG" ]] && (( i + 1 < ${#tags[@]} )); then
+              PREV="${tags[$i + 1]}"
+              break
+            fi
+          done
+
+          SECTION_FILE="$RUNNER_TEMP/changelog-section.md"
+          : > "$SECTION_FILE"
+          if [[ -f CHANGELOG.md ]]; then
+            awk -v ver="$VERSION" '
+              BEGIN { found=0 }
+              /^## \[/ {
+                if (found) { exit }
+                if ($0 ~ "\\[" ver "\\]") { found=1; next }
+              }
+              found { print }
+            ' CHANGELOG.md > "$SECTION_FILE"
+          fi
+
+          BODY_FILE="$RUNNER_TEMP/release-body.md"
+          {
+            echo "## 更新日志"
+            echo
+            if [[ -s "$SECTION_FILE" ]]; then
+              cat "$SECTION_FILE"
+            else
+              echo "_（CHANGELOG.md 中未找到 ## [$VERSION]，以下为 commit 摘要）_"
+              echo
+              if [[ -n "$PREV" ]]; then
+                git log --pretty=format:'- %s (%h)' "${PREV}..${TAG}"
+              else
+                git log --pretty=format:'- %s (%h)' -n 50
+              fi
+            fi
+            echo
+            echo "---"
+            echo
+            if [[ -n "$PREV" ]]; then
+              echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV}...${TAG}"
+            else
+              echo "**Full Changelog**: https://github.com/${{ github.repository }}/commits/${TAG}"
+            fi
+            echo
+            echo "二进制包见下方 Assets；校验和见 \`SHA256SUMS.txt\`。"
+          } > "$BODY_FILE"
+          echo "path=$BODY_FILE" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -194,6 +259,7 @@ jobs:
           tag_name: ${{ steps.meta.outputs.tag }}
           name: ${{ steps.meta.outputs.name }}
           prerelease: ${{ steps.meta.outputs.prerelease }}
-          generate_release_notes: true
+          body_path: ${{ steps.notes.outputs.path }}
+          generate_release_notes: false
           files: |
             artifacts/*
