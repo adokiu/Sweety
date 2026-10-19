@@ -1,5 +1,26 @@
 # 编译与安装
 
+## 预编译二进制（推荐）
+
+在 [GitHub Releases](https://github.com/adokiu/Sweety/releases) 下载对应平台的单文件，无需安装运行时。
+
+| 场景 | 推荐文件 |
+|------|----------|
+| Linux 服务器（通用 x86_64） | `sweety-linux-amd64-musl` |
+| Linux ARM64 / 树莓派 4+ | `sweety-linux-aarch64-musl` |
+| Linux ARMv7 | `sweety-linux-armv7-musl` |
+| macOS Apple Silicon | `sweety-macos-aarch64` |
+| macOS Intel | `sweety-macos-amd64` |
+| Windows x64 | `sweety-windows-amd64.exe` |
+| FreeBSD x86_64 | `sweety-freebsd-amd64` |
+
+完整矩阵与命名规则见仓库 [.github/RELEASE.md](https://github.com/adokiu/Sweety/blob/main/.github/RELEASE.md)。每个 Release 附带 `SHA256SUMS.txt` 校验。
+
+```bash
+chmod +x sweety-linux-amd64-musl
+./sweety-linux-amd64-musl validate -c /etc/sweety/sweety.toml
+```
+
 ## 系统要求
 
 | 依赖 | 最低版本 | 说明 |

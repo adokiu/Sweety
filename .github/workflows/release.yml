@@ -1,8 +1,9 @@
 name: Release
 
-# 触发条件：推送 tag
-#   v*     → 稳定版 Release（v0.2.0）
-#   pre-*  → Pre-release（pre-0.2.0-rc1）
+# Tag push → GitHub Release + 多平台二进制
+#   v*     稳定版
+#   pre-*  预发布
+# 产物命名见 .github/RELEASE.md
 on:
   push:
     tags:
@@ -18,120 +19,96 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  # ── 主矩阵：任一失败则不发版 ─────────────────────────────────────
+  build-primary:
     name: ${{ matrix.artifact }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # ═══════════════════════════════════════════
-          # Linux musl（静态链接，单文件部署）
-          # ═══════════════════════════════════════════
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-24.04
+          # Linux musl（推荐生产部署）
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
             artifact: sweety-linux-amd64-musl
             cross: false
-
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-24.04
+          - os: ubuntu-24.04
+            target: aarch64-unknown-linux-musl
             artifact: sweety-linux-aarch64-musl
             cross: true
+          - os: ubuntu-24.04
+            target: armv7-unknown-linux-musleabihf
+            artifact: sweety-linux-armv7-musl
+            cross: true
+          - os: ubuntu-24.04
+            target: i686-unknown-linux-musl
+            artifact: sweety-linux-i686-musl
+            cross: true
 
-          # ═══════════════════════════════════════════
-          # Linux gnu（动态链接）
-          # ═══════════════════════════════════════════
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-24.04
+          # Linux gnu
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
             artifact: sweety-linux-amd64-gnu
             cross: false
-
-          - target: i686-unknown-linux-gnu
-            os: ubuntu-24.04
+          - os: ubuntu-24.04
+            target: i686-unknown-linux-gnu
             artifact: sweety-linux-i686-gnu
             cross: true
-
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04
+          - os: ubuntu-24.04
+            target: aarch64-unknown-linux-gnu
             artifact: sweety-linux-aarch64-gnu
             cross: true
-
-          - target: armv7-unknown-linux-gnueabihf
-            os: ubuntu-24.04
+          - os: ubuntu-24.04
+            target: armv7-unknown-linux-gnueabihf
             artifact: sweety-linux-armv7-gnu
             cross: true
-
-          - target: riscv64gc-unknown-linux-gnu
-            os: ubuntu-24.04
+          - os: ubuntu-24.04
+            target: riscv64gc-unknown-linux-gnu
             artifact: sweety-linux-riscv64-gnu
             cross: true
 
-          # ═══════════════════════════════════════════
-          # FreeBSD
-          # ═══════════════════════════════════════════
-          - target: x86_64-unknown-freebsd
-            os: ubuntu-24.04
-            artifact: sweety-freebsd-amd64
-            cross: true
-
-          # ═══════════════════════════════════════════
-          # Windows
-          # ═══════════════════════════════════════════
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            artifact: sweety-windows-amd64
+          # macOS
+          - os: macos-14
+            target: aarch64-apple-darwin
+            artifact: sweety-macos-aarch64
+            cross: false
+          - os: macos-14
+            target: x86_64-apple-darwin
+            artifact: sweety-macos-amd64
             cross: false
 
-          - target: i686-pc-windows-msvc
-            os: windows-latest
+          # FreeBSD
+          - os: ubuntu-24.04
+            target: x86_64-unknown-freebsd
+            artifact: sweety-freebsd-amd64
+            cross: true
+          - os: ubuntu-24.04
+            target: aarch64-unknown-freebsd
+            artifact: sweety-freebsd-aarch64
+            cross: true
+
+          # Windows
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: sweety-windows-amd64
+            cross: false
+          - os: windows-latest
+            target: i686-pc-windows-msvc
             artifact: sweety-windows-i686
+            cross: false
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            artifact: sweety-windows-aarch64
             cross: false
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/build-release
         with:
-          targets: ${{ matrix.target }}
-
-      # ── 依赖安装 ────────────────────────────────────
-      - name: Install musl-tools (native musl)
-        if: matrix.target == 'x86_64-unknown-linux-musl' && !matrix.cross
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-
-      - name: Install cross
-        if: matrix.cross
-        uses: taiki-e/install-action@cross
-
-      - name: Install cmake (Linux)
-        if: runner.os == 'Linux' && !matrix.cross
-        run: sudo apt-get update && sudo apt-get install -y cmake
-
-      # i686 Windows 需要额外 target
-      - name: Add i686 target (Windows)
-        if: matrix.target == 'i686-pc-windows-msvc'
-        run: rustup target add i686-pc-windows-msvc
-
-      # ── 构建 ──────────────────────────────────────
-      - name: Build (native)
-        if: "!matrix.cross"
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Build (cross)
-        if: matrix.cross
-        run: cross build --release --target ${{ matrix.target }}
-
-      # ── 重命名可执行文件 ─────────────────────────────
-      - name: Rename binary (Unix)
-        if: runner.os != 'Windows'
-        run: cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }} ${{ matrix.artifact }}
-
-      - name: Rename binary (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: Copy-Item "target\${{ matrix.target }}\release\${{ env.BINARY_NAME }}.exe" "${{ matrix.artifact }}.exe"
+          target: ${{ matrix.target }}
+          artifact: ${{ matrix.artifact }}
+          cross: ${{ matrix.cross }}
 
       - name: Upload artifact (Unix)
         if: runner.os != 'Windows'
@@ -149,16 +126,50 @@ jobs:
           path: ${{ matrix.artifact }}.exe
           if-no-files-found: error
 
-  # ═══════════════════════════════════════════════════
-  # 发布到 GitHub Releases
-  # ═══════════════════════════════════════════════════
+  # ── 扩展矩阵：尽力构建，失败不阻断发版 ───────────────────────────
+  build-secondary:
+    name: ${{ matrix.artifact }}
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: powerpc64le-unknown-linux-gnu
+            artifact: sweety-linux-ppc64le-gnu
+            cross: true
+          - target: s390x-unknown-linux-gnu
+            artifact: sweety-linux-s390x-gnu
+            cross: true
+          - target: loongarch64-unknown-linux-gnu
+            artifact: sweety-linux-loong64-gnu
+            cross: true
+          - target: x86_64-unknown-netbsd
+            artifact: sweety-netbsd-amd64
+            cross: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/build-release
+        with:
+          target: ${{ matrix.target }}
+          artifact: ${{ matrix.artifact }}
+          cross: ${{ matrix.cross }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+
   release:
     name: Publish Release
-    needs: build
+    needs: [build-primary, build-secondary]
+    if: ${{ always() && needs.build-primary.result == 'success' && !cancelled() }}
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
@@ -176,6 +187,32 @@ jobs:
           cd artifacts
           sha256sum * 2>/dev/null | sort > SHA256SUMS.txt
           cat SHA256SUMS.txt
+
+      - name: Generate RELEASE_ASSETS.md
+        run: |
+          cd artifacts
+          {
+            echo "## 预编译包"
+            echo
+            echo "| 文件 | 平台 |"
+            echo "|------|------|"
+            for f in sweety-*; do
+              [[ "$f" == "SHA256SUMS.txt" ]] && continue
+              case "$f" in
+                sweety-linux-*-musl) plat="Linux musl" ;;
+                sweety-linux-*-gnu) plat="Linux glibc" ;;
+                sweety-macos-aarch64) plat="macOS Apple Silicon" ;;
+                sweety-macos-amd64) plat="macOS Intel" ;;
+                sweety-freebsd-*) plat="FreeBSD" ;;
+                sweety-netbsd-*) plat="NetBSD" ;;
+                sweety-windows-*.exe) plat="Windows" ;;
+                *) plat="—" ;;
+              esac
+              echo "| \`$f\` | $plat |"
+            done
+            echo
+            echo "校验和：\`SHA256SUMS.txt\`"
+          } > RELEASE_ASSETS.md
 
       - name: Determine release type
         id: meta
@@ -241,6 +278,10 @@ jobs:
               fi
             fi
             echo
+            if [[ -f artifacts/RELEASE_ASSETS.md ]]; then
+              cat artifacts/RELEASE_ASSETS.md
+            fi
+            echo
             echo "---"
             echo
             if [[ -n "$PREV" ]]; then
@@ -249,7 +290,7 @@ jobs:
               echo "**Full Changelog**: https://github.com/${{ github.repository }}/commits/${TAG}"
             fi
             echo
-            echo "二进制包见下方 Assets；校验和见 \`SHA256SUMS.txt\`。"
+            echo "扩展架构（ppc64le / s390x / loong64 / netbsd）在 **build-secondary** 中尽力构建，可能未出现在 Assets 中。"
           } > "$BODY_FILE"
           echo "path=$BODY_FILE" >> "$GITHUB_OUTPUT"
 

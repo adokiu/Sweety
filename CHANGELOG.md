@@ -23,6 +23,11 @@
 - H2 上游尚未接入 `background_update` 后台刷新。
 - `static_multipart_byteranges` 仅为配置占位。
 
+### CI / Release
+
+- Release 矩阵扩展：macOS（arm64/amd64）、Windows arm64、Linux armv7/i686 musl、FreeBSD arm64 等；`ci.yml` 对 main/PR 冒烟构建。
+- 产物命名与发版流程见 `.github/RELEASE.md`。
+
 ## [0.2.7] - 2026-05-28
 
 历史预发布（`pre-0.2.7` 及更早）的 Release 说明仅含 GitHub 自动生成的 compare 链接，自 **0.2.8 / pre-0.2.8** 起在 Release 正文中附带本 Changelog 对应章节。

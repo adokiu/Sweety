@@ -1,0 +1,85 @@
+name: Build release binary
+description: Compile sweety for a single Rust target and stage the release artifact filename.
+
+inputs:
+  target:
+    description: Rust triple, e.g. x86_64-unknown-linux-musl
+    required: true
+  artifact:
+    description: Output filename (without .exe on Windows)
+    required: true
+  cross:
+    description: Use cross-rs instead of cargo
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ inputs.target }}
+
+    - name: Install musl-tools (Linux native musl)
+      if: inputs.cross == 'false' && contains(inputs.target, 'linux') && contains(inputs.target, 'musl')
+      shell: bash
+      run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+    - name: Install cmake (Linux native)
+      if: inputs.cross == 'false' && runner.os == 'Linux'
+      shell: bash
+      run: sudo apt-get update && sudo apt-get install -y cmake
+
+    - name: Install cmake (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        if ! command -v cmake >/dev/null; then
+          brew install cmake
+        fi
+
+    - name: Install NASM (Windows, aws-lc-rs)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
+          choco install nasm -y
+        }
+
+    - name: Install cross
+      if: inputs.cross == 'true'
+      uses: taiki-e/install-action@cross
+
+    - name: Ensure Rust target (Windows)
+      if: runner.os == 'Windows'
+      shell: bash
+      run: rustup target add "${{ inputs.target }}"
+
+    - name: Build (native)
+      if: inputs.cross != 'true'
+      shell: bash
+      run: cargo build --release --target "${{ inputs.target }}"
+
+    - name: Build (cross)
+      if: inputs.cross == 'true'
+      shell: bash
+      run: cross build --release --target "${{ inputs.target }}"
+
+    - name: Stage binary (Unix)
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        set -euo pipefail
+        src="target/${{ inputs.target }}/release/sweety"
+        test -f "$src"
+        cp "$src" "${{ inputs.artifact }}"
+        chmod +x "${{ inputs.artifact }}"
+
+    - name: Stage binary (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $src = "target\${{ inputs.target }}\release\sweety.exe"
+        if (-not (Test-Path $src)) { throw "missing $src" }
+        Copy-Item $src "${{ inputs.artifact }}.exe"

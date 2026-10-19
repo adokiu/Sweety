@@ -1,5 +1,26 @@
 # Installation
 
+## Pre-built binaries (recommended)
+
+Download a single static binary from [GitHub Releases](https://github.com/adokiu/Sweety/releases).
+
+| Use case | Artifact |
+|----------|----------|
+| Linux x86_64 server | `sweety-linux-amd64-musl` |
+| Linux ARM64 | `sweety-linux-aarch64-musl` |
+| Linux ARMv7 | `sweety-linux-armv7-musl` |
+| macOS Apple Silicon | `sweety-macos-aarch64` |
+| macOS Intel | `sweety-macos-amd64` |
+| Windows x64 | `sweety-windows-amd64.exe` |
+| FreeBSD amd64 | `sweety-freebsd-amd64` |
+
+Full matrix: [.github/RELEASE.md](https://github.com/adokiu/Sweety/blob/main/.github/RELEASE.md). Verify with `SHA256SUMS.txt` on each release.
+
+```bash
+chmod +x sweety-linux-amd64-musl
+./sweety-linux-amd64-musl validate -c /etc/sweety/sweety.toml
+```
+
 ## System Requirements
 
 | Dependency | Minimum Version | Notes |
