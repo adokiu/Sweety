@@ -23,6 +23,9 @@ fn default_h2_max_concurrent_streams() -> u32 { 128 }
 fn default_h2_max_concurrent_reset_streams() -> usize { 200 }
 fn default_h2_max_frame_size() -> u32 { 65535 }
 fn default_h2_max_requests_per_conn() -> usize { 1000 }
+fn default_h3_max_requests_per_conn() -> usize { 1000 }
+fn default_upstream_max_response_headers() -> usize { 200 }
+fn default_upstream_max_response_header_kb() -> usize { 256 }
 fn default_true() -> bool { true }
 
 /// 全局配置项
@@ -137,6 +140,34 @@ pub struct GlobalConfig {
     #[serde(default = "default_h2_max_requests_per_conn")]
     pub h2_max_requests_per_conn: usize,
 
+    /// HTTP/3 单连接最大同时在途 handler 数量（默认 0 = 不限制）
+    #[serde(default)]
+    pub h3_max_pending_per_conn: usize,
+
+    /// HTTP/3 单连接最大请求数（0 = 不限制，默认 1000）
+    #[serde(default = "default_h3_max_requests_per_conn")]
+    pub h3_max_requests_per_conn: usize,
+
+    /// 上游 HTTP/1.1 响应头字段数上限（RFC 9110 安全限制，默认 200）
+    #[serde(default = "default_upstream_max_response_headers")]
+    pub upstream_max_response_headers: usize,
+
+    /// 上游响应头总字节上限（KB，默认 256）
+    #[serde(default = "default_upstream_max_response_header_kb")]
+    pub upstream_max_response_header_kb: usize,
+
+    /// 拒绝 TRACE（默认 true，RFC 7231 安全实践）
+    #[serde(default = "default_true")]
+    pub disable_http_trace: bool,
+
+    /// 允许非 extended CONNECT 的 HTTP/1 隧道（默认 false；WebSocket 用 RFC 8441/9220 不受影响）
+    #[serde(default)]
+    pub allow_http_connect_tunnel: bool,
+
+    /// 静态文件多 Range 时返回 multipart/byteranges（默认 false，RFC 9110 允许忽略多区间）
+    #[serde(default)]
+    pub static_multipart_byteranges: bool,
+
 }
 
 impl Default for GlobalConfig {
@@ -169,6 +200,13 @@ impl Default for GlobalConfig {
             h2_max_concurrent_reset_streams: default_h2_max_concurrent_reset_streams(),
             h2_max_frame_size: default_h2_max_frame_size(),
             h2_max_requests_per_conn: default_h2_max_requests_per_conn(),
+            h3_max_pending_per_conn: 0,
+            h3_max_requests_per_conn: default_h3_max_requests_per_conn(),
+            upstream_max_response_headers: default_upstream_max_response_headers(),
+            upstream_max_response_header_kb: default_upstream_max_response_header_kb(),
+            disable_http_trace: true,
+            allow_http_connect_tunnel: false,
+            static_multipart_byteranges: false,
         }
     }
 }

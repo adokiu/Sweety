@@ -29,7 +29,7 @@
 
 - 📁 **静态文件** — 内存缓存（可配置 `open_file_cache max=200000`）+ fd 缓存 + Range + ETag/Last-Modified + `try_files` + sendfile(2) 零拷贝（Linux/macOS）+ pread 流式传输
 - 🐘 **PHP / FastCGI** — Unix Socket / TCP 连接池 + `fastcgi_cache`；正确处理 HTTP/2 Cookie 合并（RFC 7540 §8.1.2.5），兼容 WordPress / Laravel
-- 🔄 **反向代理** — 轮询 / 加权 / 最少连接 / IP 哈希 + 连接池 + 主动健康检查 + `proxy_cache`
+- 🔄 **反向代理** — 轮询 / 加权 / 最少连接 / IP 哈希 + 连接池 + 主动健康检查 + `proxy_cache`（RFC 9111：再验证、stale-if-error、cache_lock、Cache-Status）
 - 📡 **gRPC 代理** — 自动处理 `application/grpc` + Trailer
 - 🔑 **auth_request** — 子请求鉴权
 
@@ -58,9 +58,9 @@
 
 ### 运维
 
-- 🖥️ **Admin REST API** — health / version / stats / plugins (`/api/v1/*`)；站点管理、节点控制、WebSocket 推送计划 v0.5 实现
+- 🖥️ **Admin REST API** — 配置 CRUD、站点/上游/证书/缓存、热重载（[文档](https://sweety.2o.nz/configuration/admin-api)）
 - 📝 **访问日志** — combined / JSON / 自定义模板，异步写
-- 📊 **Prometheus 指标** — `/metrics` 端点（计划 v0.5）
+- 📊 **Prometheus 指标** — `/metrics` 端点（text/plain）
 
 ---
 
@@ -134,9 +134,10 @@ handler = "static"
 | WebSocket H2（RFC 8441） | ✅ | ✅ | ✅ | ✅ |
 | gRPC 代理 | ✅ | ✅（商业版全功能） | ✅ | ⚠️ 有限 |
 | FastCGI 响应缓存 | ✅ | ✅ | ❌ | ✅ |
+| 共享缓存 RFC 9111 | ✅ proxy + FastCGI | ✅ | ⚠️ 需 cache-handler | ⚠️ mod_cache |
 | 静态文件内存缓存 | ✅ | ✅ OS page cache | ❌ | ✅ |
 | 配置易用性 | ✅ 预设 + 语法糖 | ❌ 纯手写 | ✅ Caddyfile | ⚠️ 冗长 |
-| Admin REST API | ⚠️ 部分实现 (v0.5) | ❌ | ✅ | ❌ |
+| Admin REST API | ✅ | ❌ | ✅ | ❌ |
 | 单文件无依赖 | ✅ | ❌ | ✅ | ❌ |
 | 内存安全 | ✅ Rust | ❌ C | ✅ Go | ❌ C |
 | `if` / `map` 条件 | ❌ | ✅ | ⚠️ 有限 | ✅ mod_rewrite |

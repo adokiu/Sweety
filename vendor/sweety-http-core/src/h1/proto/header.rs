@@ -32,6 +32,9 @@ impl HeaderIndex {
 }
 
 pub(super) fn parse_content_length(val: &HeaderValue) -> Result<u64, ProtoError> {
+    if val.as_bytes().is_empty() || !val.as_bytes().iter().all(u8::is_ascii_digit) {
+        return Err(ProtoError::HeaderValue);
+    }
     val.to_str()
         .ok()
         .and_then(|v| v.parse().ok())

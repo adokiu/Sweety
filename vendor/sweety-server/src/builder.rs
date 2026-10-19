@@ -239,7 +239,7 @@ impl Builder {
             #[cfg(unix)]
             socket.set_reuse_port(true)?;
             // TCP_NODELAY：禁用 Nagle 算法，降低小包延迟
-            socket.set_nodelay(true)?;
+            socket.set_tcp_nodelay(true)?;
             socket.set_nonblocking(true)?;
             // TCP keepalive
             let ka = socket2::TcpKeepalive::new()

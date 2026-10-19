@@ -47,6 +47,10 @@ bypass_headers = []
 # Ignore response headers that would prevent caching
 # WordPress requires this, otherwise Cache-Control: no-store blocks caching
 ignore_headers = ["Cache-Control", "Set-Cookie"]
+
+# Same RFC / Nginx options as proxy_cache — see [Cache](cache.md)
+# origin_revalidate = true
+# use_stale_error   = true
 ```
 
 ## FastCGI Location Configuration

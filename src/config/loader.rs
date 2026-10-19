@@ -85,6 +85,12 @@ pub fn validate_config_pub(cfg: &AppConfig) -> Result<()> {
 
 /// 配置校验：检查必填字段、端口合法性等
 fn validate_config(cfg: &AppConfig) -> Result<()> {
+    if !(16384..=16777215).contains(&cfg.global.h2_max_frame_size) {
+        bail!(
+            "global.h2_max_frame_size 必须在 16384..=16777215 范围内，实际为 {}",
+            cfg.global.h2_max_frame_size
+        );
+    }
     for site in &cfg.sites {
         // 校验站点名称非空
         if site.name.is_empty() {
@@ -93,6 +99,15 @@ fn validate_config(cfg: &AppConfig) -> Result<()> {
         // 校验至少有一个 server_name
         if site.server_name.is_empty() {
             bail!("站点 '{}' 的 server_name 列表不能为空", site.name);
+        }
+        for sn in &site.server_name {
+            if sn.starts_with("*.") {
+                if crate::dispatcher::host::normalize_host_key(&sn[2..]).is_none() {
+                    bail!("站点 '{}' 的通配符 server_name '{}' 无效", site.name, sn);
+                }
+            } else if crate::dispatcher::host::normalize_host_key(sn).is_none() {
+                bail!("站点 '{}' 的 server_name '{}' 无效", site.name, sn);
+            }
         }
         // 校验上游引用合法性
         for loc in &site.locations {
@@ -113,6 +128,14 @@ fn validate_config(cfg: &AppConfig) -> Result<()> {
                     }
                 }
             }
+        }
+        if !site.listen_tls.is_empty() && site.tls.is_none() {
+            tracing::warn!(
+                target: "sweety::config",
+                site = %site.name,
+                listen_tls = ?site.listen_tls,
+                "listen_tls 已配置但未设置 [sites.tls] 或 acme_email：不会监听 HTTPS，也不会从 HTTP 强制跳转"
+            );
         }
         // 校验 TLS：手动证书模式下必须有 cert/key 或 certs 列表
         if let Some(tls) = &site.tls {
@@ -175,6 +198,43 @@ mod tests {
         let f = write_temp(yaml, "yaml");
         let cfg = load_config(f.path()).unwrap();
         assert_eq!(cfg.sites[0].name, "demo");
+    }
+
+    #[test]
+    fn test_h2_max_frame_size_boundaries() {
+        for size in [16384, 65535, 16777215] {
+            let mut cfg = AppConfig::default();
+            cfg.global.h2_max_frame_size = size;
+            validate_config_pub(&cfg).unwrap();
+            assert_eq!(cfg.global.h2_max_frame_size, size);
+        }
+        for size in [0, 16383, 16777216, u32::MAX] {
+            let mut cfg = AppConfig::default();
+            cfg.global.h2_max_frame_size = size;
+            let err = validate_config_pub(&cfg).unwrap_err().to_string();
+            assert!(err.contains("global.h2_max_frame_size"));
+            assert!(err.contains("16384..=16777215"));
+            assert_eq!(cfg.global.h2_max_frame_size, size);
+        }
+    }
+
+    #[test]
+    fn test_load_h2_max_frame_size_boundaries() {
+        for size in [16383, 16384, 16777215, 16777216] {
+            for (ext, content) in [
+                ("toml", format!("[global]\nh2_max_frame_size = {size}\n")),
+                ("json", format!(r#"{{"global":{{"h2_max_frame_size":{size}}}}}"#)),
+                ("yaml", format!("global:\n  h2_max_frame_size: {size}\n")),
+            ] {
+                let f = write_temp(&content, ext);
+                let result = load_config(f.path());
+                if (16384..=16777215).contains(&size) {
+                    assert_eq!(result.unwrap().global.h2_max_frame_size, size);
+                } else {
+                    assert!(result.unwrap_err().to_string().contains("global.h2_max_frame_size"));
+                }
+            }
+        }
     }
 
     #[test]

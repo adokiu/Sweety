@@ -155,6 +155,23 @@ where
         self
     }
 
+    /// HTTP/3 单连接最大同时在途 handler 数（0 = 不限制）
+    pub fn h3_max_pending_per_conn(mut self, n: usize) -> Self {
+        self.config = self.config.h3_max_pending_per_conn(n);
+        self
+    }
+
+    /// HTTP/3 单连接最大请求数（0 = 不限制，默认 1000），达到后发 GOAWAY
+    pub fn h3_max_requests_per_conn(mut self, n: usize) -> Self {
+        self.config = self.config.h3_max_requests_per_conn(n);
+        self
+    }
+
+    /// 启用 H3 QUIC Early Data 建连（须与 TLS `enable_0rtt` 一致）
+    pub fn h3_enable_0rtt(mut self, enable: bool) -> Self {
+        self.config = self.config.h3_enable_0rtt(enable);
+        self
+    }
 
     /// Change max size for request head.
     ///

@@ -113,15 +113,7 @@ impl SweetyServer {
             let fcgi_cache_arc: Option<Arc<ProxyCache>> = site.fastcgi.as_ref()
                 .and_then(|fcgi| fcgi.cache.as_ref())
                 .map(|cache_cfg| {
-                    let proxy_cfg = crate::config::model::ProxyCacheConfig {
-                        path: cache_cfg.path.clone(),
-                        max_entries: cache_cfg.max_entries,
-                        ttl: cache_cfg.ttl,
-                        cacheable_statuses: cache_cfg.cacheable_statuses.clone(),
-                        cacheable_methods: cache_cfg.cacheable_methods.clone(),
-                        bypass_headers: cache_cfg.bypass_headers.clone(),
-                        ignore_headers: cache_cfg.ignore_headers.clone(),
-                    };
+                    let proxy_cfg = crate::config::model::ProxyCacheConfig::from_fcgi(cache_cfg);
                     info!("站点 '{}' FastCGI 缓存已开启（max_entries={}, ttl={}s)",
                         site.name, cache_cfg.max_entries, cache_cfg.ttl);
                     ProxyCache::from_config(&proxy_cfg)
@@ -132,6 +124,20 @@ impl SweetyServer {
                 .map(|cache_cfg| {
                     info!("站点 '{}' 反代缓存已开启（max_entries={}, ttl={}s）",
                         site.name, cache_cfg.max_entries, cache_cfg.ttl);
+                    if cache_cfg.cache_require_buffering {
+                        for loc in &site.locations {
+                            if loc.handler == crate::config::model::HandlerType::ReverseProxy
+                                && !loc.proxy_buffering
+                            {
+                                tracing::warn!(
+                                    "站点 '{}' location '{}'：proxy_buffering=false 与 proxy_cache 同时开启；\
+                                     已强制缓冲响应体以写入缓存（cache_require_buffering=true）",
+                                    site.name,
+                                    loc.path
+                                );
+                            }
+                        }
+                    }
                     ProxyCache::from_config(cache_cfg)
                 });
 
@@ -204,6 +210,11 @@ impl SweetyServer {
 
         let mut server = sweety_web::HttpServer::serve(app.finish());
 
+        crate::handler::reverse_proxy::conn::set_upstream_response_limits(
+            cfg.global.upstream_max_response_headers,
+            cfg.global.upstream_max_response_header_kb.saturating_mul(1024),
+        );
+
         // 根据 worker 线程数配置并发
         let workers = if cfg.global.worker_threads == 0 {
             std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
@@ -227,7 +238,15 @@ impl SweetyServer {
         server = server.h2_max_concurrent_reset_streams(cfg.global.h2_max_concurrent_reset_streams);
         server = server.h2_max_frame_size(cfg.global.h2_max_frame_size);
         server = server.h2_max_requests_per_conn(cfg.global.h2_max_requests_per_conn);
-
+        if cfg.global.h3_max_pending_per_conn > 0 {
+            server = server.h3_max_pending_per_conn(cfg.global.h3_max_pending_per_conn);
+        }
+        server = server.h3_max_requests_per_conn(cfg.global.h3_max_requests_per_conn);
+        let h3_enable_0rtt = cfg.sites.iter()
+            .filter_map(|s| s.tls.as_ref())
+            .filter(|tls| tls.protocols.iter().any(|p| p == "h3"))
+            .any(|tls| tls.http3.enable_0rtt);
+        server = server.h3_enable_0rtt(h3_enable_0rtt);
 
         // 绑定各站点监听端口（HTTP 明文）
         let http_ports = collect_http_ports(&cfg);

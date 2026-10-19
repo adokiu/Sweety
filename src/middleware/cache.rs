@@ -79,13 +79,130 @@ pub fn is_cache_valid(
 ) -> bool {
     // ETag 匹配（优先）
     if let Some(inm) = if_none_match {
-        return inm == etag || inm == "*";
+        return etag_list_matches(inm, etag, true);
     }
     // Last-Modified 匹配
     if let Some(ims) = if_modified_since_secs {
         return last_modified_secs <= ims;
     }
     false
+}
+
+/// 判断 entity-tag 列表（`*` 或 `"a", W/"b"`）是否匹配当前 ETag
+///
+/// - `weak = true`：弱比较（If-None-Match，RFC 9110 §8.8.3.2），忽略 `W/` 前缀
+/// - `weak = false`：强比较（If-Match / If-Range），任一方为弱 ETag 即不匹配
+pub fn etag_list_matches(list: &str, etag: &str, weak: bool) -> bool {
+    let list = list.trim();
+    if list == "*" {
+        return true;
+    }
+    let Some((current_weak, current)) = parse_entity_tag(etag) else { return false };
+    let mut rest = list;
+    let mut matched = false;
+    while !rest.is_empty() {
+        rest = rest.trim_start_matches([' ', '\t', ',']);
+        if rest.is_empty() { break; }
+        let opaque = rest.strip_prefix("W/").unwrap_or(rest);
+        if !opaque.starts_with('"') { return false; }
+        let Some(end) = opaque[1..].find('"').map(|i| i + 2) else { return false };
+        let tag_len = rest.len() - opaque.len() + end;
+        let Some((candidate_weak, candidate)) = parse_entity_tag(&rest[..tag_len]) else { return false };
+        matched |= (weak || (!current_weak && !candidate_weak)) && candidate == current;
+        rest = rest[tag_len..].trim_start_matches([' ', '\t']);
+        if !rest.is_empty() && !rest.starts_with(',') { return false; }
+    }
+    matched
+}
+
+fn parse_entity_tag(value: &str) -> Option<(bool, &str)> {
+    let value = value.trim_matches([' ', '\t']);
+    let weak = value.starts_with("W/");
+    let tag = value.strip_prefix("W/").unwrap_or(value);
+    let opaque = tag.strip_prefix('"')?.strip_suffix('"')?;
+    opaque.bytes().all(|b| b == 0x21 || (0x23..=0x7e).contains(&b) || b >= 0x80)
+        .then_some((weak, opaque))
+}
+
+/// 条件请求评估结果（RFC 9110 §13.2.2）
+#[derive(Debug, PartialEq, Eq)]
+pub enum Precondition {
+    /// 条件满足，正常处理请求
+    Proceed,
+    /// 304 Not Modified（仅 GET/HEAD）
+    NotModified,
+    /// 412 Precondition Failed
+    Failed,
+}
+
+/// 按 RFC 9110 §13.2.2 规定的顺序评估条件请求头：
+/// If-Match → If-Unmodified-Since → If-None-Match → If-Modified-Since
+pub fn evaluate_preconditions(
+    method: &str,
+    headers: &sweety_web::http::header::HeaderMap,
+    etag: &str,
+    last_modified_secs: u64,
+) -> Precondition {
+    use sweety_web::http::header::{HeaderName, IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE};
+
+    let get_or_head = matches!(method, "GET" | "HEAD");
+    let header_str = |name: HeaderName| headers.get(name).and_then(|v| v.to_str().ok());
+    let matches = |name: HeaderName, weak| {
+        headers.get_all(name).iter().filter_map(|v| v.to_str().ok())
+            .any(|value| etag_list_matches(value, etag, weak))
+    };
+    let header_date = |name: HeaderName| {
+        header_str(name)
+            .and_then(|s| httpdate::parse_http_date(s).ok())
+            .map(to_unix_secs)
+    };
+
+    // 步骤 1/2：If-Match（强比较）；否则 If-Unmodified-Since
+    if headers.contains_key(IF_MATCH) {
+        if !matches(IF_MATCH, false) {
+            return Precondition::Failed;
+        }
+    } else if let Some(ius) = header_date(IF_UNMODIFIED_SINCE) {
+        if last_modified_secs > ius {
+            return Precondition::Failed;
+        }
+    }
+
+    // 步骤 3/4：If-None-Match（弱比较）；否则 If-Modified-Since（仅 GET/HEAD）
+    if headers.contains_key(IF_NONE_MATCH) {
+        if matches(IF_NONE_MATCH, true) {
+            return if get_or_head { Precondition::NotModified } else { Precondition::Failed };
+        }
+    } else if get_or_head {
+        if let Some(ims) = header_date(IF_MODIFIED_SINCE) {
+            if last_modified_secs <= ims {
+                return Precondition::NotModified;
+            }
+        }
+    }
+    Precondition::Proceed
+}
+
+/// If-Range 评估（RFC 9110 §13.1.5）：返回 true 表示 Range 生效
+///
+/// - 无 If-Range：Range 生效
+/// - entity-tag：必须与当前 ETag 强匹配（弱 ETag 永不匹配 → 返回完整表示）
+/// - HTTP-date：必须与 Last-Modified 完全相等
+pub fn if_range_satisfied(
+    headers: &sweety_web::http::header::HeaderMap,
+    etag: &str,
+    last_modified_secs: u64,
+) -> bool {
+    let mut values = headers.get_all(sweety_web::http::header::IF_RANGE).iter();
+    let Some(value) = values.next() else { return true };
+    if values.next().is_some() { return false; }
+    let Ok(v) = value.to_str() else { return false };
+    let v = v.trim();
+    if v.starts_with('"') || v.starts_with("W/") {
+        return matches!((parse_entity_tag(v), parse_entity_tag(etag)),
+            (Some((false, candidate)), Some((false, current))) if candidate == current);
+    }
+    httpdate::parse_http_date(v).map(to_unix_secs).ok() == Some(last_modified_secs)
 }
 
 /// 根据文件扩展名推断 MIME 类型（phf 完美哈希表，O(1) 查找）
@@ -168,6 +285,83 @@ mod tests {
         assert!(is_cache_valid(None, Some(1000), "W/\"x\"", 999));
         // 资源 mtime = 1001 → 缓存失效
         assert!(!is_cache_valid(None, Some(1000), "W/\"x\"", 1001));
+    }
+
+    #[test]
+    fn test_etag_list_matching() {
+        let etag = "W/\"a-1\"";
+        assert!(etag_list_matches("\"x\", W/\"a-1\"", etag, true));
+        assert!(etag_list_matches("\"a-1\"", etag, true));
+        // 强比较：弱 ETag 永不匹配
+        assert!(!etag_list_matches("W/\"a-1\"", etag, false));
+        assert!(etag_list_matches("*", etag, false));
+    }
+
+    #[test]
+    fn test_preconditions() {
+        use sweety_web::http::header::{HeaderMap, HeaderValue, IF_MATCH, IF_NONE_MATCH};
+        let etag = "W/\"a-1\"";
+
+        let mut h = HeaderMap::new();
+        h.insert(IF_NONE_MATCH, HeaderValue::from_static("W/\"a-1\""));
+        assert_eq!(evaluate_preconditions("GET", &h, etag, 1), Precondition::NotModified);
+        assert_eq!(evaluate_preconditions("PUT", &h, etag, 1), Precondition::Failed);
+
+        let mut h = HeaderMap::new();
+        h.insert(IF_MATCH, HeaderValue::from_static("\"other\""));
+        assert_eq!(evaluate_preconditions("GET", &h, etag, 1), Precondition::Failed);
+
+        assert_eq!(evaluate_preconditions("GET", &HeaderMap::new(), etag, 1), Precondition::Proceed);
+    }
+
+    #[test]
+    fn test_entity_tag_quoted_commas_and_validation() {
+        assert!(etag_list_matches("\"other\", W/\"a,b\"", "\"a,b\"", true));
+        assert!(!etag_list_matches("\"a,b\"", "\"a\"", true));
+        assert!(!etag_list_matches("unquoted", "unquoted", true));
+        assert!(!etag_list_matches("\"a\" garbage", "\"a\"", true));
+        assert!(!etag_list_matches("\"a\", *", "\"a\"", true));
+        assert!(!etag_list_matches("W/\"a\"", "\"a\"", false));
+        assert!(etag_list_matches("\"a\"", "\"a\"", false));
+    }
+
+    #[test]
+    fn test_repeated_conditions_and_precedence() {
+        use sweety_web::http::header::{HeaderMap, HeaderValue, IF_MATCH, IF_NONE_MATCH, IF_MODIFIED_SINCE, IF_UNMODIFIED_SINCE};
+        let mut h = HeaderMap::new();
+        h.append(IF_NONE_MATCH, HeaderValue::from_static("\"other\""));
+        h.append(IF_NONE_MATCH, HeaderValue::from_static("W/\"a\""));
+        assert_eq!(evaluate_preconditions("HEAD", &h, "\"a\"", 1), Precondition::NotModified);
+        h.insert(IF_MATCH, HeaderValue::from_static("\"wrong\""));
+        assert_eq!(evaluate_preconditions("GET", &h, "\"a\"", 1), Precondition::Failed);
+        h.clear();
+        h.insert(IF_NONE_MATCH, HeaderValue::from_static("\"other\""));
+        h.insert(IF_MODIFIED_SINCE, HeaderValue::from_static("Thu, 01 Jan 1970 00:00:10 GMT"));
+        assert_eq!(evaluate_preconditions("GET", &h, "\"a\"", 1), Precondition::Proceed);
+        h.clear();
+        h.insert(IF_MATCH, HeaderValue::from_static("\"a\""));
+        h.insert(IF_UNMODIFIED_SINCE, HeaderValue::from_static("Thu, 01 Jan 1970 00:00:00 GMT"));
+        assert_eq!(evaluate_preconditions("GET", &h, "\"a\"", 1), Precondition::Proceed);
+    }
+
+    #[test]
+    fn test_if_range_requires_single_strong_validator() {
+        use sweety_web::http::header::{HeaderMap, HeaderValue, IF_RANGE};
+        let mut h = HeaderMap::new();
+        assert!(if_range_satisfied(&h, "\"a,b\"", 1));
+        for value in ["W/\"a,b\"", "\"other\", \"a,b\"", "*", "invalid-date"] {
+            h.insert(IF_RANGE, HeaderValue::from_str(value).unwrap());
+            assert!(!if_range_satisfied(&h, "\"a,b\"", 1));
+        }
+        h.insert(IF_RANGE, HeaderValue::from_static("\"a,b\""));
+        assert!(if_range_satisfied(&h, "\"a,b\"", 1));
+        assert!(!if_range_satisfied(&h, "W/\"a,b\"", 1));
+        h.append(IF_RANGE, HeaderValue::from_static("\"a,b\""));
+        assert!(!if_range_satisfied(&h, "\"a,b\"", 1));
+        h.clear();
+        h.insert(IF_RANGE, HeaderValue::from_static("Thu, 01 Jan 1970 00:00:01 GMT"));
+        assert!(if_range_satisfied(&h, "\"a\"", 1));
+        assert!(!if_range_satisfied(&h, "\"a\"", 2));
     }
 
     #[test]

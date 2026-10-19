@@ -26,12 +26,12 @@ name = "sweety_collection"
 path = "src/lib.rs"
 
 [dependencies.bytes_crate]
-version = "1.4"
+version = "1.12"
 optional = true
 package = "bytes"
 
 [dev-dependencies.tokio]
-version = "1.30"
+version = "1.53"
 features = [
     "rt",
     "sync",

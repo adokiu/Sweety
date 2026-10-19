@@ -59,7 +59,7 @@ pub mod h1;
 pub mod h2;
 #[cfg(feature = "http3")]
 pub mod h3;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod sendfile_ext;
 
 /// re-export bytes crate as module.
@@ -75,7 +75,7 @@ pub use self::{
 pub use self::builder::HttpServiceBuilder;
 
 #[cfg(feature = "http3")]
-pub use self::service::set_h3_max_connections;
+pub use self::service::{set_h3_draining, set_h3_max_connections};
 
 // TODO: enable this conflict feature check.
 // temporary compile error for conflicted feature combination.

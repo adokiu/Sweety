@@ -6,11 +6,52 @@ use sweety_web::{
 };
 
 use super::proto::{
-    FcgiRecord, FCGI_STDOUT, FCGI_STDERR,
+    FcgiRecord, FCGI_STDOUT, FCGI_STDERR, FCGI_END_REQUEST, FCGI_REQUEST_COMPLETE,
     FCGI_BEGIN_REQUEST, FCGI_PARAMS, FCGI_STDIN, FCGI_RESPONDER,
     write_fcgi_header, write_fcgi_record, encode_nv_pair,
-    read_fcgi_conn, find_header_end, parse_fcgi_headers,
+    read_fcgi_conn, read_fcgi_record, find_header_end, parse_fcgi_headers,
 };
+
+const REQUEST_ID: u16 = 1;
+
+#[derive(Default)]
+struct ResponseState {
+    stdout_done: bool,
+    request_done: bool,
+}
+
+impl ResponseState {
+    fn accept(&mut self, rec: &FcgiRecord) -> std::io::Result<bool> {
+        let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid FastCGI response state");
+        if self.request_done || rec.request_id != REQUEST_ID {
+            return Err(invalid());
+        }
+        match rec.rec_type {
+            FCGI_STDOUT => {
+                if self.stdout_done { return Err(invalid()); }
+                self.stdout_done = rec.data.is_empty();
+            }
+            FCGI_STDERR => {}
+            FCGI_END_REQUEST => {
+                if !self.stdout_done || rec.data.len() != 8 || rec.data[4] != FCGI_REQUEST_COMPLETE {
+                    return Err(invalid());
+                }
+                self.request_done = true;
+            }
+            _ => return Err(invalid()),
+        }
+        Ok(self.request_done)
+    }
+}
+
+async fn read_response_record(
+    conn: &mut crate::handler::fastcgi_pool::FcgiConn,
+    timeout_secs: u64,
+) -> std::io::Result<FcgiRecord> {
+    tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), read_fcgi_conn(conn))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "FastCGI record read timed out"))?
+}
 
 // ─────────────────────────────────────────────
 // 内部数据结构
@@ -37,7 +78,7 @@ pub(super) async fn fcgi_send_and_read_headers(
 ) -> anyhow::Result<FcgiParsedHeaders> {
     use crate::handler::fastcgi_pool::FcgiConn;
 
-    let rid: u16 = 1;
+    let rid = REQUEST_ID;
     let params_est: usize = params.iter().map(|(k, v)| k.len() + v.len() + 8).sum();
     let mut pkt = Vec::with_capacity(8 + 8 + params_est + 8 + stdin_body.len() + 64);
     write_fcgi_header(&mut pkt, FCGI_BEGIN_REQUEST, rid, 8, 0);
@@ -88,12 +129,17 @@ where
     let mut header_buf: Vec<u8> = Vec::with_capacity(4096);
     let mut body_prefix: Vec<u8> = Vec::new();
     let mut body_done = false;
+    let mut state = ResponseState::default();
 
     loop {
         let rec = read_fcgi_from_stream(stream).await?;
+        if state.accept(&rec)? {
+            body_done = true;
+            break;
+        }
         match rec.rec_type {
             t if t == FCGI_STDOUT => {
-                if rec.data.is_empty() { body_done = true; break; }
+                if rec.data.is_empty() { continue; }
                 header_buf.extend_from_slice(&rec.data);
                 if let Some((body_start, hdr_text_end)) = find_header_end(&header_buf) {
                     body_prefix = header_buf[body_start..].to_vec();
@@ -120,17 +166,7 @@ async fn read_fcgi_from_stream<S>(stream: &mut S) -> anyhow::Result<FcgiRecord>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
-    use tokio::io::AsyncReadExt;
-    let mut hdr = [0u8; 8];
-    stream.read_exact(&mut hdr).await?;
-    let rec_type    = hdr[1];
-    let content_len = u16::from_be_bytes([hdr[4], hdr[5]]) as usize;
-    let padding_len = hdr[6] as usize;
-    let total = content_len + padding_len;
-    let mut buf = vec![0u8; total];
-    if total > 0 { stream.read_exact(&mut buf).await?; }
-    buf.truncate(content_len);
-    Ok(FcgiRecord { rec_type, data: buf })
+    Ok(read_fcgi_record(stream).await?)
 }
 
 // ─────────────────────────────────────────────
@@ -142,26 +178,66 @@ pub(super) async fn build_streaming_response(
     parsed: FcgiParsedHeaders,
     pool: std::sync::Arc<crate::handler::fastcgi_pool::FcgiPool>,
     addr: String,
+    method: &str,
     fcgi_cache: Option<std::sync::Arc<crate::middleware::proxy_cache::ProxyCache>>,
     cache_key: Option<crate::middleware::proxy_cache::CacheKey>,
+    vary_req_headers: sweety_web::http::HeaderMap,
 ) -> WebResponse {
     if parsed.body_done {
         pool.release(&addr, parsed.conn);
-        write_fcgi_cache(&fcgi_cache, &cache_key, parsed.status, &parsed.headers, &parsed.body_prefix);
+        write_fcgi_cache(
+            &fcgi_cache,
+            &cache_key,
+            parsed.status,
+            &parsed.headers,
+            &parsed.body_prefix,
+            &vary_req_headers,
+        );
         return make_complete_response(parsed.status, parsed.headers, parsed.body_prefix);
+    }
+
+    // SSE（text/event-stream）永不结束：拿到响应头后立即进入流式透传，不做缓冲 / 缓存
+    let event_stream = parsed.headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("content-type")
+            && v.split(';').next().is_some_and(|m| m.trim().eq_ignore_ascii_case("text/event-stream"))
+    });
+    if event_stream {
+        return stream_remaining(parsed.body_prefix, parsed.conn, pool, addr, parsed.status, parsed.headers).await;
     }
 
     let mut conn = parsed.conn;
     let mut body = parsed.body_prefix;
     let mut use_stream = false;
+    let mut state = ResponseState::default();
     loop {
-        let rec = match read_fcgi_conn(&mut conn).await {
+        let rec = match read_response_record(&mut conn, pool.read_timeout_secs).await {
             Ok(r) => r,
-            Err(_) => break,
+            Err(e) => {
+                return stale_or_failed_response(
+                    e,
+                    method,
+                    &fcgi_cache,
+                    &cache_key,
+                    &vary_req_headers,
+                );
+            }
         };
+        match state.accept(&rec) {
+            Ok(true) => break,
+            Ok(false) => {}
+            Err(e) => {
+                return stale_or_failed_response(
+                    e,
+                    method,
+                    &fcgi_cache,
+                    &cache_key,
+                    &vary_req_headers,
+                );
+            }
+        }
         match rec.rec_type {
             t if t == FCGI_STDOUT => {
-                if rec.data.is_empty() { break; }
+                if rec.data.is_empty() { continue; }
                 body.extend_from_slice(&rec.data);
                 if body.len() > 4 * 1024 * 1024 { use_stream = true; break; }
             }
@@ -179,8 +255,53 @@ pub(super) async fn build_streaming_response(
     }
 
     pool.release(&addr, conn);
-    write_fcgi_cache(&fcgi_cache, &cache_key, parsed.status, &parsed.headers, &body);
+    write_fcgi_cache(
+        &fcgi_cache,
+        &cache_key,
+        parsed.status,
+        &parsed.headers,
+        &body,
+        &vary_req_headers,
+    );
     make_complete_response(parsed.status, parsed.headers, body)
+}
+
+fn stale_or_failed_response(
+    error: std::io::Error,
+    method: &str,
+    fcgi_cache: &Option<std::sync::Arc<crate::middleware::proxy_cache::ProxyCache>>,
+    cache_key: &Option<crate::middleware::proxy_cache::CacheKey>,
+    req_headers: &sweety_web::http::HeaderMap,
+) -> WebResponse {
+    let upstream_status = if error.kind() == std::io::ErrorKind::TimedOut {
+        504
+    } else {
+        502
+    };
+    if let (Some(cache), Some(key)) = (fcgi_cache, cache_key) {
+        if let Some(resp) = crate::middleware::proxy_cache::try_stale_error_serve(
+            cache,
+            method,
+            key,
+            req_headers,
+            upstream_status,
+        ) {
+            return resp;
+        }
+    }
+    failed_response(error)
+}
+
+fn failed_response(error: std::io::Error) -> WebResponse {
+    let status = if error.kind() == std::io::ErrorKind::TimedOut {
+        StatusCode::GATEWAY_TIMEOUT
+    } else {
+        StatusCode::BAD_GATEWAY
+    };
+    tracing::warn!(%error, "FastCGI response rejected");
+    let mut resp = WebResponse::new(ResponseBody::empty());
+    *resp.status_mut() = status;
+    resp
 }
 
 fn write_fcgi_cache(
@@ -189,10 +310,17 @@ fn write_fcgi_cache(
     status: u16,
     headers: &[(String, String)],
     body: &[u8],
+    vary_req_headers: &sweety_web::http::HeaderMap,
 ) {
     if let (Some(cache), Some(key)) = (cache, key) {
         if cache.is_cacheable(status, headers) {
-            cache.set(key.clone(), status, headers.to_vec(), bytes::Bytes::copy_from_slice(body));
+            cache.set(
+                key.clone(),
+                status,
+                headers.to_vec(),
+                bytes::Bytes::copy_from_slice(body),
+                vary_req_headers,
+            );
         }
     }
 }
@@ -212,14 +340,25 @@ async fn stream_remaining(
         if !initial.is_empty() {
             if tx.send(Ok(bytes::Bytes::from(initial))).await.is_err() { return; }
         }
+        let mut state = ResponseState::default();
         loop {
-            let rec = match read_fcgi_conn(&mut conn).await {
-                Ok(r) => r,
-                Err(e) => { let _ = tx.send(Err(e)).await; return; }
+            // 客户端断开（rx drop）时立即结束，避免长连接（SSE）在客户端离开后仍占用 PHP-FPM 连接
+            let rec = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                r = read_response_record(&mut conn, pool.read_timeout_secs) => match r {
+                    Ok(r) => r,
+                    Err(e) => { let _ = tx.send(Err(e)).await; return; }
+                },
             };
+            match state.accept(&rec) {
+                Ok(true) => { pool.release(&addr, conn); return; }
+                Ok(false) => {}
+                Err(e) => { let _ = tx.send(Err(e)).await; return; }
+            }
             match rec.rec_type {
                 t if t == FCGI_STDOUT => {
-                    if rec.data.is_empty() { pool.release(&addr, conn); return; }
+                    if rec.data.is_empty() { continue; }
                     if tx.send(Ok(bytes::Bytes::from(rec.data))).await.is_err() { return; }
                 }
                 t if t == FCGI_STDERR => {
@@ -227,7 +366,7 @@ async fn stream_remaining(
                         if !s.trim().is_empty() { tracing::warn!("PHP-FPM stderr: {}", s.trim()); }
                     }
                 }
-                _ => { pool.release(&addr, conn); return; }
+                _ => return,
             }
         }
     });
@@ -246,6 +385,8 @@ async fn stream_remaining(
     let mut resp = WebResponse::new(body_rb);
     *resp.status_mut() = http_status;
     for (k, v) in &headers {
+        // 连接级头不得转发（RFC 9110 §7.6.1；H2/H3 中出现即为畸形消息）
+        if crate::handler::reverse_proxy::response::is_hop_by_hop(k) { continue; }
         if let (Ok(name), Ok(val)) = (
             HeaderName::from_bytes(k.as_bytes()),
             HeaderValue::from_bytes(v.as_bytes()),
@@ -274,6 +415,7 @@ pub(super) fn make_complete_response(status: u16, headers: Vec<(String, String)>
     };
     *resp.status_mut() = http_status;
     for (k, v) in &headers {
+        if crate::handler::reverse_proxy::response::is_hop_by_hop(k) { continue; }
         if let (Ok(name), Ok(val)) = (
             HeaderName::from_bytes(k.as_bytes()),
             HeaderValue::from_bytes(v.as_bytes()),
@@ -291,3 +433,36 @@ pub(super) fn make_complete_response(status: u16, headers: Vec<(String, String)>
     }
     resp
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(rec_type: u8, data: &[u8]) -> FcgiRecord {
+        FcgiRecord { rec_type, request_id: REQUEST_ID, data: data.to_vec() }
+    }
+
+    #[test]
+    fn response_requires_end_request_before_reuse() {
+        let mut state = ResponseState::default();
+        assert!(!state.accept(&record(FCGI_STDOUT, b"body")).unwrap());
+        assert!(!state.accept(&record(FCGI_STDOUT, b"")).unwrap());
+        assert!(!state.accept(&record(FCGI_STDERR, b"")).unwrap());
+        assert!(state.accept(&record(FCGI_END_REQUEST, &[0; 8])).unwrap());
+        assert!(state.accept(&record(FCGI_STDOUT, b"later")).is_err());
+    }
+
+    #[test]
+    fn response_rejects_incomplete_or_wrong_request() {
+        let mut state = ResponseState::default();
+        assert!(state.accept(&record(FCGI_END_REQUEST, &[0; 8])).is_err());
+        let mut wrong = record(FCGI_STDOUT, b"body");
+        wrong.request_id = 2;
+        assert!(state.accept(&wrong).is_err());
+        assert!(state.accept(&record(255, b"")).is_err());
+        assert!(!state.accept(&record(FCGI_STDOUT, b"")).unwrap());
+        assert!(state.accept(&record(FCGI_STDOUT, b"late")).is_err());
+        assert!(state.accept(&record(FCGI_END_REQUEST, &[0; 7])).is_err());
+    }
+}
+

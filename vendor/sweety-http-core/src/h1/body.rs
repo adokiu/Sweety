@@ -146,6 +146,7 @@ impl RequestBodySender {
     // Lazily wait until RequestBody is already polled.
     // For specific use case body must not be eagerly polled.
     // For example: Request with Expect: Continue header.
+    #[allow(dead_code)]
     pub(super) fn wait_for_poll(&mut self) -> impl Future<Output = io::Result<()>> + '_ {
         self.ready_with(|inner| inner.waiting())
     }
@@ -242,6 +243,7 @@ impl Inner {
     fn poll_next_unpin(&mut self, cx: &Context<'_>) -> Poll<Option<io::Result<Bytes>>> {
         if let Some(data) = self.items.pop_front() {
             self.len -= data.len();
+            self.wake_io();
             Poll::Ready(Some(Ok(data)))
         } else if let Some(err) = self.err.take() {
             Poll::Ready(Some(Err(err)))
@@ -252,5 +254,35 @@ impl Inner {
             self.wake_io();
             Poll::Pending
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    use std::task::Wake;
+
+    struct CountWake(AtomicUsize);
+
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn consuming_data_wakes_backpressured_sender() {
+        let (mut tx, mut body) = RequestBody::channel(false);
+        tx.feed_data(Bytes::from(vec![0; MAX_BUFFER_SIZE / 2]));
+        tx.feed_data(Bytes::from(vec![0; MAX_BUFFER_SIZE / 2]));
+        let wake = Arc::new(CountWake(AtomicUsize::new(0)));
+        let waker = Waker::from(wake.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut ready = core::pin::pin!(tx.ready());
+        assert!(ready.as_mut().poll(&mut cx).is_pending());
+        assert!(matches!(Pin::new(&mut body).poll_next(&mut cx), Poll::Ready(Some(Ok(_)))));
+        assert_eq!(wake.0.load(Ordering::SeqCst), 1);
+        assert!(matches!(ready.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
     }
 }

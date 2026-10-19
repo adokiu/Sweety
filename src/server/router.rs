@@ -8,9 +8,14 @@
 
 use std::sync::Arc;
 
+use std::collections::HashMap;
+
 use sweety_web::{
     body::ResponseBody,
-    http::{StatusCode, WebResponse, header::{CONTENT_TYPE, LOCATION, HeaderValue}},
+    http::{
+        Method, StatusCode, WebResponse,
+        header::{CONTENT_TYPE, LOCATION, RETRY_AFTER, HeaderValue},
+    },
     WebContext,
 };
 
@@ -44,6 +49,17 @@ pub(super) async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebRes
     state.metrics.inc_requests();
     let _req_guard = RequestGuard(state.metrics.clone());
 
+    let global = state.cfg.load().global.clone();
+    let method = ctx.req().method();
+    if *method == Method::TRACE && global.disable_http_trace {
+        state.metrics.record_status(405);
+        return make_method_not_allowed();
+    }
+    if *method == Method::CONNECT && !ctx.req().body().is_h2_ws() && !global.allow_http_connect_tunnel {
+        state.metrics.record_status(405);
+        return make_method_not_allowed();
+    }
+
     // ACME HTTP-01 challenge 响应（优先于所有站点匹配）
     {
         let path = ctx.req().uri().path();
@@ -63,29 +79,22 @@ pub(super) async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebRes
         }
     }
 
-    // 解析 Host 头（H2/H3 用 :authority，H1 用 Host 头）
-    let host_raw = ctx.req().uri().authority()
-        .map(|a| a.as_str())
-        .or_else(|| ctx.req().headers().get("host").and_then(|v| v.to_str().ok()))
+    // Host 优先于 URI authority（HTTP/1.1 以 Host 为准；H2/H3 通常只有 :authority）
+    let host_raw = ctx
+        .req()
+        .headers()
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| ctx.req().uri().authority().map(|a| a.as_str()))
         .unwrap_or("");
-    let (host, host_port): (&str, Option<u16>) = if host_raw.starts_with('[') {
-        if let Some(end) = host_raw.find(']') {
-            let h = &host_raw[..=end];
-            let p = host_raw[end + 1..].strip_prefix(':').and_then(|s| s.parse().ok());
-            (h, p)
-        } else {
-            (host_raw, None)
-        }
-    } else if let Some((h, p)) = host_raw.rsplit_once(':') {
-        (h, p.parse().ok())
-    } else {
-        (host_raw, None)
-    };
+    let (host, host_port) = crate::dispatcher::host::split_host_port(host_raw);
 
-    let path = ctx.req().uri().path();
+    let path_raw = ctx.req().uri().path();
+    let path_decoded = crate::handler::static_file::decode_uri_path(path_raw);
+    let path = path_decoded.as_deref().unwrap_or(path_raw);
     let request_uri = ctx.req().uri().path_and_query()
         .map(|pq| pq.as_str())
-        .unwrap_or(path);
+        .unwrap_or(path_raw);
     let is_https = ctx.req().body().is_tls();
 
     // HTTPS 严格匹配：无精确/通配符匹配时返回 421
@@ -101,8 +110,13 @@ pub(super) async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebRes
         match state.registry.lookup_by_host(host) {
             Some(s) => s,
             None => {
-                state.metrics.record_status(404);
-                return make_error_resp(StatusCode::NOT_FOUND);
+                // 单站点 + 用 IP 访问时 Host 可能与 server_name 不一致，仍路由到唯一站点
+                if state.registry.site_count() == 1 {
+                    state.registry.all_sites().into_iter().next().unwrap()
+                } else {
+                    state.metrics.record_status(404);
+                    return make_error_resp(StatusCode::NOT_FOUND);
+                }
             }
         }
     };
@@ -118,9 +132,31 @@ pub(super) async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebRes
         conn_ip
     };
 
+    if let Some(ref limiter) = site.rate_limiter {
+        let ua = ctx
+            .req()
+            .headers()
+            .get(sweety_web::http::header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let hdr_map: HashMap<String, String> = ctx
+            .req()
+            .headers()
+            .iter()
+            .filter_map(|(k, v)| v.to_str().ok().map(|vs| (k.as_str().to_string(), vs.to_string())))
+            .collect();
+        if let crate::middleware::rate_limit::RateLimitResult::Deny { retry_after_secs } =
+            limiter.check_all(&effective_client_ip.to_string(), path, &hdr_map, ua)
+        {
+            state.metrics.record_status(429);
+            return make_rate_limited_resp(retry_after_secs);
+        }
+    }
+
     // force_https 重定向（启用 ACME 但尚无有效证书时跳过，避免阻塞首次申请）
     let acme_cert_ready = !site.acme || crate::server::tls::ACME_CERTS_READY.contains(&site.name);
-    if site.force_https && !is_https && acme_cert_ready {
+    let tls_configured = site.tls.is_some();
+    if site.force_https && tls_configured && !is_https && acme_cert_ready {
         let tls_port = if site.listen_tls.contains(&443) { 443 }
                        else { site.listen_tls.first().copied().unwrap_or(443) };
         let host_for_redirect = if tls_port == 443 { host.to_string() }
@@ -309,7 +345,7 @@ pub(super) async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebRes
             }
         }
         HandlerType::Websocket => {
-            crate::handler::websocket::handle_sweety(ctx, &location).await
+            crate::handler::websocket::handle_sweety(ctx, &site, &location).await
         }
         HandlerType::ReverseProxy => {
             crate::handler::reverse_proxy::handle_sweety(ctx, &site, &location).await
@@ -453,11 +489,29 @@ pub(super) async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebRes
 
 /// 构造 HTML 错误响应（不依赖 ctx）
 #[inline(always)]
+fn make_method_not_allowed() -> WebResponse {
+    let mut resp = make_error_resp(StatusCode::METHOD_NOT_ALLOWED);
+    crate::handler::reverse_proxy::response::attach_standard_allow(&mut resp);
+    resp
+}
+
+fn make_rate_limited_resp(retry_after_secs: u64) -> WebResponse {
+    let mut resp = make_error_resp(StatusCode::TOO_MANY_REQUESTS);
+    if let Ok(v) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+        resp.headers_mut().insert(RETRY_AFTER, v);
+    }
+    resp
+}
+
 pub(crate) fn make_error_resp(status: StatusCode) -> WebResponse {
     let body = crate::handler::error_page::get_error_bytes(status.as_u16());
     let mut resp = WebResponse::new(ResponseBody::from(body));
     *resp.status_mut() = status;
     resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+    if status == StatusCode::METHOD_NOT_ALLOWED {
+        crate::handler::reverse_proxy::response::attach_standard_allow(&mut resp);
+    }
+    crate::handler::reverse_proxy::response::attach_http_date(&mut resp);
     resp
 }
 

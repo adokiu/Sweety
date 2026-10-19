@@ -1,13 +1,34 @@
-﻿//! 响应处理模块
+//! 响应处理模块
 //! 负责：响应头透传（跳过 hop-by-hop）、Set-Cookie 改写、Location 重写、proxy_error
+
+use std::time::SystemTime;
 
 use sweety_web::{
     body::ResponseBody,
     http::{
-        StatusCode, WebResponse,
-        header::{CONTENT_TYPE, HeaderValue},
+        StatusCode, Version, WebResponse,
+        header::{ALLOW, CONTENT_TYPE, DATE, HeaderName, HeaderValue, VIA},
+        stage_trailers_on_headers,
     },
 };
+
+/// RFC 9110 §6.6.1：错误响应携带当前 Date
+pub fn attach_http_date(resp: &mut WebResponse) {
+    if resp.headers().contains_key(DATE) {
+        return;
+    }
+    if let Ok(v) = HeaderValue::from_str(&httpdate::fmt_http_date(SystemTime::now())) {
+        resp.headers_mut().insert(DATE, v);
+    }
+}
+
+/// RFC 9110 §15.5.6：405 应声明本网关支持的方法
+pub const STANDARD_HTTP_ALLOW: &str = "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS";
+
+pub fn attach_standard_allow(resp: &mut WebResponse) {
+    resp.headers_mut()
+        .insert(ALLOW, HeaderValue::from_static(STANDARD_HTTP_ALLOW));
+}
 
 /// 编译期 hop-by-hop 头完美哈希表（全小写 key，O(1) 查找）
 static HOP_BY_HOP_SET: phf::Set<&'static str> = phf::phf_set! {
@@ -36,6 +57,21 @@ pub fn is_hop_by_hop(name: &str) -> bool {
         Err(_) => return false,
     };
     HOP_BY_HOP_SET.contains(lower)
+}
+
+/// 解析 Connection 头列出的连接选项（RFC 9110 §7.6.1），返回小写字段名列表。
+/// 这些字段只对当前连接有效，代理转发前必须移除。
+pub fn connection_tokens<'a>(values: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for v in values {
+        for t in v.split(',') {
+            let t = t.trim();
+            if !t.is_empty() {
+                tokens.push(t.to_ascii_lowercase());
+            }
+        }
+    }
+    tokens
 }
 
 /// 对响应体内容做 sub_filter 替换（等价 Nginx sub_filter）
@@ -101,6 +137,27 @@ fn sub_filter_regex(pattern: &str) -> Option<regex::Regex> {
     }
 }
 
+/// 网关生成的响应追加 Via（RFC 9110 §7.6.3），与请求侧 `Via` 语义一致。
+pub fn append_gateway_via(resp: &mut WebResponse, version: Version) {
+    let received_protocol = match version {
+        Version::HTTP_10 => "1.0",
+        Version::HTTP_2 => "2",
+        Version::HTTP_3 => "3",
+        _ => "1.1",
+    };
+    let hop = format!("{received_protocol} sweety");
+    let merged = resp.headers().get(VIA).and_then(|v| v.to_str().ok()).map(|existing| {
+        if existing.is_empty() {
+            hop.clone()
+        } else {
+            format!("{existing}, {hop}")
+        }
+    }).unwrap_or(hop);
+    if let Ok(val) = HeaderValue::from_str(&merged) {
+        resp.headers_mut().insert(VIA, val);
+    }
+}
+
 /// 将上游响应头全量透传给客户端（Nginx proxy_pass 默认行为）
 ///
 /// - 跳过 hop-by-hop 头（Connection / Transfer-Encoding 等）
@@ -117,9 +174,15 @@ pub fn apply_response_headers(
 ) {
     use sweety_web::http::header::HeaderName;
 
+    // 上游 Connection 头列出的字段同样不得转发（RFC 9110 §7.6.1）
+    let conn_tokens = connection_tokens(
+        headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("connection")).map(|(_, v)| v.as_str()),
+    );
+
     for (k, v) in headers {
         // hop-by-hop 头不透传给客户端，phf O(1) 查找
         if is_hop_by_hop(k) { continue; }
+        if !conn_tokens.is_empty() && conn_tokens.iter().any(|t| t.eq_ignore_ascii_case(k)) { continue; }
 
         // Location：将上游 URL 前缀替换为客户端 URL（等价 Nginx proxy_redirect）
         if k.eq_ignore_ascii_case("location") {
@@ -157,6 +220,22 @@ pub fn apply_response_headers(
     }
 }
 
+#[cfg(test)]
+mod via_tests {
+    use super::*;
+    use sweety_web::http::Version;
+
+    #[test]
+    fn append_gateway_via_merges_existing() {
+        let mut resp = WebResponse::new(ResponseBody::empty());
+        resp.headers_mut().insert(VIA, HeaderValue::from_static("1.1 upstream"));
+        append_gateway_via(&mut resp, Version::HTTP_2);
+        let via = resp.headers().get(VIA).unwrap().to_str().unwrap();
+        assert!(via.contains("1.1 upstream"));
+        assert!(via.contains("2 sweety"));
+    }
+}
+
 /// 修改 Set-Cookie 属性：
 /// - 去掉 `Secure` 标志（HTTP 代理 HTTPS 上游时必须，否则浏览器不存 Cookie）
 /// - 替换 `Domain=upstream` 为指定值
@@ -188,8 +267,35 @@ pub fn parse_status_code(status_line: &str) -> u16 {
         .unwrap_or(502)
 }
 
-/// 构造 HTML 错误响应
-pub fn proxy_error(status: StatusCode, _msg: &str) -> WebResponse {
+/// 将上游 chunked trailer 或 gRPC 尾部头挂到响应（H2/H3 由栈拆成 TRAILERS 帧）
+pub fn apply_upstream_trailers(resp: &mut WebResponse, pairs: &[(String, String)]) {
+    if pairs.is_empty() {
+        return;
+    }
+    stage_trailers_on_headers(resp.headers_mut(), pairs);
+}
+
+/// gRPC：把误放在响应头里的 grpc-* 挪到 trailer（HTTP/2 规范要求）
+pub fn promote_grpc_headers_to_trailers(resp: &mut WebResponse) {
+    let ct = resp.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    if !ct.contains("application/grpc") {
+        return;
+    }
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for name in ["grpc-status", "grpc-message", "grpc-status-details-bin"] {
+        if let Some(v) = resp.headers().get(name).and_then(|v| v.to_str().ok()) {
+            pairs.push((name.to_string(), v.to_string()));
+            resp.headers_mut().remove(HeaderName::from_static(name));
+        }
+    }
+    if pairs.is_empty() {
+        pairs.push(("grpc-status".to_string(), "0".to_string()));
+    }
+    apply_upstream_trailers(resp, &pairs);
+}
+
+/// 构造 HTML 错误响应（含网关 Via）
+pub fn proxy_error(status: StatusCode, _msg: &str, client_version: Version) -> WebResponse {
     let body = crate::handler::error_page::build_default_html(status.as_u16());
     let mut resp = WebResponse::new(ResponseBody::from(body));
     *resp.status_mut() = status;
@@ -197,5 +303,10 @@ pub fn proxy_error(status: StatusCode, _msg: &str) -> WebResponse {
         CONTENT_TYPE,
         HeaderValue::from_static("text/html; charset=utf-8"),
     );
+    if status == StatusCode::METHOD_NOT_ALLOWED {
+        attach_standard_allow(&mut resp);
+    }
+    attach_http_date(&mut resp);
+    append_gateway_via(&mut resp, client_version);
     resp
 }

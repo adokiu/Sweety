@@ -6,11 +6,9 @@ use core::{
     time::Duration,
 };
 
-use std::io;
-
 use futures_core::stream::Stream;
 use http_ws::{
-    HandshakeError, Item, Message as WsMessage, ProtocolError, WsOutput,
+    CloseReason, HandshakeError, Item, Message as WsMessage, ProtocolError, WsOutput,
     stream::{RequestStream, WsError},
 };
 use tokio::time::{Instant, sleep};
@@ -239,14 +237,12 @@ async fn spawn_task<B>(
                             continue;
                         }
                         WsMessage::Ping(ping) => {
-                            tx.send(WsMessage::Pong(ping)).await?;
+                            tx.pong(ping).await?;
                             continue;
                         }
                         WsMessage::Close(reason) => {
-                            match tx.send(WsMessage::Close(reason)).await {
-                                // ProtocolError::Closed error means someone already sent close message
-                                // so just ignore it and treat as success.
-                                Ok(_) | Err(ProtocolError::Closed) => return Ok(()),
+                            match tx.close(reason).await {
+                                Ok(_) | Err(ProtocolError::SendClosed) => return Ok(()),
                                 Err(e) => return Err(e.into()),
                             }
                         }
@@ -258,10 +254,8 @@ async fn spawn_task<B>(
                 SelectOutput::A(None) => return Ok(()),
                 SelectOutput::B(_) => match un_answered_ping.cmp(&max_unanswered_ping) {
                     Ordering::Less => {
-                        if let Err(e) = tx.send(WsMessage::Ping(Bytes::new())).await {
-                            // continue ping timer when websocket is closed.
-                            // client may be lagging behind and not respond to close message immediately.
-                            if !matches!(e, ProtocolError::Closed) {
+                        if let Err(e) = tx.ping(Bytes::new()).await {
+                            if !matches!(e, ProtocolError::SendClosed) {
                                 return Err(e.into());
                             }
                         }
@@ -270,19 +264,12 @@ async fn spawn_task<B>(
                     }
                     // on last interval try to send close message to client to inform it connection
                     // is going away.
-                    Ordering::Equal => match tx.send(WsMessage::Close(None)).await {
+                    Ordering::Equal => match tx.close(None::<CloseReason>).await {
                         Ok(_) => un_answered_ping += 1,
-                        // ProtocolError::Closed error means someone already sent close message
-                        // so just ignore it and end connection right away.
-                        Err(ProtocolError::Closed) => return Ok(()),
+                        Err(ProtocolError::SendClosed) => return Ok(()),
                         Err(e) => return Err(e.into()),
                     },
-                    // this will only happen when client fail to respond to the close message on last
-                    // interval in time and at this point just closed the connection with an io error.
-                    Ordering::Greater => {
-                        let _ = tx.send_error(io::ErrorKind::UnexpectedEof.into()).await;
-                        return Ok(());
-                    }
+                    Ordering::Greater => return Ok(()),
                 },
             }
         }

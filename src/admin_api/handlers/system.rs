@@ -43,6 +43,7 @@ pub fn route_system(ctx: &AdminContext) -> (u16, String) {
 
 pub fn route_stop() -> (u16, String) {
     tokio::spawn(async {
+        sweety_web::set_h3_draining(true);
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         info!("管理 API 收到停机指令，正在退出...");
         std::process::exit(0);

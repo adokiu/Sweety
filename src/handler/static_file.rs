@@ -16,7 +16,7 @@ use sweety_web::{
         StatusCode, WebResponse,
         header::{
             ACCEPT_RANGES, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE,
-            CONTENT_TYPE, ETAG, LAST_MODIFIED, IF_MODIFIED_SINCE, IF_NONE_MATCH, VARY,
+            CONTENT_TYPE, ETAG, LAST_MODIFIED, VARY,
             HeaderMap, HeaderValue,
         },
     },
@@ -34,15 +34,15 @@ mod path;
 mod range;
 
 pub use cache::{start_file_cache_watcher, init_cache_limits};
-pub use path::{TryFilesResult, try_files_resolve, resolve_safe_path, resolve_safe_path_fast};
+pub use path::{TryFilesResult, decode_uri_path, try_files_resolve, resolve_safe_path, resolve_safe_path_fast};
 
 use cache::{
-    FileCacheEntry, cache_get_fast, cache_insert, make_cache_key,
+    FileCacheEntry, cache_get_validated, cache_insert, make_cache_key,
     fd_cache_get_or_open_arc, make_cache_key_from_path,
     GZIP_MAX_INLINE, FILE_CACHE_MAX_BYTES,
 };
 use compress::{stream_file_response_pread, stream_file_response_compressed, CompressEncoding, gzip_compress, brotli_compress, zstd_compress};
-use range::parse_range;
+use range::{parse_range, RangeSpec};
 
 
 /// 根据 Accept-Encoding 头和缓存条目选出最优编码
@@ -76,8 +76,10 @@ pub async fn handle_sweety(
     site: &SiteInfo,
     location: &LocationConfig,
 ) -> WebResponse {
-    // 直接导用 URI 中的路径，避免 to_string() 堆分配
-    let path = ctx.req().uri().path();
+    let path = match decode_uri_path(ctx.req().uri().path()) {
+        Some(p) => p,
+        None => return make_error(StatusCode::NOT_FOUND, "Not Found"),
+    };
     let method = ctx.req().method().as_str();
     let req_headers = ctx.req().headers();
 
@@ -89,45 +91,55 @@ pub async fn handle_sweety(
         }
     };
 
+    // 静态资源只支持 GET / HEAD（RFC 9110 §15.5.6：405 必须携带 Allow）；OPTIONS 返回能力声明
+    if !matches!(method, "GET" | "HEAD") {
+        let allow = HeaderValue::from_static("GET, HEAD, OPTIONS");
+        let mut resp = if method == "OPTIONS" {
+            let mut r = WebResponse::new(ResponseBody::none());
+            *r.status_mut() = StatusCode::NO_CONTENT;
+            r
+        } else {
+            make_error(StatusCode::METHOD_NOT_ALLOWED, "")
+        };
+        resp.headers_mut().insert(sweety_web::http::header::ALLOW, allow);
+        return resp;
+    }
+
     let is_range_req = req_headers.get(sweety_web::http::header::RANGE).is_some();
-    let is_head      = method.eq_ignore_ascii_case("HEAD");
+    let is_head      = method == "HEAD";
 
     // ── 小文件内存缓存热路径 ────────────────────────────────────────────────────
     // 热路径：先用无 canonicalize 的快速路径构建 key 查缓存
     // 缓存 key 在写入时已经是 canonical path，查缓存只需 root.join + cache.get
     // 命中时完全跳过 canonicalize/stat/open 系统调用
     // Range 请求也走此热路径：小文件数据在内存中，直接 slice，零 syscall
-    if !is_head {
+    if !(is_head && is_range_req) {
         // 快速 `..` 检查（不做 syscall）
-        let path_only = path.split('?').next().unwrap_or(path);
+        let path_only = path.as_str();
         let has_traversal = path_only.split('/').any(|s| s == "..");
         if has_traversal {
             return make_error(StatusCode::FORBIDDEN, "Forbidden");
         }
         let relative = path_only.trim_start_matches('/');
-        if let Some(entry) = cache_get_fast(root, relative) {
+        if let Some(entry) = cache_get_validated(root, relative).await {
             let modified_secs = entry.modified_secs;
             let etag_str = entry.hv_etag.to_str().unwrap_or("");
 
-            // 304 协商缓存
-            let if_none_match     = req_headers.get(IF_NONE_MATCH).and_then(|v| v.to_str().ok());
-            let if_modified_since = req_headers.get(IF_MODIFIED_SINCE)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| httpdate::parse_http_date(s).ok())
-                .map(to_unix_secs);
-            if crate::middleware::cache::is_cache_valid(if_none_match, if_modified_since, etag_str, modified_secs) {
-                let mut resp = WebResponse::new(ResponseBody::none());
-                *resp.status_mut() = StatusCode::NOT_MODIFIED;
+            // 条件请求（RFC 9110 §13.2.2）：304 / 412
+            if let Some(resp) = check_preconditions(method, req_headers, etag_str, modified_secs, || {
+                not_modified(entry.hv_etag.clone(), entry.hv_last_modified.clone(), entry.hv_cache_control.clone())
+            }) {
                 return resp;
             }
 
             // ── Range 请求：直接从内存缓存 slice，零 open/seek syscall ─────────
             if is_range_req {
                 let file_size = entry.data.len() as u64;
-                let range_hdr = req_headers
-                    .get(sweety_web::http::header::RANGE)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| parse_range(s, file_size));
+                let range_hdr = match decide_range(req_headers, method, file_size, etag_str, modified_secs) {
+                    RangeDecision::Partial(s, e) => Some((s, e)),
+                    RangeDecision::NotSatisfiable => return range_not_satisfiable(file_size),
+                    RangeDecision::Full => None,
+                };
                 if let Some((range_start, range_end)) = range_hdr {
                     let range_len = range_end - range_start + 1;
                     let slice = entry.data.slice(range_start as usize..=range_end as usize);
@@ -139,28 +151,39 @@ pub async fn handle_sweety(
                     h.insert(ETAG, entry.hv_etag.clone());
                     h.insert(LAST_MODIFIED, entry.hv_last_modified.clone());
                     h.insert(CACHE_CONTROL, entry.hv_cache_control.clone());
+                    h.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
                     h.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
                     if let Ok(v) = HeaderValue::from_str(itoa::Buffer::new().format(range_len)) {
                         h.insert(CONTENT_LENGTH, v);
                     }
-                    let mut cr = String::with_capacity(32);
-                    cr.push_str("bytes "); cr.push_str(itoa::Buffer::new().format(range_start));
-                    cr.push('-'); cr.push_str(itoa::Buffer::new().format(range_end));
-                    cr.push('/'); cr.push_str(itoa::Buffer::new().format(file_size));
-                    if let Ok(v) = HeaderValue::from_str(&cr) { h.insert(CONTENT_RANGE, v); }
+                    if let Some(v) = content_range_value(range_start, range_end, file_size) { h.insert(CONTENT_RANGE, v); }
                     return resp;
                 }
-                // Range 解析失败（超出范围等），回落到下方常规路径
+                // Range 被忽略（语法无效 / 多区间 / If-Range 不满足），回落到下方完整响应
             }
 
             // 选择最优编码（br > zstd > gzip > 原始），严格 q= 解析，复用缓存中预压缩结果
             let (body_bytes, enc) = pick_encoding(req_headers, &entry);
             let body_bytes = body_bytes.clone();
 
+            if is_head {
+                let mut resp = WebResponse::new(ResponseBody::none());
+                let h = resp.headers_mut();
+                h.insert(CONTENT_TYPE, entry.hv_content_type.clone());
+                h.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
+                h.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+                h.insert(CONTENT_LENGTH, entry.hv_content_length.clone());
+                h.insert(ETAG, entry.hv_etag.clone());
+                h.insert(LAST_MODIFIED, entry.hv_last_modified.clone());
+                h.insert(CACHE_CONTROL, entry.hv_cache_control.clone());
+                return resp;
+            }
+
             // 直接插入预构建的头，零 from_str 分配
             let mut resp = WebResponse::new(ResponseBody::from(body_bytes.clone()));
             let h = resp.headers_mut();
             h.insert(CONTENT_TYPE,   entry.hv_content_type.clone());
+            h.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
             h.insert(ACCEPT_RANGES,  HeaderValue::from_static("bytes"));
             if enc.is_some() {
                 if let Ok(v) = HeaderValue::from_str(itoa::Buffer::new().format(body_bytes.len())) {
@@ -181,7 +204,7 @@ pub async fn handle_sweety(
         }
         // 缓存未命中：做完整安全检查，然后读文件并缓存
         let canonical_root_ref = site.canonical_root.as_deref();
-        let file_path = match resolve_safe_path_fast(root, path, canonical_root_ref) {
+        let file_path = match resolve_safe_path_fast(root, &path, canonical_root_ref) {
             Some(p) => p,
             None => return make_error(StatusCode::FORBIDDEN, "Forbidden"),
         };
@@ -218,18 +241,23 @@ pub async fn handle_sweety(
         let modified_secs = to_unix_secs(meta.modified().unwrap_or(SystemTime::UNIX_EPOCH));
         let etag_val      = generate_etag(file_size, modified_secs);
 
-        let if_none_match     = req_headers.get(IF_NONE_MATCH).and_then(|v| v.to_str().ok());
-        let if_modified_since = req_headers.get(IF_MODIFIED_SINCE)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| httpdate::parse_http_date(s).ok())
-            .map(to_unix_secs);
-        if crate::middleware::cache::is_cache_valid(if_none_match, if_modified_since, &etag_val, modified_secs) {
-            let mut resp = WebResponse::new(ResponseBody::none());
-            *resp.status_mut() = StatusCode::NOT_MODIFIED;
+        if let Some(resp) = check_preconditions(method, req_headers, &etag_val, modified_secs, || {
+            not_modified_for(&file_path, &etag_val, modified_secs, location)
+        }) {
             return resp;
         }
 
-        if file_size <= FILE_CACHE_MAX_BYTES {
+        // 未缓存的小文件同样遵守 Range（含 416）：判定后再决定走内存全量还是 fd 分片
+        let range_decision = if is_range_req {
+            decide_range(req_headers, method, file_size, &etag_val, modified_secs)
+        } else {
+            RangeDecision::Full
+        };
+        if matches!(range_decision, RangeDecision::NotSatisfiable) {
+            return range_not_satisfiable(file_size);
+        }
+
+        if file_size <= FILE_CACHE_MAX_BYTES && matches!(range_decision, RangeDecision::Full) {
             let data = match tokio::fs::read(&file_path).await {
                 Ok(d) => d,
                 Err(e) => {
@@ -286,7 +314,9 @@ pub async fn handle_sweety(
             let http_date = httpdate::fmt_http_date(modified_time);
             let cc = location.cache_control.as_deref().unwrap_or_else(|| default_cache_control(ext));
             let mut cl_buf = itoa::Buffer::new();
+            let source_path = make_cache_key_from_path(&file_path);
             let entry = FileCacheEntry {
+                source_path:        source_path.clone(),
                 data:               bytes.clone(),
                 gz:                 gz_bytes,
                 br:                 br_bytes,
@@ -318,6 +348,7 @@ pub async fn handle_sweety(
             let mut resp = WebResponse::new(ResponseBody::from(resp_bytes.clone()));
             let h = resp.headers_mut();
             h.insert(CONTENT_TYPE,   hv_ct);
+            h.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
             h.insert(ACCEPT_RANGES,  HeaderValue::from_static("bytes"));
             if enc_hv.is_some() {
                 if let Ok(v) = HeaderValue::from_str(itoa::Buffer::new().format(resp_bytes.len())) {
@@ -336,7 +367,7 @@ pub async fn handle_sweety(
             return resp;
         }
 
-        // 大文件（> FILE_CACHE_MAX_BYTES）：先查 fd 缓存，命中则共享 fd 直接用；否则 open 后写入缓存
+        // 大文件（> FILE_CACHE_MAX_BYTES）或 Range 请求：先查 fd 缓存，命中则共享 fd 直接用；否则 open 后写入缓存
         debug!("提供静态文件(stream): {} size={} range={}", file_path.display(), file_size, is_range_req);
         let arc_fd = match fd_cache_get_or_open_arc(&file_path, file_size, modified_secs).await {
             Some(f) => f,
@@ -347,36 +378,25 @@ pub async fn handle_sweety(
         };
 
         // Range 请求：只传 Range 片段
-        if is_range_req {
-            let range = req_headers
-                .get(sweety_web::http::header::RANGE)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| parse_range(s, file_size));
-            if let Some((range_start, range_end)) = range {
-                let range_len = range_end - range_start + 1;
-                // Range ≤ 4MB：单次 pread 读满到堆内存，零 stream 调度开销
-                // 典型场景：视频分块请求（浏览器默认 128KB-1MB/块）
-                const PREAD_INLINE_MAX: u64 = 4 * 1024 * 1024;
-                let body = if range_len <= PREAD_INLINE_MAX {
-                    match crate::handler::sendfile::async_read_range(&arc_fd, range_start, range_len as usize).await {
-                        Ok(buf) => ResponseBody::from(buf),
-                        Err(_) => return make_error(StatusCode::INTERNAL_SERVER_ERROR, ""),
-                    }
-                } else {
-                    let stream = crate::handler::sendfile::pread_stream(arc_fd, range_start, range_len);
-                    ResponseBody::box_stream(stream)
-                };
-                let mut resp = WebResponse::new(body);
-                *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
-                set_file_headers(resp.headers_mut(), &file_path, range_len, &etag_val, modified_secs, location);
-                let mut cr = String::with_capacity(32);
-                cr.push_str("bytes "); cr.push_str(itoa::Buffer::new().format(range_start));
-                cr.push('-'); cr.push_str(itoa::Buffer::new().format(range_end));
-                cr.push('/'); cr.push_str(itoa::Buffer::new().format(file_size));
-                if let Ok(v) = HeaderValue::from_str(&cr) { resp.headers_mut().insert(CONTENT_RANGE, v); }
-                return resp;
-            }
-            // Range 解析失败（超出范围），回落到全量传输
+        if let RangeDecision::Partial(range_start, range_end) = range_decision {
+            let range_len = range_end - range_start + 1;
+            // Range ≤ 4MB：单次 pread 读满到堆内存，零 stream 调度开销
+            // 典型场景：视频分块请求（浏览器默认 128KB-1MB/块）
+            const PREAD_INLINE_MAX: u64 = 4 * 1024 * 1024;
+            let body = if range_len <= PREAD_INLINE_MAX {
+                match crate::handler::sendfile::async_read_range(&arc_fd, range_start, range_len as usize).await {
+                    Ok(buf) => ResponseBody::from(buf),
+                    Err(_) => return make_error(StatusCode::INTERNAL_SERVER_ERROR, ""),
+                }
+            } else {
+                let stream = crate::handler::sendfile::pread_stream(arc_fd, range_start, range_len);
+                ResponseBody::box_stream(stream)
+            };
+            let mut resp = WebResponse::new(body);
+            *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+            set_file_headers(resp.headers_mut(), &file_path, range_len, &etag_val, modified_secs, location);
+            if let Some(v) = content_range_value(range_start, range_end, file_size) { resp.headers_mut().insert(CONTENT_RANGE, v); }
+            return resp;
         }
 
         // 大文件非 Range：尝试流式压缩（Range 请求不压缩，语义不兼容）
@@ -423,7 +443,7 @@ pub async fn handle_sweety(
 
     // ── HEAD / Range 路径：必须读 metadata ────────────────────────────────────
     let canonical_root_ref = site.canonical_root.as_deref();
-    let file_path = match resolve_safe_path_fast(root, path, canonical_root_ref) {
+    let file_path = match resolve_safe_path_fast(root, &path, canonical_root_ref) {
         Some(p) => p,
         None => return make_error(StatusCode::FORBIDDEN, "Forbidden"),
     };
@@ -461,17 +481,10 @@ pub async fn handle_sweety(
     let modified_secs = to_unix_secs(meta.modified().unwrap_or(SystemTime::UNIX_EPOCH));
     let etag_val      = generate_etag(file_size, modified_secs);
 
-    // 304 缓存验证
-    let if_none_match = req_headers.get(IF_NONE_MATCH).and_then(|v| v.to_str().ok());
-    let if_modified_since = req_headers
-        .get(IF_MODIFIED_SINCE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| httpdate::parse_http_date(s).ok())
-        .map(to_unix_secs);
-
-    if crate::middleware::cache::is_cache_valid(if_none_match, if_modified_since, &etag_val, modified_secs) {
-        let mut resp = WebResponse::new(ResponseBody::none());
-        *resp.status_mut() = StatusCode::NOT_MODIFIED;
+    // 条件请求（RFC 9110 §13.2.2）：304 / 412
+    if let Some(resp) = check_preconditions(method, req_headers, &etag_val, modified_secs, || {
+        not_modified_for(&file_path, &etag_val, modified_secs, location)
+    }) {
         return resp;
     }
 
@@ -482,15 +495,14 @@ pub async fn handle_sweety(
         return resp;
     }
 
-    // 解析 Range 头（bytes=start-end，只支持单区间）
-    let range = req_headers
-        .get(sweety_web::http::header::RANGE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| parse_range(s, file_size));
+    // 解析 Range 头（只支持单区间；不可满足 → 416）
+    let range = match decide_range(req_headers, method, file_size, &etag_val, modified_secs) {
+        RangeDecision::Partial(s, e) => Some((s, e)),
+        RangeDecision::NotSatisfiable => return range_not_satisfiable(file_size),
+        RangeDecision::Full => None,
+    };
 
     debug!("提供静态文件: {} size={} range={:?}", file_path.display(), file_size, range);
-
-    let _ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     if let Some((range_start, range_end)) = range {
         // ── Range 请求 ───────────────────────────────────────────────────────────────────
@@ -519,11 +531,7 @@ pub async fn handle_sweety(
         let mut resp = WebResponse::new(body);
         *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
         set_file_headers(resp.headers_mut(), &file_path, range_len, &etag_val, modified_secs, location);
-        let mut cr = String::with_capacity(32);
-        cr.push_str("bytes "); cr.push_str(itoa::Buffer::new().format(range_start));
-        cr.push('-'); cr.push_str(itoa::Buffer::new().format(range_end));
-        cr.push('/'); cr.push_str(itoa::Buffer::new().format(file_size));
-        if let Ok(v) = HeaderValue::from_str(&cr) { resp.headers_mut().insert(CONTENT_RANGE, v); }
+        if let Some(v) = content_range_value(range_start, range_end, file_size) { resp.headers_mut().insert(CONTENT_RANGE, v); }
         resp
     } else {
         // ── 普通请求（大文件，> FILE_CACHE_MAX_BYTES）────────────────────────────────────────
@@ -582,6 +590,7 @@ fn set_file_headers(
 
     // RFC 7233: 声明支持 Range 请求（与 Nginx 行为一致）
     headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    headers.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
 }
 
 /// 设置静态文件响应头（不含 Content-Length，供流式压缩路径使用）
@@ -611,6 +620,95 @@ pub(super) fn set_file_headers_no_length(
         headers.insert(CACHE_CONTROL, v);
     }
     headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    headers.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
+}
+
+/// Range 处理决策
+enum RangeDecision {
+    Full,
+    Partial(u64, u64),
+    NotSatisfiable,
+}
+
+/// 综合 Range / If-Range / 方法决定是否返回部分内容
+///
+/// - RFC 9110 §14.2：仅 GET 请求处理 Range
+/// - RFC 9110 §13.1.5：If-Range 不满足时忽略 Range，返回完整表示
+fn decide_range(req_headers: &HeaderMap, method: &str, file_size: u64, etag: &str, modified_secs: u64) -> RangeDecision {
+    if method != "GET" || req_headers.get_all(sweety_web::http::header::RANGE).iter().count() > 1 {
+        return RangeDecision::Full;
+    }
+    let Some(range) = req_headers.get(sweety_web::http::header::RANGE).and_then(|v| v.to_str().ok()) else {
+        return RangeDecision::Full;
+    };
+    if !crate::middleware::cache::if_range_satisfied(req_headers, etag, modified_secs) {
+        return RangeDecision::Full;
+    }
+    match parse_range(range, file_size) {
+        RangeSpec::Ignore => RangeDecision::Full,
+        RangeSpec::Satisfiable(s, e) => RangeDecision::Partial(s, e),
+        RangeSpec::Unsatisfiable => RangeDecision::NotSatisfiable,
+    }
+}
+
+/// 416 Range Not Satisfiable，携带 `Content-Range: bytes */<len>`（RFC 9110 §15.5.17）
+fn range_not_satisfiable(file_size: u64) -> WebResponse {
+    let mut resp = make_error(StatusCode::RANGE_NOT_SATISFIABLE, "");
+    let mut cr = String::with_capacity(24);
+    cr.push_str("bytes */");
+    cr.push_str(itoa::Buffer::new().format(file_size));
+    if let Ok(v) = HeaderValue::from_str(&cr) { resp.headers_mut().insert(CONTENT_RANGE, v); }
+    resp.headers_mut().insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    resp
+}
+
+/// 304 响应：携带 200 时会发送的验证器与缓存头（RFC 9110 §15.4.5）
+fn not_modified(etag: HeaderValue, last_modified: HeaderValue, cache_control: HeaderValue) -> WebResponse {
+    let mut resp = WebResponse::new(ResponseBody::none());
+    *resp.status_mut() = StatusCode::NOT_MODIFIED;
+    let h = resp.headers_mut();
+    h.insert(ETAG, etag);
+    h.insert(LAST_MODIFIED, last_modified);
+    h.insert(CACHE_CONTROL, cache_control);
+    h.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
+    resp
+}
+
+/// 由文件元数据构造 304 响应
+fn not_modified_for(path: &Path, etag: &str, modified_secs: u64, location: &LocationConfig) -> WebResponse {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let lm = httpdate::fmt_http_date(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(modified_secs));
+    let cc = location.cache_control.as_deref().unwrap_or_else(|| default_cache_control(ext));
+    not_modified(
+        HeaderValue::from_str(etag).unwrap_or_else(|_| HeaderValue::from_static("\"\"")),
+        HeaderValue::from_str(&lm).unwrap_or_else(|_| HeaderValue::from_static("Thu, 01 Jan 1970 00:00:00 GMT")),
+        HeaderValue::from_str(cc).unwrap_or_else(|_| HeaderValue::from_static("public, max-age=3600")),
+    )
+}
+
+/// 条件请求评估：返回 Some(响应) 表示应直接返回 304 / 412
+fn check_preconditions(
+    method: &str,
+    req_headers: &HeaderMap,
+    etag: &str,
+    modified_secs: u64,
+    make_304: impl FnOnce() -> WebResponse,
+) -> Option<WebResponse> {
+    use crate::middleware::cache::{evaluate_preconditions, Precondition};
+    match evaluate_preconditions(method, req_headers, etag, modified_secs) {
+        Precondition::Proceed => None,
+        Precondition::NotModified => Some(make_304()),
+        Precondition::Failed => Some(make_error(StatusCode::PRECONDITION_FAILED, "")),
+    }
+}
+
+/// 构造 206 Partial Content 的 Content-Range 头值
+fn content_range_value(start: u64, end: u64, total: u64) -> Option<HeaderValue> {
+    let mut cr = String::with_capacity(32);
+    cr.push_str("bytes "); cr.push_str(itoa::Buffer::new().format(start));
+    cr.push('-'); cr.push_str(itoa::Buffer::new().format(end));
+    cr.push('/'); cr.push_str(itoa::Buffer::new().format(total));
+    HeaderValue::from_str(&cr).ok()
 }
 
 fn make_error(status: StatusCode, _msg: &str) -> WebResponse {
@@ -633,6 +731,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_range_response_and_precondition_order() {
+        use sweety_web::http::header::{IF_NONE_MATCH, IF_RANGE, RANGE};
+        let mut h = HeaderMap::new();
+        h.insert(RANGE, HeaderValue::from_static("bytes=100-"));
+        assert!(matches!(decide_range(&h, "GET", 100, "\"tag\"", 1), RangeDecision::NotSatisfiable));
+        assert!(matches!(decide_range(&h, "HEAD", 100, "\"tag\"", 1), RangeDecision::Full));
+        h.insert(IF_RANGE, HeaderValue::from_static("\"old\""));
+        assert!(matches!(decide_range(&h, "GET", 100, "\"tag\"", 1), RangeDecision::Full));
+        h.insert(IF_NONE_MATCH, HeaderValue::from_static("\"tag\""));
+        let resp = check_preconditions("GET", &h, "\"tag\"", 1, || {
+            not_modified(HeaderValue::from_static("\"tag\""),
+                HeaderValue::from_static("Thu, 01 Jan 1970 00:00:01 GMT"),
+                HeaderValue::from_static("no-cache"))
+        }).unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(resp.headers()[ETAG], "\"tag\"");
+        assert_eq!(resp.headers()[CACHE_CONTROL], "no-cache");
+        assert_eq!(resp.headers()[VARY], "Accept-Encoding");
+        assert!(!resp.headers().contains_key(CONTENT_LENGTH));
+        let resp = range_not_satisfiable(100);
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(resp.headers()[CONTENT_RANGE], "bytes */100");
+    }
+
+    #[test]
     fn test_resolve_safe_path_normal() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("index.html"), b"hello").unwrap();
@@ -645,6 +768,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(resolve_safe_path(dir.path(), "/../etc/passwd").is_none());
         assert!(resolve_safe_path(dir.path(), "/foo/../../../etc/passwd").is_none());
+        assert!(resolve_safe_path(dir.path(), "/%2e%2e/etc/passwd").is_none());
+    }
+
+    #[test]
+    fn test_resolve_safe_path_percent_encoded_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "树荫下的奶蛙.avif";
+        std::fs::create_dir_all(dir.path().join("classic")).unwrap();
+        std::fs::write(dir.path().join("classic").join(name), b"avif").unwrap();
+        let encoded = "/classic/%E6%A0%91%E8%8D%AB%E4%B8%8B%E7%9A%84%E5%A5%B6%E8%9B%99.avif";
+        let resolved = resolve_safe_path(dir.path(), encoded).expect("decoded path must resolve");
+        assert!(resolved.is_file());
+        assert_eq!(resolved.file_name().and_then(|s| s.to_str()), Some(name));
     }
 
     #[test]

@@ -10,6 +10,8 @@ pub struct Context<'a, D, const HEADER_LIMIT: usize> {
     header: Option<HeaderMap>,
     // http extensions reused by next request.
     exts: Extensions,
+    /// H1 chunked 响应尾（由 encode_head 从 `Trailer:` 拆出，EOF 时写出）
+    chunk_trailers: Option<HeaderMap>,
     date: &'a D,
 }
 
@@ -28,6 +30,8 @@ impl ContextState {
     const CLOSE: u8 = 0b_1000;
     // Enable when current connection is TLS (HTTPS/WSS).
     const IS_TLS: u8 = 0b_0001_0000;
+    // Enable when current request is HTTP/1.0 (chunked transfer coding MUST NOT be used, RFC 9112 §7.1).
+    const HTTP10: u8 = 0b_0010_0000;
 
     const fn new() -> Self {
         Self(0)
@@ -72,6 +76,7 @@ impl<'a, D, const HEADER_LIMIT: usize> Context<'a, D, HEADER_LIMIT> {
             state,
             header: None,
             exts: Extensions::new(),
+            chunk_trailers: None,
             date,
         }
     }
@@ -116,6 +121,17 @@ impl<'a, D, const HEADER_LIMIT: usize> Context<'a, D, HEADER_LIMIT> {
     pub fn reset(&mut self) {
         let keep = self.state.0 & ContextState::IS_TLS;
         self.state = ContextState(keep);
+        self.chunk_trailers = None;
+    }
+
+    #[inline]
+    pub fn set_chunk_trailers(&mut self, trailers: Option<HeaderMap>) {
+        self.chunk_trailers = trailers;
+    }
+
+    #[inline]
+    pub fn take_chunk_trailers(&mut self) -> Option<HeaderMap> {
+        self.chunk_trailers.take()
     }
 
     /// Set Context's state to EXPECT header received.
@@ -146,6 +162,18 @@ impl<'a, D, const HEADER_LIMIT: usize> Context<'a, D, HEADER_LIMIT> {
     #[inline]
     pub fn remove_close(&mut self) {
         self.state.remove(ContextState::CLOSE)
+    }
+
+    /// Set Context's state to HTTP/1.0 request received.
+    #[inline]
+    pub fn set_http10(&mut self) {
+        self.state.insert(ContextState::HTTP10)
+    }
+
+    /// Get HTTP/1.0 request state.
+    #[inline]
+    pub const fn is_http10(&self) -> bool {
+        self.state.contains(ContextState::HTTP10)
     }
 
     /// Get expect header state.

@@ -2,7 +2,7 @@
 use std::sync::Arc;
 
 #[cfg(feature = "http3")]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// H3 连接限流：原子计数器 + 原子限制值，支持热更新
 /// 每个 QUIC 连接实际占用约 2-4MB（含 quinn buffer、协议栈状态）
@@ -12,9 +12,26 @@ static H3_CONN_LIMIT: AtomicUsize = AtomicUsize::new(0); // 0 = 未初始化，�
 static H3_CONN_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "http3")]
 static H3_CONN_NOTIFY: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+#[cfg(feature = "http3")]
+static H3_DRAINING: AtomicBool = AtomicBool::new(false);
 
 /// 设置/热更新 H3 最大并发连接数（0 = 自动检测）
 /// 可在运行时任意时刻调用，立即生效（原子写入）
+#[cfg(feature = "http3")]
+/// 优雅停机：现有 H3 连接发 GOAWAY，不再接受新流（由 dispatcher 轮询）
+#[cfg(feature = "http3")]
+pub fn set_h3_draining(draining: bool) {
+    H3_DRAINING.store(draining, Ordering::SeqCst);
+    if draining {
+        tracing::info!("H3 进入 draining：活跃连接将发送 GOAWAY");
+    }
+}
+
+#[cfg(feature = "http3")]
+pub(crate) fn h3_draining() -> bool {
+    H3_DRAINING.load(Ordering::Acquire)
+}
+
 #[cfg(feature = "http3")]
 pub fn set_h3_max_connections(max: usize) {
     let max = if max == 0 {
@@ -178,7 +195,15 @@ where
             ServerStream::Udp(io, addr) => {
                 // 连接级限流：原子计数器，支持热更新
                 h3_conn_acquire().await;
-                let result = super::h3::Dispatcher::new(io, addr, Arc::clone(&self.service), self.date.get_rc())
+                let result = super::h3::Dispatcher::new(
+                    io,
+                    addr,
+                    Arc::clone(&self.service),
+                    self.date.get_rc(),
+                    self.config.h3_max_pending_per_conn,
+                    self.config.h3_max_requests_per_conn,
+                    self.config.h3_enable_0rtt,
+                )
                     .run()
                     .await
                     .map_err(From::from);
@@ -328,6 +353,16 @@ async fn parse_proxy_protocol_header(
 
     let mut buf = [0u8; 232];
     let n = io.peek(&mut buf).await?;
+    if n == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "PROXY protocol: 连接在读取头之前关闭",
+        ));
+    }
+    // PROXY v2 以 0x0D 开头，v1 以 "PROXY " 开头；其余（GET/POST/HEAD…）视为直连 HTTP，不消费字节
+    if buf[0] != 0x0D && buf[0] != b'P' {
+        return Ok(None);
+    }
     if n < 8 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -422,6 +457,7 @@ async fn parse_proxy_protocol_header(
         })?;
         Ok(Some(SocketAddr::new(src_ip, src_port)))
     } else {
+        // 以 P/0x0D 开头但格式不对：可能是损坏的 PP 或罕见前缀，关闭连接
         Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "PROXY protocol: 既非 v1 也非 v2 格式",

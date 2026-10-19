@@ -28,11 +28,25 @@ pub fn build_response(status: u16, body: &str, content_type: &str) -> String {
         404 => "Not Found", 405 => "Method Not Allowed",
         500 => "Internal Server Error", _ => "Unknown",
     };
+    let date_line = {
+        let d = httpdate::fmt_http_date(std::time::SystemTime::now());
+        format!("Date: {d}\r\n")
+    };
+    let allow_line = if status == 405 {
+        format!(
+            "Allow: {}\r\n",
+            crate::handler::reverse_proxy::response::STANDARD_HTTP_ALLOW
+        )
+    } else {
+        String::new()
+    };
     // 安全修复：移除 CORS 通配符，Admin API 不应允许任意来源跨域访问
     format!(
         "HTTP/1.1 {} {}\r\n\
          Content-Type: {}\r\n\
          Content-Length: {}\r\n\
+         {date_line}\
+         {allow_line}\
          Connection: close\r\n\r\n{}",
         status, status_text, content_type, body.len(), body
     )
@@ -158,6 +172,13 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 200 OK"));
         assert!(resp.contains("application/json"));
         assert!(resp.contains(r#"{"ok":true}"#));
+    }
+
+    #[test]
+    fn test_build_response_405_includes_allow() {
+        let resp = build_response(405, "nope", "text/plain");
+        assert!(resp.contains("405 Method Not Allowed"));
+        assert!(resp.contains("Allow: GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"));
     }
 
     #[test]

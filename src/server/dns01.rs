@@ -324,7 +324,7 @@ async fn aliyun_request(
     let string_to_sign = format!("GET&{}&{}", url_encode("/"), url_encode(&canonical));
 
     // HMAC-SHA1 签名
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha1::Sha1;
     type HmacSha1 = Hmac<Sha1>;
     let secret_key = format!("{}&", access_key_secret);

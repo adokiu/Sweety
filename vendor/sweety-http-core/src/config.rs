@@ -36,6 +36,12 @@ pub struct HttpServiceConfig<
     /// 达到后发 GOAWAY 优雅关闭，强制客户端重建连接重新分散到各 worker
     /// 对标 Nginx keepalive_requests
     pub(crate) h2_max_requests_per_conn: usize,
+    /// HTTP/3 单连接最大同时在途 handler 数（0 = 不限制）
+    pub(crate) h3_max_pending_per_conn: usize,
+    /// HTTP/3 单连接最大请求数（0 = 不限制，默认 1000），达到后发 GOAWAY（RFC 9114）
+    pub(crate) h3_max_requests_per_conn: usize,
+    /// 是否对 H3 使用 QUIC 0-RTT/0.5-RTT 建连（须配合 TLS early data；开启后由协议栈拒绝非幂等 Early 请求）
+    pub(crate) h3_enable_0rtt: bool,
 }
 
 impl Default for HttpServiceConfig {
@@ -61,6 +67,9 @@ impl HttpServiceConfig {
             h2_max_concurrent_reset_streams: 200,
             h2_max_frame_size: 65535,
             h2_max_requests_per_conn: 1000,
+            h3_max_pending_per_conn: 0,
+            h3_max_requests_per_conn: 1000,
+            h3_enable_0rtt: false,
         }
     }
 }
@@ -165,6 +174,23 @@ impl<const HEADER_LIMIT: usize, const READ_BUF_LIMIT: usize, const WRITE_BUF_LIM
         self
     }
 
+    /// HTTP/3 单连接最大同时在途 handler 数（0 = 不限制）
+    pub fn h3_max_pending_per_conn(mut self, n: usize) -> Self {
+        self.h3_max_pending_per_conn = n;
+        self
+    }
+
+    /// HTTP/3 单连接最大请求数（0 = 不限制，默认 1000），达到后发 GOAWAY
+    pub fn h3_max_requests_per_conn(mut self, n: usize) -> Self {
+        self.h3_max_requests_per_conn = n;
+        self
+    }
+
+    /// 启用 H3 QUIC Early Data 建连路径（与站点 `enable_0rtt` 对齐）
+    pub fn h3_enable_0rtt(mut self, enable: bool) -> Self {
+        self.h3_enable_0rtt = enable;
+        self
+    }
 
     /// Enable peek into connection to figure out it's protocol regardless the outcome
     /// of alpn negotiation.
@@ -196,6 +222,9 @@ impl<const HEADER_LIMIT: usize, const READ_BUF_LIMIT: usize, const WRITE_BUF_LIM
             h2_max_concurrent_reset_streams: self.h2_max_concurrent_reset_streams,
             h2_max_frame_size: self.h2_max_frame_size,
             h2_max_requests_per_conn: self.h2_max_requests_per_conn,
+            h3_max_pending_per_conn: self.h3_max_pending_per_conn,
+            h3_max_requests_per_conn: self.h3_max_requests_per_conn,
+            h3_enable_0rtt: self.h3_enable_0rtt,
         }
     }
 }

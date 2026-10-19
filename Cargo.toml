@@ -1,4 +1,4 @@
-﻿[workspace]
+[workspace]
 members = [
     ".",
 ]
@@ -78,27 +78,27 @@ rustls         = { version = "0.23", default-features = false, features = ["aws-
 rustls-pemfile  = "2"
 tokio-rustls    = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 # TLS 客户端根证书（反向代理证书验证）
-webpki-roots    = "0.26"
+webpki-roots    = "1.0"
 # ACME 自动证书（HTTP-01/DNS-01，instant-acme）
 instant-acme   = { version = "0.8", features = ["hyper-rustls"] }
 # WebSocket 协议库（sweety-web websocket feature 已引入此 crate）
-http-ws        = { version = "0.3", features = ["stream"] }
+http-ws        = { version = "0.4", features = ["stream"] }
 # http 基础类型（WebSocket handler 需要）
 http           = "1"
 # 证书生成（CSR/自签名，aws-lc-rs 后端）
-rcgen          = { version = "0.13", default-features = false, features = ["aws_lc_rs"] }
+rcgen          = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }
 
 # ── 序列化 / 配置 ─────────────────────────────
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
-toml        = "0.8"
+toml        = "1.1"
 serde_yaml  = "0.9"
 
 # ── 正则（Rewrite 规则）──────────────────────
 regex = "1"
 
 # ── 文件监听（热重载）────────────────────────
-notify = "6"
+notify = "8"
 
 # ── 日志 ──────────────────────────────────────
 tracing            = "0.1"
@@ -125,25 +125,27 @@ async-compression = { version = "0.4", features = ["gzip", "brotli", "zstd", "to
 async-stream      = "0.3"
 # mmap 零拷贝大文件传输（文件直接映射到进程地址空间，绕过 read() 内核→用户态拷贝）
 memmap2           = "0.9"
-x509-parser  = { version = "0.16", default-features = false }
+x509-parser  = { version = "0.18", default-features = false }
 anyhow       = "1"
 itoa         = "1"
 # 完美哈希表（编译期生成，MIME 类型查找 O(1)）
-phf          = { version = "0.11", features = ["macros"] }
+phf          = { version = "0.14", features = ["macros"] }
 # jemalloc 通过 [target] 条件依赖引入（见下方）
-base64       = "0.22"
-thiserror    = "1"
+base64       = "0.23"
+thiserror    = "2"
 url          = "2"
+percent-encoding = "2"
+idna = "1"
 mime_guess   = "2"
 # HTTP 日期格式（ETag/Last-Modified 需要）
 httpdate     = "1"
 # 系统目录（ACME 证书缓存目录）
 dirs-next    = "2"
 # HTTP 客户端（DNS-01 API 调用）
-reqwest      = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest      = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 # HMAC-SHA1（阿里云 DNS 签名）
-hmac         = "0.12"
-sha1         = "0.10"
+hmac         = "0.13"
+sha1         = "0.11"
 # sendfile(2) syscall（Linux/macOS 零拷贝静态文件传输）
 libc         = "0.2"
 # Quinn QUIC 传输层（HTTP/3），版本与 sweety-io 0.5.1 内部使用的版本一致
@@ -154,7 +156,11 @@ quinn        = { version = "0.11", default-features = false, features = ["rustls
 # ─────────────────────────────────────────────
 # jemalloc 仅在非 Windows 平台启用（Windows 无法编译其 C 代码）
 [target.'cfg(not(windows))'.dependencies]
-tikv-jemallocator = { version = "0.6", optional = true }
+tikv-jemallocator = { version = "0.7", optional = true }
+
+# hyperium/h3：crates.io 0.0.8 尚无 RFC 9220 `:protocol=websocket`，跟踪 upstream 至发布新版本
+[patch.crates-io]
+h3 = { git = "https://github.com/hyperium/h3", rev = "43745ad87e95b0c035ac9c547aad467303213425" }
 
 # ─────────────────────────────────────────────
 # Features

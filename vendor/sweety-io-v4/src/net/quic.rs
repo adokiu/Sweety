@@ -152,10 +152,30 @@ impl QuicStream {
         self.connecting
     }
 
+    /// 建立 HTTP/3 用的 QUIC 连接（见 sweety-io v5 同名 API）
+    pub async fn into_h3_server(self, enable_0rtt: bool) -> Result<H3ServerConnection, quinn::ConnectionError> {
+        let connecting = self.connecting.accept()?;
+        if enable_0rtt {
+            let (quinn, zero_rtt) = connecting
+                .into_0rtt()
+                .map_err(|_| quinn::ConnectionError::LocallyClosed)?;
+            Ok(H3ServerConnection { quinn, zero_rtt: Some(zero_rtt) })
+        } else {
+            let quinn = connecting.await?;
+            Ok(H3ServerConnection { quinn, zero_rtt: None })
+        }
+    }
+
     /// Get remote [`SocketAddr`] self connected to.
     pub fn peer_addr(&self) -> SocketAddr {
         self.connecting.remote_address()
     }
+}
+
+/// HTTP/3 服务端 QUIC 连接（含可选的 0-RTT 握手完成通知）
+pub struct H3ServerConnection {
+    pub quinn: quinn::Connection,
+    pub zero_rtt: Option<quinn::ZeroRttAccepted>,
 }
 
 impl TryFrom<Stream> for QuicStream {

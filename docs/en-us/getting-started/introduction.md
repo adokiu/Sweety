@@ -21,8 +21,8 @@ Sweety is a high-performance, multi-site web server written in Rust, aiming to c
 | Feature | Description |
 |---------|-------------|
 | Static Files | In-memory cache (≤ 64KB with pre-compressed gz/br/zst), fd cache, Range, sendfile(2) zero-copy, inotify eviction |
-| FastCGI/PHP | Connection pool, Unix socket/TCP, response cache |
-| Reverse Proxy | HTTP/1.1 + HTTP/2 upstream, connection pool, circuit breaker, load balancing |
+| FastCGI/PHP | Connection pool, Unix socket/TCP, fastcgi_cache (shared RFC cache logic with proxy) |
+| Reverse Proxy | HTTP/1.1 + HTTP/2 upstream, pool, circuit breaker, LB, `proxy_cache` (RFC 9111 + Nginx-style ops) |
 | gRPC Proxy | Transparent gRPC/gRPC-Web forwarding |
 | WebSocket | Forward proxy WS/WSS |
 | auth_request | Subrequest authentication (equivalent to Nginx auth_request) |
@@ -40,8 +40,8 @@ Sweety is a high-performance, multi-site web server written in Rust, aiming to c
 - **Hot Reload**: `sweety reload` reloads config without dropping connections
 - **Daemon Mode**: `sweety start/stop/restart`
 - **Config Validation**: `sweety validate` (equivalent to `nginx -t`)
-- **Prometheus Metrics**: `/metrics` endpoint (planned for v0.5)
-- **Admin REST API**: health / stats / plugins available (`/api/v1/*`); site management and node control planned for v0.5
+- **Prometheus Metrics**: `/metrics` endpoint (text/plain)
+- **Admin REST API**: config tree CRUD, certs/cache/upstreams, hot reload — see [Admin API](/en-us/configuration/admin-api)
 
 ## Comparison with Alternatives
 
@@ -57,3 +57,4 @@ Sweety is a high-performance, multi-site web server written in Rust, aiming to c
 | Memory Safety | ✅ | ❌ | ✅ |
 | Static File Memory Cache | ✅ | ✅ | ❌ |
 | FastCGI Response Cache | ✅ | ✅ | ❌ |
+| Shared cache RFC 9111 | ✅ | ✅ | ⚠️ cache-handler |

@@ -28,13 +28,16 @@ impl<S, E> Service<Result<S, E>> for Compress {
     }
 }
 mod service {
-    use http_encoding::{Coder, ContentEncoding, encoder};
+    use http_body_alt::util::StreamDataBody;
+    use http_encoding::{Coder, ContentEncoding};
 
     use crate::{
-        body::{BodyStream, NONE_BODY_HINT},
+        body::{BodyStream, NONE_BODY_HINT, StreamAsBody},
         http::{BorrowReq, WebResponse, header::HeaderMap},
         service::{Service, ready::ReadyService},
     };
+
+    pub type CompressedBody<B> = StreamDataBody<Coder<StreamAsBody<B>>>;
 
     pub struct CompressService<S>(pub(super) S);
 
@@ -44,7 +47,7 @@ mod service {
         S: Service<Req, Response = WebResponse<ResB>>,
         ResB: BodyStream,
     {
-        type Response = WebResponse<Coder<ResB>>;
+        type Response = WebResponse<CompressedBody<ResB>>;
         type Error = S::Error;
 
         async fn call(&self, req: Req) -> Result<Self::Response, Self::Error> {
@@ -53,13 +56,15 @@ mod service {
 
             // TODO: expose encoding filter as public api.
             match res.body().size_hint() {
-                (low, Some(up)) if low == up && low < 64 => encoding = ContentEncoding::NoOp,
+                (low, Some(up)) if low == up && low < 64 => encoding = ContentEncoding::Identity,
                 // this variant is a crate hack. see NONE_BODY_HINT for detail.
-                NONE_BODY_HINT => encoding = ContentEncoding::NoOp,
+                NONE_BODY_HINT => encoding = ContentEncoding::Identity,
                 _ => {}
             }
 
-            Ok(encoder(res, encoding))
+            Ok(encoding
+                .try_encode(res.map(|body| StreamAsBody::new(body)))
+                .map(|body| StreamDataBody::new(body)))
         }
     }
 

@@ -30,7 +30,7 @@ features:
     details: 内置 WordPress / Laravel / 静态站预设，php_fastcgi 与 acme_email 语法糖，8 行跑起一个站点。
 
   - title: 反向代理 & gRPC
-    details: 多种负载均衡策略，连接池，三状态断路器，主动健康检查，gRPC 与 WebSocket 透明转发。
+    details: 负载均衡、连接池、断路器、RFC 9111 proxy_cache（cache_lock、use_stale、Cache-Status），gRPC 与 WebSocket 全透传。
 
   - title: 零停机运维
     details: 热重载不断开连接，Admin REST API，Prometheus /metrics，sweety validate 配置校验。

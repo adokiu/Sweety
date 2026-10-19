@@ -118,8 +118,8 @@ async fn do_auth_request(
 
     if use_tls {
         // TLS 鉴权端点
-        use crate::handler::reverse_proxy::tls_client::tls_connect;
-        let tls = tls_connect(tcp, &host, false).await?;
+        use crate::handler::reverse_proxy::tls_client::{tls_connect, TlsAlpn};
+        let tls = tls_connect(tcp, &host, false, TlsAlpn::Http11).await?;
         let (r, mut w) = tokio::io::split(tls);
         w.write_all(req.as_bytes()).await?;
         w.flush().await?;

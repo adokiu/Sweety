@@ -3,9 +3,12 @@
 //! 使用 http_ws::handshake() 验证请求 + http_ws::ws() 建立流式连接
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context as TaskContext, Poll};
 
+use futures_util::stream::Stream;
 use tokio::sync::RwLock;
 use tracing::warn;
 use sweety_web::{
@@ -17,6 +20,7 @@ use sweety_web::{
 };
 
 use crate::config::model::LocationConfig;
+use crate::dispatcher::vhost::SiteInfo;
 use crate::server::http::AppState;
 
 // ─────────────────────────────────────────────
@@ -47,30 +51,29 @@ impl WsRegistry {
     /// 原子 CAS 增加计数（仅当未超过上限时成功）
     ///
     /// 性能优于 Nginx limit_conn：无锁 CAS 操作，不阻塞其他连接
-    /// 返回 true 表示成功增加，false 表示已达上限
-    pub async fn inc_if_under(&self, site_name: &str, max: u64) -> bool {
+    /// 成功返回计数器（调用方负责在连接结束时递减），已达上限返回 None
+    pub async fn try_acquire(&self, site_name: &str, max: u64) -> Option<Arc<AtomicU64>> {
         let map = self.sites.read().await;
-        if let Some(counter) = map.get(site_name) {
-            loop {
-                let cur = counter.load(Ordering::Relaxed);
-                if cur >= max { return false; }
-                if counter.compare_exchange_weak(
-                    cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed
-                ).is_ok() {
-                    return true;
-                }
+        let counter = match map.get(site_name) {
+            Some(c) => c.clone(),
+            None => {
+                drop(map);
+                // 首次插入：写锁路径（仅新站点第一次连接触发）
+                self.sites.write().await
+                    .entry(site_name.to_string())
+                    .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+                    .clone()
+            }
+        };
+        loop {
+            let cur = counter.load(Ordering::Relaxed);
+            if cur >= max { return None; }
+            if counter.compare_exchange_weak(
+                cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed
+            ).is_ok() {
+                return Some(counter);
             }
         }
-        drop(map);
-        // 首次插入：写锁路径（仅新站点第一次连接触发）
-        let mut map = self.sites.write().await;
-        let counter = map
-            .entry(site_name.to_string())
-            .or_insert_with(|| Arc::new(AtomicU64::new(0)));
-        let cur = counter.load(Ordering::Relaxed);
-        if cur >= max { return false; }
-        counter.fetch_add(1, Ordering::Relaxed);
-        true
     }
 
     /// 减少指定站点的活跃连接计数
@@ -94,62 +97,77 @@ impl WsRegistry {
 // WebSocket 握手 + 帧收发
 // ─────────────────────────────────────────────
 
-/// 处理 WebSocket 升级请求
+/// 连接计数守卫：Drop 时递减（WS 连接结束 = 响应 body stream 被丢弃）
+struct WsConnGuard(Arc<AtomicU64>);
+
+impl Drop for WsConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// 持有连接计数守卫的响应 body 包装，生命周期与 WS 隧道一致
+struct GuardedBody<S> {
+    inner: S,
+    _guard: WsConnGuard,
+}
+
+impl<S: Stream + Unpin> Stream for GuardedBody<S> {
+    type Item = S::Item;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.get_mut().inner).poll_next(cx)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+/// 处理 WebSocket 代理请求
 ///
 /// 流程：
-/// 1. 用 http_ws::handshake() 验证请求头
-/// 2. 用 http_ws::ws() 建立流式连接，返回 101 响应
-/// 3. 在后台 task 中进行帧收发（Echo + Ping/Pong + Close）
+/// 1. 每站点并发连接数检查（max_connections）
+/// 2. 交给反向代理处理器完成上游握手与双向转发（H1 Upgrade / H2 extended CONNECT）
+/// 3. 握手成功时计数守卫随响应 body 存活，连接关闭时自动递减
 pub async fn handle_sweety(
     ctx: &WebContext<'_, AppState>,
+    site: &SiteInfo,
     location: &LocationConfig,
 ) -> WebResponse {
     let max_conn = location.max_connections.unwrap_or(10000) as u64;
 
     // 并发连接数限制：原子 CAS 无锁检查，性能优于 Nginx limit_conn 的互斥锁
-    if max_conn > 0 {
+    let guard = if max_conn > 0 {
         let site_name = ctx.req().uri().authority()
             .map(|a| a.as_str())
             .or_else(|| ctx.req().headers().get("host").and_then(|v| v.to_str().ok()))
             .unwrap_or("_default");
-        if !ctx.state().ws_registry.inc_if_under(site_name, max_conn).await {
-            warn!("WebSocket 连接数已达上限 {} （站点: {}）", max_conn, site_name);
-            let mut resp = WebResponse::new(ResponseBody::from(
-                crate::handler::error_page::build_default_html(503)
-            ));
-            *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
-            return resp;
-        }
-    }
-
-    // 验证 WebSocket 握手请求头
-    let handshake_result = http_ws::handshake(ctx.req().method(), ctx.req().headers());
-    match handshake_result {
-        Err(e) => {
-            let status = match e {
-                http_ws::HandshakeError::GetMethodRequired => StatusCode::METHOD_NOT_ALLOWED,
-                _ => StatusCode::BAD_REQUEST,
-            };
-            warn!("WebSocket 握手失败: {:?}", e);
-            let mut resp = WebResponse::new(ResponseBody::from(
-                crate::handler::error_page::build_default_html(status.as_u16())
-            ));
-            *resp.status_mut() = status;
-            resp
-        }
-        Ok(builder) => {
-            // 握手成功，构建 101 Switching Protocols 响应头
-            let http_resp = builder
-                .body(())
-                .unwrap_or_else(|_| http::Response::new(()));
-            let mut resp = WebResponse::new(ResponseBody::empty());
-            *resp.status_mut() = http_resp.status();
-            for (name, value) in http_resp.headers() {
-                resp.headers_mut().insert(name.clone(), value.clone());
+        match ctx.state().ws_registry.try_acquire(site_name, max_conn).await {
+            Some(counter) => Some(WsConnGuard(counter)),
+            None => {
+                warn!("WebSocket 连接数已达上限 {} （站点: {}）", max_conn, site_name);
+                let mut resp = WebResponse::new(ResponseBody::from(
+                    crate::handler::error_page::build_default_html(503)
+                ));
+                *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+                return resp;
             }
-            resp
         }
+    } else {
+        None
+    };
+
+    let mut resp = crate::handler::reverse_proxy::handle_sweety(ctx, site, location).await;
+
+    // 握手成功（H1 返回 101，H2 extended CONNECT 返回 200）才让守卫随隧道存活，否则此处立即释放
+    let established = resp.status() == StatusCode::SWITCHING_PROTOCOLS
+        || (ctx.req().body().is_h2_ws() && resp.status() == StatusCode::OK);
+    if let (true, Some(guard)) = (established, guard) {
+        let inner = std::mem::take(resp.body_mut());
+        *resp.body_mut() = ResponseBody::box_stream(GuardedBody { inner, _guard: guard });
     }
+    resp
 }
 
 // ─────────────────────────────────────────────

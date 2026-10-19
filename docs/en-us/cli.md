@@ -177,9 +177,9 @@ curl -H "Authorization: Bearer your-secret-token" http://127.0.0.1:9099/api/v1/s
 | `POST` | `/api/v1/upstreams/:name/nodes/:addr/enable` | Yes | 🚧 Planned | Enable node (v0.5) |
 | `POST` | `/api/v1/upstreams/:name/nodes/:addr/disable` | Yes | 🚧 Planned | Disable node (v0.5) |
 | — | WebSocket `/api/v1/stats/stream` | — | 🚧 Planned | Real-time stats push (v0.5) |
-| `GET` | `/metrics` | — | 🚧 Planned | Prometheus metrics endpoint (v0.5) |
+| `GET` | `/metrics` | No | ✅ | Prometheus metrics (text/plain) |
 
-> ⚠️ `sweety reload` currently uses system signals for hot reload, not the Admin API. `POST /api/v1/reload` is not yet implemented.
+> Full Admin API (config tree, `/config/reload`, upstreams/certs/cache, etc.) is documented in [Admin API](/en-us/configuration/admin-api). CLI `sweety reload` via signals still works alongside Admin endpoints.
 
 ---
 

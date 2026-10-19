@@ -194,13 +194,32 @@ pub fn compress_response(
     // ② 上游 / PHP 已压缩：跳过，避免双重压缩
     if resp.headers().contains_key(CONTENT_ENCODING) { return resp; }
 
+    // ②' 无内容实体的状态（1xx 隧道 / 204 / 304）不压缩
+    let status = resp.status();
+    if status.is_informational()
+        || status == sweety_web::http::StatusCode::NO_CONTENT
+        || status == sweety_web::http::StatusCode::NOT_MODIFIED
+    {
+        return resp;
+    }
+
     // ③ mime 不可压缩
     let ct = resp.headers().get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok()).unwrap_or("");
+    // 流式事件（SSE / NDJSON）：压缩器会攒批输出导致事件延迟，必须逐块原样下发
+    let mime = ct.split(';').next().unwrap_or("").trim();
+    if mime.eq_ignore_ascii_case("text/event-stream") || mime.eq_ignore_ascii_case("application/x-ndjson") {
+        return resp;
+    }
     let compressible = ct.starts_with("text/")
         || ct.contains("javascript") || ct.contains("json")
         || ct.contains("xml")        || ct.contains("svg");
     if !compressible { return resp; }
+
+    // 压缩会改变 body 语义：不得再声明 chunked trailer（RFC 9112）
+    use sweety_web::http::{TrailersAfterBody, take_staged_trailers};
+    let _ = take_staged_trailers(resp.headers_mut());
+    resp.extensions_mut().remove::<TrailersAfterBody>();
 
     // ④ 严格解析 Accept-Encoding，自适应算法选择（读取 Content-Length 作为大小提示）
     let size_hint: Option<u64> = resp.headers()

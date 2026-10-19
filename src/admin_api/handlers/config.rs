@@ -392,6 +392,11 @@ fn apply_config(ctx: &AdminContext, new_cfg: AppConfig) -> Result<(), String> {
         sweety_web::set_h3_max_connections(max_handlers);
     }
 
+    crate::handler::reverse_proxy::conn::set_upstream_response_limits(
+        new_cfg.global.upstream_max_response_headers,
+        new_cfg.global.upstream_max_response_header_kb.saturating_mul(1024),
+    );
+
     ctx.cfg.store(Arc::new(new_cfg));
     Ok(())
 }

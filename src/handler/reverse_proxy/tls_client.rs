@@ -1,5 +1,5 @@
 //! TLS 客户端模块
-//! 负责：为上游连接构建 TLS 客户端配置，支持标准证书验证和跳过验证两种模式
+//! 负责：为上游连接构建 TLS 客户端配置（ALPN 区分 HTTP/1.1 与 HTTP/2），支持标准/跳过验证
 
 use std::sync::Arc;
 
@@ -8,39 +8,50 @@ use rustls::ClientConfig as RustlsClientConfig;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::TlsConnector;
 
-/// 全局单例 TLS 客户端配置（启用 session cache，跳过证书验证模式）
-static TLS_CLIENT_INSECURE: std::sync::OnceLock<Arc<RustlsClientConfig>> = std::sync::OnceLock::new();
-/// 全局单例 TLS 客户端配置（启用 session cache，标准证书验证模式）
-static TLS_CLIENT_SECURE:   std::sync::OnceLock<Arc<RustlsClientConfig>> = std::sync::OnceLock::new();
+/// 上游 TLS ALPN（RFC 7540 §3.3：H2 必须协商 `h2`）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TlsAlpn {
+    Http11,
+    Http2,
+}
+
+static TLS_INSECURE_H11: std::sync::OnceLock<Arc<RustlsClientConfig>> = std::sync::OnceLock::new();
+static TLS_INSECURE_H2: std::sync::OnceLock<Arc<RustlsClientConfig>> = std::sync::OnceLock::new();
+static TLS_SECURE_H11: std::sync::OnceLock<Arc<RustlsClientConfig>> = std::sync::OnceLock::new();
+static TLS_SECURE_H2: std::sync::OnceLock<Arc<RustlsClientConfig>> = std::sync::OnceLock::new();
 
 /// 对已建立的连接执行 TLS 握手，返回加密流
-///
-/// 泛型 IO：支持 TcpStream 和 UnixStream，编译器对具体类型单态化，零虚函数开销
-///
-/// ClientConfig 全局单例：
-/// - 启用 session cache（ClientSessionMemoryCache 1024），允许 TLS session resumption
-/// - 避免每次请求新建 config 导致 session cache 失效
-pub async fn tls_connect<IO>(io: IO, sni: &str, insecure: bool) -> Result<tokio_rustls::client::TlsStream<IO>>
-where IO: AsyncRead + AsyncWrite + Unpin
+pub async fn tls_connect<IO>(io: IO, sni: &str, insecure: bool, alpn: TlsAlpn) -> Result<tokio_rustls::client::TlsStream<IO>>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
 {
-    let config = if insecure {
-        TLS_CLIENT_INSECURE.get_or_init(build_insecure_config).clone()
-    } else {
-        TLS_CLIENT_SECURE.get_or_init(build_secure_config).clone()
-    };
+    let config = config_for(insecure, alpn);
     let connector = TlsConnector::from(config);
     let server_name = rustls::pki_types::ServerName::try_from(sni.to_string())
         .map_err(|e| anyhow::anyhow!("无效的 TLS SNI '{}': {}", sni, e))?;
-    connector.connect(server_name, io).await
+    connector
+        .connect(server_name, io)
+        .await
         .map_err(|e| anyhow::anyhow!("TLS 握手失败 ({}): {}", sni, e))
 }
 
-// ─────────────────────────────────────────────
-// 内部实现
-// ─────────────────────────────────────────────
+fn config_for(insecure: bool, alpn: TlsAlpn) -> Arc<RustlsClientConfig> {
+    match (insecure, alpn) {
+        (true, TlsAlpn::Http11) => TLS_INSECURE_H11.get_or_init(|| build_insecure_config(TlsAlpn::Http11)).clone(),
+        (true, TlsAlpn::Http2) => TLS_INSECURE_H2.get_or_init(|| build_insecure_config(TlsAlpn::Http2)).clone(),
+        (false, TlsAlpn::Http11) => TLS_SECURE_H11.get_or_init(|| build_secure_config(TlsAlpn::Http11)).clone(),
+        (false, TlsAlpn::Http2) => TLS_SECURE_H2.get_or_init(|| build_secure_config(TlsAlpn::Http2)).clone(),
+    }
+}
 
-/// 跳过证书验证的 TLS 配置（insecure 模式）
-fn build_insecure_config() -> Arc<RustlsClientConfig> {
+fn apply_alpn(cfg: &mut RustlsClientConfig, alpn: TlsAlpn) {
+    cfg.alpn_protocols = match alpn {
+        TlsAlpn::Http11 => vec![b"http/1.1".to_vec()],
+        TlsAlpn::Http2 => vec![b"h2".to_vec()],
+    };
+}
+
+fn build_insecure_config(alpn: TlsAlpn) -> Arc<RustlsClientConfig> {
     #[derive(Debug)]
     struct NoVerifier;
 
@@ -81,28 +92,30 @@ fn build_insecure_config() -> Arc<RustlsClientConfig> {
         }
     }
 
-    let mut cfg = RustlsClientConfig::builder_with_provider(
-        Arc::new(rustls::crypto::aws_lc_rs::default_provider())
-    )
-        .with_safe_default_protocol_versions().unwrap()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerifier))
-        .with_no_client_auth();
-    // 启用 session cache，允许 TLS session resumption，避免每次全量握手
+    let mut cfg = RustlsClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(NoVerifier))
+    .with_no_client_auth();
     cfg.resumption = rustls::client::Resumption::in_memory_sessions(1024);
+    apply_alpn(&mut cfg, alpn);
     Arc::new(cfg)
 }
 
-/// 使用 webpki 根证书的标准 TLS 配置
-fn build_secure_config() -> Arc<RustlsClientConfig> {
+fn build_secure_config(alpn: TlsAlpn) -> Arc<RustlsClientConfig> {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let mut cfg = RustlsClientConfig::builder_with_provider(
-        Arc::new(rustls::crypto::aws_lc_rs::default_provider())
-    )
-        .with_safe_default_protocol_versions().unwrap()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+    let mut cfg = RustlsClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(root_store)
+    .with_no_client_auth();
     cfg.resumption = rustls::client::Resumption::in_memory_sessions(1024);
+    apply_alpn(&mut cfg, alpn);
     Arc::new(cfg)
 }

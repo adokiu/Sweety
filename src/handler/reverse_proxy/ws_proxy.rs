@@ -73,7 +73,7 @@ unsafe impl<S: Send> Send for WsMetricsStream<S> {}
 /// - upstream → client：从 upstream read half 读帧，输出给框架
 ///
 /// 与 Nginx 单 worker 事件循环等价：一次 poll 同时检查两个 fd 的 ready 状态。
-struct BiDirStream<R, W> {
+pub(crate) struct BiDirStream<R, W> {
     upstream_read:  R,
     upstream_write: W,
     client_body:    RequestBody,
@@ -85,6 +85,8 @@ struct BiDirStream<R, W> {
     pending_write:  Option<Bytes>,
     /// client body 是否已结束
     client_done:    bool,
+    /// 是否已向上游传播半关闭（shutdown write half → TCP FIN / TLS close_notify）
+    upstream_shutdown: bool,
 }
 
 // SAFETY: BiDirStream 作为 response body stream 只在单个 tokio task 里被 poll，
@@ -97,7 +99,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    fn new(upstream_read: R, upstream_write: W, client_body: RequestBody, prefetched_upstream: Option<Bytes>) -> Self {
+    pub(crate) fn new(upstream_read: R, upstream_write: W, client_body: RequestBody, prefetched_upstream: Option<Bytes>) -> Self {
         let mut read_buf = bytes::BytesMut::with_capacity(65536);
         read_buf.resize(65536, 0);
         Self {
@@ -108,6 +110,7 @@ where
             read_buf,
             pending_write: None,
             client_done: false,
+            upstream_shutdown: false,
         }
     }
 }
@@ -147,6 +150,16 @@ where
                 Poll::Pending => {}
             }
         }
+        // 客户端方向结束且数据已写完：向上游传播半关闭，让上游感知 EOF 后自行收尾
+        if this.client_done && this.pending_write.is_none() && !this.upstream_shutdown {
+            match Pin::new(&mut this.upstream_write).poll_shutdown(cx) {
+                Poll::Ready(r) => {
+                    if let Err(e) = r { trace!("WS 上游 shutdown 失败: {}", e); }
+                    this.upstream_shutdown = true;
+                }
+                Poll::Pending => {}
+            }
+        }
 
         // ── 方向 B：upstream → client ───────────────────────────────
         if let Some(chunk) = this.prefetched_upstream.take() {
@@ -176,7 +189,7 @@ where
 
 /// 处理 WS/WSS 反向代理请求的公开入口
 ///
-/// H2 extended CONNECT（RFC 8441）：返回 501，浏览器自动降级 HTTP/1.1 重试
+/// H2 extended CONNECT（RFC 8441）/ H3（RFC 9220）：返回 200，双向流透传
 /// H1 Upgrade：正常代理，返回 101 Switching Protocols
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_ws_proxy(
@@ -195,6 +208,12 @@ pub async fn handle_ws_proxy(
     proxy_redirect_to: Option<&str>,
     is_h2_ws: bool,
 ) -> WebResponse {
+    // H1：先校验客户端握手再连接上游（RFC 6455 §4.2.1），失败返回 4xx 而非 502
+    if !is_h2_ws {
+        if let Err(resp) = validate_client_handshake(ctx.req().method(), ctx.req().version(), ctx.req().headers()) {
+            return resp;
+        }
+    }
     match do_ws_proxy(
         ctx, upstream_addr, use_tls, tls_sni, tls_insecure,
         extra_headers, client_ip, upstream_host, path,
@@ -209,6 +228,71 @@ pub async fn handle_ws_proxy(
             resp
         }
     }
+}
+
+/// 按 RFC 6455 §4.2.1 校验 H1 客户端握手
+///
+/// - 方法必须为 GET（否则 405 + Allow: GET）
+/// - Upgrade 含 websocket token，Connection 含 upgrade token（否则 400）
+/// - Sec-WebSocket-Version 必须为 13（否则 426 + Sec-WebSocket-Version: 13）
+/// - Sec-WebSocket-Key 必须是 base64 编码的 16 字节随机值（否则 400）
+fn validate_client_handshake(
+    method: &sweety_web::http::Method,
+    _version: sweety_web::http::Version,
+    headers: &sweety_web::http::header::HeaderMap,
+) -> std::result::Result<(), WebResponse> {
+    use base64::Engine as _;
+    use sweety_web::http::header::{
+        ALLOW, CONNECTION, HeaderValue, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION, UPGRADE,
+    };
+
+    let reject = |status: StatusCode| {
+        let mut resp = WebResponse::new(ResponseBody::empty());
+        *resp.status_mut() = status;
+        resp
+    };
+    let has_token = |name: &sweety_web::http::header::HeaderName, token: &str| {
+        headers.get_all(name).iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .any(|t| t.trim().eq_ignore_ascii_case(token))
+    };
+
+    if method != sweety_web::http::Method::GET {
+        let mut resp = reject(StatusCode::METHOD_NOT_ALLOWED);
+        resp.headers_mut().insert(ALLOW, HeaderValue::from_static("GET"));
+        return Err(resp);
+    }
+    if !has_token(&UPGRADE, "websocket") || !has_token(&CONNECTION, "upgrade") {
+        return Err(reject(StatusCode::BAD_REQUEST));
+    }
+    if headers.get(SEC_WEBSOCKET_VERSION).map(|v| v.as_bytes()) != Some(&b"13"[..]) {
+        let mut resp = reject(StatusCode::UPGRADE_REQUIRED);
+        resp.headers_mut().insert(SEC_WEBSOCKET_VERSION, HeaderValue::from_static("13"));
+        return Err(resp);
+    }
+    let key_ok = headers.get(SEC_WEBSOCKET_KEY)
+        .and_then(|v| base64::engine::general_purpose::STANDARD.decode(v.as_bytes()).ok())
+        .is_some_and(|k| k.len() == 16);
+    if !key_ok {
+        return Err(reject(StatusCode::BAD_REQUEST));
+    }
+    Ok(())
+}
+
+/// 生成 Sec-WebSocket-Key：16 字节密码学随机数的 base64（RFC 6455 §4.1）
+fn random_ws_key() -> String {
+    use base64::Engine as _;
+    let mut key = [0u8; 16];
+    if rustls::crypto::aws_lc_rs::default_provider().secure_random.fill(&mut key).is_err() {
+        // 系统随机源不可用时退化为时间 + 地址熵（仅用于防缓存重放，不承担安全性）
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() ^ (&key as *const _ as usize as u128);
+        key.copy_from_slice(&seed.to_le_bytes());
+    }
+    base64::engine::general_purpose::STANDARD.encode(key)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -240,40 +324,28 @@ async fn do_ws_proxy(
     upgrade_req.push_str(" HTTP/1.1\r\nHost: "); upgrade_req.push_str(upstream_host);
     upgrade_req.push_str("\r\n");
     for (k, v) in extra_headers {
+        // 握手关键头由下方按 RFC 6455 统一生成，避免与用户 proxy_set_headers 产生重复/冲突
+        if k.eq_ignore_ascii_case("upgrade")
+            || k.eq_ignore_ascii_case("connection")
+            || k.eq_ignore_ascii_case("sec-websocket-version")
+            || k.eq_ignore_ascii_case("content-length")
+            || k.eq_ignore_ascii_case("transfer-encoding")
+        {
+            continue;
+        }
         // CRLF 注入防护：过滤 header name/value 中的 \r \n，防止 HTTP Request Smuggling
         super::conn::push_safe_header(&mut upgrade_req, k, v);
     }
-    upgrade_req.push_str("X-Real-IP: "); super::conn::push_sanitized_value(&mut upgrade_req, client_ip); upgrade_req.push_str("\r\n");
-    upgrade_req.push_str("X-Forwarded-For: "); super::conn::push_sanitized_value(&mut upgrade_req, client_ip); upgrade_req.push_str("\r\n");
-    // 对标 Nginx: proxy_http_version 1.1 + proxy_set_header Upgrade $http_upgrade
-    // 必须显式加上 Upgrade + Connection，上游才能完成 WebSocket 升级握手
-    let is_already_upgrade = extra_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("upgrade"));
-    if !is_already_upgrade {
-        upgrade_req.push_str("Upgrade: websocket\r\n");
-    }
-    // H2 WS（RFC 8441）客户端不发 Sec-WebSocket-Key，但上游 HTTP/1.1 WS 服务器必须有此头
-    // 若缺失则自动生成随机 key（与 Nginx 对 H2 WS 的处理方式一致）
+    super::conn::push_forwarding_headers(&mut upgrade_req, extra_headers, client_ip, None);
+    // H2 WS（RFC 8441）客户端不发 Sec-WebSocket-Key，但上游 HTTP/1.1 WS 服务器必须有此头：
+    // 生成 16 字节密码学随机 nonce（RFC 6455 §4.1）。H1 透传客户端 key，保证 Accept 与客户端一致
     let has_ws_key = extra_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("sec-websocket-key"));
     if !has_ws_key {
-        use base64::Engine as _;
-        let mut key_bytes = [0u8; 16];
-        key_bytes.iter_mut().enumerate().for_each(|(i, b)| {
-            // 用连接时间和索引生成伪随机 key（足够唯一，不需要密码学随机）
-            let t = (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .subsec_nanos() >> (i % 8)) as u8;
-            *b = t ^ ((i as u32).wrapping_mul(0x9e3779b9) as u8);
-        });
-        let key = base64::engine::general_purpose::STANDARD.encode(key_bytes);
-        upgrade_req.push_str("Sec-WebSocket-Key: "); upgrade_req.push_str(&key); upgrade_req.push_str("\r\n");
+        upgrade_req.push_str("Sec-WebSocket-Key: ");
+        upgrade_req.push_str(&random_ws_key());
+        upgrade_req.push_str("\r\n");
     }
-    // Sec-WebSocket-Version 必须是 13（RFC 6455）
-    let has_ws_version = extra_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("sec-websocket-version"));
-    if !has_ws_version {
-        upgrade_req.push_str("Sec-WebSocket-Version: 13\r\n");
-    }
-    upgrade_req.push_str("Connection: Upgrade\r\n\r\n");
+    upgrade_req.push_str("Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\r\n");
 
     // ── Step 2：连接上游 + TLS + 握手 + 双向转发 ───────────────
     /// 泛型内部函数：对任意 IO 流完成 WS 握手和双向转发
@@ -285,7 +357,7 @@ async fn do_ws_proxy(
         proxy_redirect_from: Option<&str>, proxy_redirect_to: Option<&str>,
     ) -> Result<WebResponse> {
         if use_tls {
-            let tls = tls_connect(io, tls_sni, tls_insecure).await?;
+            let tls = tls_connect(io, tls_sni, tls_insecure, super::tls_client::TlsAlpn::Http11).await?;
             ws_handshake_and_relay(
                 ctx, tls, upgrade_req, is_h2_ws,
                 strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to,
@@ -359,9 +431,19 @@ where
     let (status_code, response_headers, prefetched_upstream) = read_upstream_headers(&mut upstream).await?;
 
     if status_code != 101 {
+        // 上游拒绝升级：完整透传状态码、响应头与响应体（如 401 的 WWW-Authenticate、302 的 Location）
         warn!("WS 上游返回非 101: {}", status_code);
-        let mut resp = WebResponse::new(ResponseBody::empty());
-        *resp.status_mut() = StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY);
+        let status = StatusCode::from_u16(status_code)
+            .ok()
+            .filter(|s| !s.is_informational())
+            .unwrap_or(StatusCode::BAD_GATEWAY);
+        let body = read_rejection_body(upstream, prefetched_upstream, &response_headers).await;
+        let mut resp = WebResponse::new(if body.is_empty() { ResponseBody::empty() } else { ResponseBody::from(body) });
+        *resp.status_mut() = status;
+        apply_response_headers(
+            &mut resp, &response_headers,
+            strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to,
+        );
         return Ok(resp);
     }
 
@@ -382,8 +464,7 @@ where
     let mut final_resp = WebResponse::new(ResponseBody::box_stream(ws_stream));
 
     if is_h2_ws {
-        // H2 extended CONNECT（RFC 8441）：返回 200，无 Upgrade/Connection 头
-        // H2 DATA 帧天然双向，框架持续 poll bidir stream 驱动转发
+        // H2/H3 extended CONNECT：返回 200，无 Upgrade/Connection 头
         *final_resp.status_mut() = StatusCode::OK;
     } else {
         // H1 Upgrade：需要验证客户端握手头（Sec-WebSocket-Key 等），返回 101
@@ -403,13 +484,42 @@ where
         strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to,
     );
 
+    if is_h2_ws {
+        // RFC 8441 §5：H2 下握手由 :protocol + 2xx 完成，Sec-WebSocket-Accept 无意义（对应的是代理生成的 key）
+        final_resp.headers_mut().remove(sweety_web::http::header::SEC_WEBSOCKET_ACCEPT);
+    }
+
     Ok(final_resp)
 }
 
+/// 读取上游拒绝升级时的响应体（最多 1 MiB，10 秒超时），用于透传给客户端
+async fn read_rejection_body<IO>(io: IO, prefetched: Option<Bytes>, headers: &[(String, String)]) -> Vec<u8>
+where IO: AsyncRead + Unpin {
+    const MAX: usize = 1 << 20;
+    let tmo = Duration::from_secs(10);
+    let prefix = std::io::Cursor::new(prefetched.map(|b| b.to_vec()).unwrap_or_default());
+    let mut reader = tokio::io::BufReader::new(prefix.chain(io));
+    let get = |name: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str());
+
+    let chunked = get("transfer-encoding")
+        .and_then(|v| v.rsplit(',').map(str::trim).find(|c| !c.is_empty()))
+        .is_some_and(|c| c.eq_ignore_ascii_case("chunked"));
+    if chunked {
+        return super::conn::read_chunked_body(&mut reader, false, tmo).await
+            .map(|(b, _)| b)
+            .unwrap_or_default();
+    }
+    let limit = get("content-length").and_then(|v| v.parse::<usize>().ok()).unwrap_or(MAX).min(MAX);
+    let mut body = Vec::new();
+    let _ = tokio::time::timeout(tmo, (&mut reader).take(limit as u64).read_to_end(&mut body)).await;
+    body
+}
+
 /// 读取上游 HTTP 响应头，返回（状态码，头列表）
-async fn read_upstream_headers<IO>(io: &mut IO) -> Result<(u16, Vec<(String, String)>, Option<Bytes>)>
+pub(crate) async fn read_upstream_headers<IO>(io: &mut IO) -> Result<(u16, Vec<(String, String)>, Option<Bytes>)>
 where IO: AsyncReadExt + Unpin {
-    let mut buf = vec![0u8; 4096];
+    // 16 KiB：容纳较大的 Set-Cookie / 扩展协商头
+    let mut buf = vec![0u8; 16384];
     let mut filled = 0usize;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
 

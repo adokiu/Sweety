@@ -1,4 +1,4 @@
-﻿use core::{
+use core::{
     cmp, fmt,
     future::{Future, poll_fn},
     marker::PhantomData,
@@ -27,8 +27,10 @@ use crate::{
     date::{DateTime, DateTimeHandle},
     h2::{body::RequestBody, error::Error},
     http::{
-        Extension, Request, RequestExt, Response, Version,
+        Extension, InformationalResponse, InformationalSink, Method, Request, RequestExt,
+        Response, StatusCode, Version,
         header::{CONNECTION, CONTENT_LENGTH, DATE, HeaderMap, HeaderName, HeaderValue, TRAILER},
+        proxy_ext::{TrailersAfterBody, take_deferred_trailers},
     },
     util::timer::KeepAlive,
 };
@@ -77,7 +79,7 @@ where
 
     async fn run_handler(
         req: Request<::h2::RecvStream>,
-        respond: ::h2::server::SendResponse<Bytes>,
+        mut respond: ::h2::server::SendResponse<Bytes>,
         service: Arc<S>,
         date: Rc<DateTimeHandle>,
         addr: SocketAddr,
@@ -90,19 +92,35 @@ where
         let is_h2_ws = req.extensions().get::<Protocol>()
             .map(|p| p.as_str().eq_ignore_ascii_case("websocket"))
             .unwrap_or(false);
+        let is_head = req.method() == Method::HEAD;
+        let (info_tx, mut info_rx) = InformationalSink::pair();
         let req = req.map(|body| {
             let ext = if is_h2_ws {
                 Extension::new_h2_ws(addr, is_tls)
             } else {
                 Extension::new(addr, is_tls)
             };
-            RequestExt::from_parts(RequestBody::from(body).into(), ext)
+            let mut req_ext = RequestExt::from_parts(RequestBody::from(body).into(), ext);
+            req_ext.set_informational_sink(info_tx);
+            req_ext
         });
-        let resp = match service.call(req).await {
-            Ok(r) => r,
-            Err(e) => { trace!("h2 service error: {:?}", e); return Ok(true); }
+        let mut service_fut = pin!(service.call(req));
+        let resp = loop {
+            tokio::select! {
+                Some(info) = info_rx.recv() => {
+                    if send_h2_informational(&mut respond, &date, info).await.is_err() {
+                        return Ok(true);
+                    }
+                }
+                res = &mut service_fut => {
+                    break match res {
+                        Ok(r) => r,
+                        Err(e) => { trace!("h2 service error: {:?}", e); return Ok(true); }
+                    };
+                }
+            }
         };
-        h2_handler(resp, respond, &date, raw_fd).await
+        h2_handler(resp, respond, &date, raw_fd, is_head).await
     }
 
     pub(crate) async fn run(self) -> Result<(), Error<S::Error, BE>> {
@@ -233,30 +251,69 @@ fn set_tcp_cork(fd: i32, on: bool) {
     // SAFETY: fd 来自已建立的 TLS 连接，生命周期由调用方保证有效
     // ManuallyDrop 确保函数返回时不会 close fd（不拥有所有权）
     let owned = std::mem::ManuallyDrop::new(unsafe { std::net::TcpStream::from_raw_fd(fd) });
-    let _ = socket2::SockRef::from(&*owned).set_cork(on);
+    let _ = socket2::SockRef::from(&*owned).set_tcp_cork(on);
 }
 
 #[cfg(not(target_os = "linux"))]
 #[inline(always)]
 fn set_tcp_cork(_fd: i32, _on: bool) {}
 
-async fn h2_handler<B, BE>(
-    resp: Response<B>,
-    mut respond: SendResponse<Bytes>,
-    date: &DateTimeHandle,
-    raw_fd: i32,
-) -> Result<bool, ()>
-where
-    B: Stream<Item = Result<Bytes, BE>>,
-    BE: fmt::Debug,
-{
-    let (res, body) = resp.into_parts();
-    let mut res = Response::from_parts(res, ());
-    *res.version_mut() = Version::HTTP_2;
+fn send_result<T>(result: Result<T, ::h2::Error>, raw_fd: i32) -> Result<T, ()> {
+    result.map_err(|e| {
+        trace!("h2 response send error: {:?}", e);
+        set_tcp_cork(raw_fd, false);
+    })
+}
 
-    let body_size = BodySize::from_stream(&body);
-    let is_eof = match body_size {
-        BodySize::None   => true,
+fn listed_header_names(headers: &HeaderMap, field: HeaderName) -> Vec<HeaderName> {
+    headers.get_all(field).iter()
+        .flat_map(|value| value.as_bytes().split(|&byte| byte == b','))
+        .filter_map(|token| {
+            let token = std::str::from_utf8(token).ok()?.trim_matches([' ', '\t']);
+            HeaderName::from_bytes(token.as_bytes()).ok()
+        })
+        .collect()
+}
+
+fn strip_connection_headers(headers: &mut HeaderMap) -> bool {
+    let nominated = listed_header_names(headers, CONNECTION);
+    let keep_alive = !nominated.iter().any(|name| name.as_str() == "close");
+    for name in nominated {
+        headers.remove(name);
+    }
+    for name in ["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade", "te"] {
+        headers.remove(name);
+    }
+    keep_alive
+}
+
+fn take_response_trailers(headers: &mut HeaderMap) -> Option<HeaderMap> {
+    let names = listed_header_names(headers, TRAILER);
+    headers.remove(TRAILER);
+    let mut trailers = None;
+    for name in names {
+        if name == CONTENT_LENGTH {
+            continue;
+        }
+        for value in headers.get_all(&name).iter() {
+            trailers.get_or_insert_with(|| HeaderMap::with_capacity(2))
+                .append(name.clone(), value.clone());
+        }
+        headers.remove(name);
+    }
+    trailers
+}
+
+fn prepare_response_body(res: &mut Response<()>, body_size: BodySize, is_head: bool) -> bool {
+    if res.status().is_informational() || res.status() == StatusCode::NO_CONTENT {
+        res.headers_mut().remove(CONTENT_LENGTH);
+        return true;
+    }
+    if is_head || res.status() == StatusCode::NOT_MODIFIED {
+        return true;
+    }
+    match body_size {
+        BodySize::None => true,
         BodySize::Stream => false,
         BodySize::Sized(n) => {
             if !res.headers().contains_key(CONTENT_LENGTH) {
@@ -264,31 +321,83 @@ where
             }
             n == 0
         }
-    };
-
-    // trailers 惰性分配：绝大多数响应无 trailer，跳过无条件 HeaderMap 分配
-    let mut trailers: Option<HeaderMap> = None;
-    while let Some(value) = res.headers_mut().remove(TRAILER) {
-        let name = HeaderName::from_bytes(value.as_bytes()).unwrap();
-        let value = match res.headers_mut().remove(name.clone()) {
-            Some(v) => v,
-            None => continue,
-        };
-        trailers.get_or_insert_with(|| HeaderMap::with_capacity(2)).append(name, value);
     }
+}
+
+async fn merge_deferred_trailers(
+    mut trailers: Option<HeaderMap>,
+    deferred: Option<TrailersAfterBody>,
+) -> Option<HeaderMap> {
+    if let Some(d) = deferred {
+        if let Some(extra) = take_deferred_trailers(&d).await {
+            trailers
+                .get_or_insert_with(HeaderMap::new)
+                .extend(extra);
+        }
+    }
+    trailers
+}
+
+async fn send_h2_informational(
+    respond: &mut SendResponse<Bytes>,
+    date: &DateTimeHandle,
+    info: InformationalResponse,
+) -> Result<(), ()> {
+    let mut res = Response::builder()
+        .status(info.status)
+        .version(Version::HTTP_2)
+        .body(())
+        .map_err(|_| ())?;
+    *res.headers_mut() = info.headers;
+    if !res.headers().contains_key(DATE) {
+        let d = date.with_date(HeaderValue::from_bytes).map_err(|_| ())?;
+        res.headers_mut().insert(DATE, d);
+    }
+    strip_connection_headers(res.headers_mut());
+    respond.send_response(res, false).map_err(|_| ())?;
+    Ok(())
+}
+
+async fn h2_handler<B, BE>(
+    resp: Response<B>,
+    mut respond: SendResponse<Bytes>,
+    date: &DateTimeHandle,
+    raw_fd: i32,
+    is_head: bool,
+) -> Result<bool, ()>
+where
+    B: Stream<Item = Result<Bytes, BE>>,
+    BE: fmt::Debug,
+{
+    let deferred_trailers = resp.extensions().get::<TrailersAfterBody>().cloned();
+    let (res, body) = resp.into_parts();
+    let mut res = Response::from_parts(res, ());
+    *res.version_mut() = Version::HTTP_2;
+
+    let body_size = BodySize::from_stream(&body);
+    let is_eof = prepare_response_body(&mut res, body_size, is_head);
     if !res.headers().contains_key(DATE) {
         let d = date.with_date(HeaderValue::from_bytes).unwrap();
         res.headers_mut().insert(DATE, d);
     }
+    let keep_alive = strip_connection_headers(res.headers_mut());
+
+    // trailers 惰性分配：绝大多数响应无 trailer，跳过无条件 HeaderMap 分配
+    let trailers = take_response_trailers(res.headers_mut());
     // Connection: close → 返回 false 通知 dispatcher graceful_shutdown
-    let keep_alive = res.headers_mut().remove(CONNECTION)
-        .map(|v| !v.as_bytes().eq_ignore_ascii_case(b"close"))
-        .unwrap_or(true);
 
     // 无 body
     if is_eof {
         set_tcp_cork(raw_fd, true);
-        let _ = respond.send_response(res, true);
+        let merged = merge_deferred_trailers(trailers, deferred_trailers).await;
+        if merged.is_some() {
+            let mut stream = send_result(respond.send_response(res, false), raw_fd)?;
+            if let Some(t) = merged {
+                send_result(stream.send_trailers(t), raw_fd)?;
+            }
+        } else {
+            send_result(respond.send_response(res, true), raw_fd)?;
+        }
         set_tcp_cork(raw_fd, false);
         return Ok(keep_alive);
     }
@@ -298,19 +407,26 @@ where
     // 消除 H2 流控等待：整块 send_data 比分块流式减少多次 poll_capacity 调度往返
     if let BodySize::Sized(n) = body_size {
         if n as usize <= SMALL_BODY_INLINE {
-            let data: Option<Bytes> = {
+            let data: Result<Option<Bytes>, BE> = async {
                 let mut body = pin!(body);
                 // 先尝试同步 poll（单块 Bytes body 永远同步 Ready，避免不必要的 await）
                 let waker = futures_util::task::noop_waker();
                 let mut cx = Context::from_waker(&waker);
-                match body.as_mut().poll_next(&mut cx) {
+                Ok(match body.as_mut().poll_next(&mut cx) {
                     Poll::Pending => {
                         // 异步 body（少见），直接 async await 第一块
-                        poll_fn(|cx| body.as_mut().poll_next(cx)).await
-                            .and_then(|r| r.ok())
+                        let Some(first) = poll_fn(|cx| body.as_mut().poll_next(cx)).await.transpose()? else {
+                            return Ok(None);
+                        };
+                        let mut buf = crate::bytes::BytesMut::with_capacity(n as usize);
+                        buf.extend_from_slice(&first);
+                        while let Some(chunk) = poll_fn(|cx| body.as_mut().poll_next(cx)).await {
+                            buf.extend_from_slice(&chunk?);
+                        }
+                        Some(buf.freeze())
                     }
                     Poll::Ready(None) => None,
-                    Poll::Ready(Some(Err(_))) => None,
+                    Poll::Ready(Some(Err(e))) => return Err(e),
                     Poll::Ready(Some(Ok(first))) => {
                         // 检查是否还有更多 chunk
                         match body.as_mut().poll_next(&mut cx) {
@@ -324,11 +440,12 @@ where
                                 loop {
                                     match body.as_mut().poll_next(&mut cx) {
                                         Poll::Ready(Some(Ok(c))) => buf.extend_from_slice(&c),
-                                        Poll::Ready(_) => break,
+                                        Poll::Ready(None) => break,
+                                        Poll::Ready(Some(Err(e))) => return Err(e),
                                         Poll::Pending => {
                                             // stream 还有数据但需要 async，切换到 async collect
-                                            while let Some(Ok(c)) = poll_fn(|cx| body.as_mut().poll_next(cx)).await {
-                                                buf.extend_from_slice(&c);
+                                            while let Some(chunk) = poll_fn(|cx| body.as_mut().poll_next(cx)).await {
+                                                buf.extend_from_slice(&chunk?);
                                             }
                                             break;
                                         }
@@ -341,29 +458,48 @@ where
                                 let cap = n as usize;
                                 let mut buf = crate::bytes::BytesMut::with_capacity(cap);
                                 buf.extend_from_slice(&first);
-                                while let Some(Ok(c)) = poll_fn(|cx| body.as_mut().poll_next(cx)).await {
-                                    buf.extend_from_slice(&c);
+                                while let Some(chunk) = poll_fn(|cx| body.as_mut().poll_next(cx)).await {
+                                    buf.extend_from_slice(&chunk?);
                                 }
                                 Some(buf.freeze())
                             }
-                            _ => Some(first),
+                            Poll::Ready(Some(Err(e))) => return Err(e),
                         }
                     }
+                })
+            }.await;
+            let data = match data {
+                Ok(data) => data,
+                Err(e) => {
+                    trace!("h2 response body error: {:?}", e);
+                    respond.send_reset(::h2::Reason::INTERNAL_ERROR);
+                    return Err(());
                 }
             };
-            let has_trailers = trailers.is_some();
             set_tcp_cork(raw_fd, true);
             match data {
-                None => { let _ = respond.send_response(res, true); }
-                Some(data) => {
-                    if let Ok(mut stream) = respond.send_response(res, false) {
+                None => {
+                    let merged_trailers = merge_deferred_trailers(trailers, deferred_trailers.clone()).await;
+                    if merged_trailers.is_some() {
+                        let mut stream = send_result(respond.send_response(res, false), raw_fd)?;
+                        if let Some(t) = merged_trailers {
+                            send_result(stream.send_trailers(t), raw_fd)?;
+                        }
+                    } else {
+                        send_result(respond.send_response(res, true), raw_fd)?;
+                    }
+                }
+                Some(data) => match respond.send_response(res, false) {
+                    Ok(mut stream) => {
+                        let merged_trailers = merge_deferred_trailers(trailers, deferred_trailers.clone()).await;
+                        let has_trailers = merged_trailers.is_some();
                         // 先申请容量：初始流控窗口仅 65535，直接 send_data 超过窗口会被丢弃导致 EOF
                         let total = data.len();
                         stream.reserve_capacity(total);
                         let cap = stream.capacity();
                         if cap >= total {
                             // 窗口足够（小文件或对端窗口够大），直接发
-                            let _ = stream.send_data(data, !has_trailers);
+                            send_result(stream.send_data(data, !has_trailers), raw_fd)?;
                         } else {
                             // 窗口不够（典型：100KB > 65535），需要分块等 WINDOW_UPDATE
                             // 先 UNCORK 让 HEADERS 刷到对端，对端才会发 WINDOW_UPDATE
@@ -375,23 +511,27 @@ where
                                     let n = cmp::min(cap, remaining.len());
                                     let chunk = remaining.split_to(n);
                                     let eos = remaining.is_empty() && !has_trailers;
-                                    let _ = stream.send_data(chunk, eos);
+                                    send_result(stream.send_data(chunk, eos), raw_fd)?;
                                     stream.reserve_capacity(remaining.len());
                                     if remaining.is_empty() { break; }
                                 } else {
                                     match poll_fn(|cx| stream.poll_capacity(cx)).await {
-                                        None | Some(Err(_)) => {
+                                        None => {
                                             set_tcp_cork(raw_fd, false);
-                                            return Ok(keep_alive);
+                                            return Err(());
                                         }
+                                        Some(Err(e)) => return send_result(Err(e), raw_fd),
                                         Some(Ok(_)) => {}
                                     }
                                 }
                             }
                             // 分块完成后不再需要重新 CORK（后续直接 UNCORK）
                         }
-                        if let Some(t) = trailers { let _ = stream.send_trailers(t); }
+                        if let Some(t) = merged_trailers {
+                            send_result(stream.send_trailers(t), raw_fd)?;
+                        }
                     }
+                    Err(e) => return send_result(Err(e), raw_fd),
                 }
             }
             set_tcp_cork(raw_fd, false);
@@ -409,10 +549,7 @@ where
     // 内存保证：每流最多 1 个 chunk(32KB) + h2 buffer(32KB) = 64KB
     //   10,000 并发流 × 64KB = 640MB（vs 旧方案 10GB+）
     set_tcp_cork(raw_fd, true);
-    let mut stream = match respond.send_response(res, false) {
-        Ok(s) => s,
-        Err(_) => { set_tcp_cork(raw_fd, false); return Ok(keep_alive); }
-    };
+    let mut stream = send_result(respond.send_response(res, false), raw_fd)?;
     let mut body = pin!(body);
 
     // 预申请窗口：让 h2 crate 开始追踪流控需求
@@ -424,13 +561,20 @@ where
             set_tcp_cork(raw_fd, false);
             match poll_fn(|cx| stream.poll_capacity(cx)).await {
                 Some(Ok(_)) => { set_tcp_cork(raw_fd, true); }
-                _ => return Ok(keep_alive),
+                Some(Err(e)) => return send_result(Err(e), raw_fd),
+                None => return Err(()),
             }
         }
 
         // ② 有容量了，读一块数据（文件：pread kernel page cache 几乎立即 Ready）
         let chunk = match poll_fn(|cx| body.as_mut().poll_next(cx)).await {
-            None | Some(Err(_)) => break,
+            None => break,
+            Some(Err(e)) => {
+                trace!("h2 response body error: {:?}", e);
+                stream.send_reset(::h2::Reason::INTERNAL_ERROR);
+                set_tcp_cork(raw_fd, false);
+                return Err(());
+            }
             // 空 chunk 跳过，不当做 EOF：WebSocket 空帧、流控屏障等场景下可能吸入 0 字节，
             // 若 break 则 h2 会发送 EOS 帧强制关闭流，导致 WebSocket 连接异常断开
             Some(Ok(c)) if c.is_empty() => continue,
@@ -445,7 +589,7 @@ where
             if cap > 0 {
                 let n = cmp::min(cap, remaining.len());
                 let to_send = remaining.split_to(n);
-                let _ = stream.send_data(to_send, false);
+                send_result(stream.send_data(to_send, false), raw_fd)?;
                 stream.reserve_capacity(PIPELINE_WINDOW);
                 if remaining.is_empty() { break; }
             } else {
@@ -453,18 +597,153 @@ where
                 set_tcp_cork(raw_fd, false);
                 match poll_fn(|cx| stream.poll_capacity(cx)).await {
                     Some(Ok(_)) => { set_tcp_cork(raw_fd, true); }
-                    _ => return Ok(keep_alive),
+                    Some(Err(e)) => return send_result(Err(e), raw_fd),
+                    None => return Err(()),
                 }
             }
         }
     }
 
-    if let Some(t) = trailers {
-        let _ = stream.send_trailers(t);
+    if let Some(t) = merge_deferred_trailers(trailers, deferred_trailers).await {
+        send_result(stream.send_trailers(t), raw_fd)?;
     } else {
-        let _ = stream.send_data(Bytes::new(), true);
+        send_result(stream.send_data(Bytes::new(), true), raw_fd)?;
     }
     set_tcp_cork(raw_fd, false);
 
     Ok(keep_alive)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_connection_fields_cannot_become_trailers() {
+        let mut headers = HeaderMap::new();
+        for name in ["keep-alive", "proxy-connection", "transfer-encoding", "upgrade", "te", "x-hop", "x-other"] {
+            headers.append(HeaderName::from_static(name), HeaderValue::from_static("first"));
+            headers.append(HeaderName::from_static(name), HeaderValue::from_static("second"));
+        }
+        headers.append(CONNECTION, HeaderValue::from_static("X-Hop, keep-alive"));
+        headers.append(CONNECTION, HeaderValue::from_static("\tClOsE , X-Other, bad name"));
+        headers.insert(TRAILER, HeaderValue::from_static(
+            "connection, keep-alive, proxy-connection, transfer-encoding, upgrade, te, x-hop, x-other, x-check"
+        ));
+        headers.insert("x-check", HeaderValue::from_static("ok"));
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("17"));
+
+        assert!(!strip_connection_headers(&mut headers));
+        let trailers = take_response_trailers(&mut headers).unwrap();
+        for name in ["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade", "te", "x-hop", "x-other"] {
+            assert!(!headers.contains_key(name));
+            assert!(!trailers.contains_key(name));
+        }
+        assert!(!headers.contains_key(TRAILER));
+        assert_eq!(headers[CONTENT_LENGTH], "17");
+        assert_eq!(trailers.len(), 1);
+        assert_eq!(trailers["x-check"], "ok");
+    }
+
+    #[test]
+    fn response_te_is_removed_even_when_trailers() {
+        for value in ["trailers", "gzip", "trailers, gzip"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("te", HeaderValue::from_static(value));
+            assert!(strip_connection_headers(&mut headers));
+            assert!(!headers.contains_key("te"));
+        }
+    }
+
+    #[test]
+    fn connection_can_nominate_trailer_declaration() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONNECTION, HeaderValue::from_static("Trailer"));
+        headers.insert(TRAILER, HeaderValue::from_static("x-check"));
+        headers.insert("x-check", HeaderValue::from_static("ok"));
+        assert!(strip_connection_headers(&mut headers));
+        assert!(take_response_trailers(&mut headers).is_none());
+        assert_eq!(headers["x-check"], "ok");
+    }
+
+    #[test]
+    fn trailer_lists_ignore_invalid_names_and_preserve_all_values() {
+        let mut headers = HeaderMap::new();
+        headers.append(TRAILER, HeaderValue::from_static(" , X-Check, bad name, :status, content-length, "));
+        headers.append(TRAILER, HeaderValue::from_bytes(b"\xff, x-second, x-check").unwrap());
+        headers.append("x-check", HeaderValue::from_static("one"));
+        headers.append("x-check", HeaderValue::from_static("two"));
+        headers.insert("x-second", HeaderValue::from_static("three"));
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("99"));
+        assert!(strip_connection_headers(&mut headers));
+        let trailers = take_response_trailers(&mut headers).unwrap();
+        let values: Vec<_> = trailers.get_all("x-check").iter().collect();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0], "one");
+        assert_eq!(values[1], "two");
+        assert_eq!(trailers["x-second"], "three");
+        assert!(!trailers.contains_key(CONTENT_LENGTH));
+        assert_eq!(headers[CONTENT_LENGTH], "99");
+        assert!(!headers.contains_key(TRAILER));
+        assert!(!headers.contains_key("x-check"));
+        assert!(!headers.contains_key("x-second"));
+    }
+
+    #[test]
+    fn invalid_trailer_list_is_discarded() {
+        let mut headers = HeaderMap::new();
+        headers.insert(TRAILER, HeaderValue::from_static(" , bad name, :status, "));
+        assert!(take_response_trailers(&mut headers).is_none());
+        assert!(!headers.contains_key(TRAILER));
+    }
+
+    #[test]
+    fn head_and_304_preserve_length_metadata_without_sending_body() {
+        for (is_head, status) in [(true, StatusCode::OK), (false, StatusCode::NOT_MODIFIED)] {
+            for size in [BodySize::None, BodySize::Sized(0), BodySize::Sized(17), BodySize::Stream] {
+                let mut res = Response::new(());
+                *res.status_mut() = status;
+                res.headers_mut().insert(CONTENT_LENGTH, HeaderValue::from_static("123"));
+                assert!(prepare_response_body(&mut res, size, is_head));
+                assert_eq!(res.headers()[CONTENT_LENGTH], "123");
+                res.headers_mut().remove(CONTENT_LENGTH);
+                assert!(prepare_response_body(&mut res, size, is_head));
+                assert!(!res.headers().contains_key(CONTENT_LENGTH));
+            }
+        }
+    }
+
+    #[test]
+    fn no_content_never_sends_body_or_content_length() {
+        for is_head in [false, true] {
+            for size in [BodySize::None, BodySize::Sized(0), BodySize::Sized(17), BodySize::Stream] {
+                let mut res = Response::new(());
+                *res.status_mut() = StatusCode::NO_CONTENT;
+                res.headers_mut().insert(CONTENT_LENGTH, HeaderValue::from_static("123"));
+                assert!(prepare_response_body(&mut res, size, is_head));
+                assert!(!res.headers().contains_key(CONTENT_LENGTH));
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_responses_keep_body_framing() {
+        let mut res = Response::new(());
+        assert!(!prepare_response_body(&mut res, BodySize::Sized(17), false));
+        assert_eq!(res.headers()[CONTENT_LENGTH], "17");
+        res.headers_mut().remove(CONTENT_LENGTH);
+        assert!(prepare_response_body(&mut res, BodySize::Sized(0), false));
+        assert_eq!(res.headers()[CONTENT_LENGTH], "0");
+        res.headers_mut().remove(CONTENT_LENGTH);
+        assert!(!prepare_response_body(&mut res, BodySize::Stream, false));
+        assert!(!res.headers().contains_key(CONTENT_LENGTH));
+        assert!(prepare_response_body(&mut res, BodySize::None, false));
+        assert!(!res.headers().contains_key(CONTENT_LENGTH));
+    }
+
+    #[test]
+    fn send_errors_are_not_success() {
+        assert_eq!(send_result(Ok(42), 0), Ok(42));
+        assert!(send_result::<()>(Err(::h2::Reason::INTERNAL_ERROR.into()), 0).is_err());
+    }
 }

@@ -58,10 +58,12 @@ max_age            = 31536000   # Seconds (default 1 year)
 include_subdomains = true
 preload            = false
 
-# ─── Proxy Cache ──────────────────────────────────────────────────
+# ─── Proxy Cache (see [Cache](cache.md)) ───────────────────────────
 [sites.proxy_cache]
-max_entries = 1000
-ttl         = 60
+max_entries       = 1000
+ttl               = 60
+origin_revalidate = true
+use_stale_error   = true
 
 # ─── Rate Limiting ────────────────────────────────────────────────
 [sites.rate_limit]

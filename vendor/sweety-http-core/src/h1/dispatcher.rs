@@ -1,4 +1,4 @@
-﻿use core::{
+use core::{
     convert::Infallible,
     future::{pending, poll_fn},
     marker::PhantomData,
@@ -25,8 +25,8 @@ use crate::{
         error::Error,
     },
     http::{
-        StatusCode,
-        response::{Parts, Response},
+        InformationalResponse, InformationalSink, StatusCode, TrailersAfterBody,
+        header::HeaderMap, response::{Parts, Response}, take_deferred_trailers,
     },
     util::{
         buffered::{BufferedIo, ListWriteBuf, ReadBuf, WriteBuf},
@@ -38,7 +38,6 @@ use super::proto::{
     buf_write::H1BufWrite,
     codec::{ChunkResult, TransferCoding},
     context::Context,
-    encode::CONTINUE,
     error::ProtoError,
 };
 
@@ -157,6 +156,37 @@ impl<'a> Timer<'a> {
     }
 }
 
+/// 读取客户端请求体，并在等待 socket 可读时 interleave 写出 103 等 1xx（RFC 8297）
+async fn pump_client_request_body<St, W, D, const HEADER_LIMIT: usize, const READ_BUF_LIMIT: usize, SE, BE>(
+    io: &mut BufferedIo<'_, St, W, READ_BUF_LIMIT>,
+    ctx: &mut Context<'_, D, HEADER_LIMIT>,
+    body_reader: &mut BodyReader,
+    info_rx: &mut tokio::sync::mpsc::UnboundedReceiver<InformationalResponse>,
+) -> Result<Infallible, Error<SE, BE>>
+where
+    St: AsyncIo,
+    W: H1BufWrite,
+    D: DateTime,
+{
+    use super::proto::encode::encode_informational_response;
+
+    // Expect: 100-continue 仅经 InformationalSink 下发（反代转发上游 100；本地 handler 调 notify_expect_continue）
+
+    loop {
+        tokio::select! {
+            biased;
+            Some(info) = info_rx.recv() => {
+                io.write_buf
+                    .write_buf_head(|buf| encode_informational_response(ctx.date(), info.status, info.headers, buf))
+                    .map_err(Error::Proto)?;
+                io.drain_write().await.map_err(Error::from)?;
+            }
+            _ = body_reader.ready(&mut io.read_buf) => {}
+        }
+        io.read().await.map_err(Error::from)?;
+    }
+}
+
 impl<'a, St, S, ReqB, ResB, BE, W, D, const HEADER_LIMIT: usize, const READ_BUF_LIMIT: usize>
     Dispatcher<'a, St, S, ReqB, W, D, HEADER_LIMIT, READ_BUF_LIMIT>
 where
@@ -198,6 +228,10 @@ where
                 Err(Error::Proto(ProtoError::HeaderTooLarge)) => {
                     self.request_error(|| status_only(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE))
                 }
+                Err(Error::Proto(ProtoError::UriTooLong)) => self.request_error(|| status_only(StatusCode::URI_TOO_LONG)),
+                Err(Error::Proto(ProtoError::UnsupportedTransferCoding)) => {
+                    self.request_error(|| status_only(StatusCode::NOT_IMPLEMENTED))
+                }
                 Err(Error::Proto(_)) => self.request_error(|| status_only(StatusCode::BAD_REQUEST)),
                 Err(e) => return Err(e),
             }
@@ -223,15 +257,28 @@ where
             self.timer.reset_state();
 
             let (mut body_reader, body) = BodyReader::from_coding(decoder);
-            let req = req.map(|ext| ext.map_body(|_| ReqB::from(body)));
+            let (info_tx, mut info_rx) = InformationalSink::pair();
+            let req = req.map(|mut ext| {
+                ext.set_informational_sink(info_tx);
+                ext.map_body(|_| ReqB::from(body))
+            });
 
-            let (parts, body) = match self
+            let (parts, body, deferred_trailers) = match self
                 .service
                 .call(req)
-                .select(self.request_body_handler(&mut body_reader))
+                .select(pump_client_request_body(
+                    &mut self.io,
+                    &mut self.ctx,
+                    &mut body_reader,
+                    &mut info_rx,
+                ))
                 .await
             {
-                SelectOutput::A(Ok(res)) => res.into_parts(),
+                SelectOutput::A(Ok(res)) => {
+                    let deferred_trailers = res.extensions().get::<TrailersAfterBody>().cloned();
+                    let (parts, body) = res.into_parts();
+                    (parts, body, deferred_trailers)
+                }
                 SelectOutput::A(Err(e)) => return Err(Error::Service(e)),
                 SelectOutput::B(Err(e)) => return Err(e),
                 SelectOutput::B(Ok(i)) => match i {},
@@ -242,13 +289,20 @@ where
             let send_file_info: Option<crate::sendfile_ext::SendFileInfo> =
                 parts.extensions.get::<crate::sendfile_ext::SendFileInfo>().cloned();
 
+            // 101 Switching Protocols / CONNECT 2xx 进入隧道模式
+            let is_tunnel = parts.status == StatusCode::SWITCHING_PROTOCOLS
+                || (self.ctx.is_connect_method() && parts.status.is_success());
+
             let encoder = &mut self.encode_head(parts, &body)?;
+            self.io.drain_write().await?;
+            let no_body = matches!(encoder, TransferCoding::Eof);
             let mut body = pin!(body);
 
             // sendfile(2) 快路径：通过 sendfile_fd() 编译期 dispatch
             // 裸 TCP socket 返回 Some(fd)，TLS 等封装类型返回 None（编译期单态化，零开销）
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             let did_sendfile = 'sf: {
+                if no_body || is_tunnel { break 'sf false; }
                 let Some(sf) = send_file_info else { break 'sf false; };
                 let Some(sock_fd) = self.io.io.sendfile_fd() else { break 'sf false; };
                 self.io.drain_write().await?;
@@ -258,19 +312,70 @@ where
             #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             let did_sendfile = false;
 
-            if !did_sendfile {
-                // 参考 H2 实现：顺序「拉取 body → encode → drain 写出」
-                // 确保 TLS 路径下数据立即加密并刷到 socket，不依赖 select io_ready
+            // 隧道（WebSocket 等）：响应 body 期间必须继续读取客户端 socket，
+            // 否则 client → upstream 方向在握手后永久停滞（RFC 9110 §7.8 / RFC 6455 双向全双工）
+            if !did_sendfile && !no_body {
+                use super::proto::encode::encode_informational_response;
+                // 响应体写出期间 interleave 103/100 等 1xx（与 H2/H3 dispatcher 一致）
                 loop {
-                    match poll_fn(|cx| body.as_mut().poll_next(cx)).await {
+                    let next = if is_tunnel {
+                        let want_buf = self.io.write_buf.want_write_buf();
+                        tokio::select! {
+                            biased;
+                            Some(info) = info_rx.recv() => {
+                                self.io.write_buf
+                                    .write_buf_head(|buf| encode_informational_response(self.ctx.date(), info.status, info.headers, buf))
+                                    .map_err(Error::Proto)?;
+                                self.io.drain_write().await.map_err(Error::from)?;
+                                continue;
+                            }
+                            r = self.tunnel_read(&mut body_reader) => {
+                                match r {
+                                    Err(e) => return Err(e.into()),
+                                    Ok(()) => continue,
+                                }
+                            }
+                            next = poll_fn(|cx| {
+                                if want_buf {
+                                    body.as_mut().poll_next(cx)
+                                } else {
+                                    core::task::Poll::Pending
+                                }
+                            }) => next,
+                        }
+                    } else {
+                        tokio::select! {
+                            biased;
+                            Some(info) = info_rx.recv() => {
+                                self.io.write_buf
+                                    .write_buf_head(|buf| encode_informational_response(self.ctx.date(), info.status, info.headers, buf))
+                                    .map_err(Error::Proto)?;
+                                self.io.drain_write().await.map_err(Error::from)?;
+                                continue;
+                            }
+                            next = poll_fn(|cx| body.as_mut().poll_next(cx)) => next,
+                        }
+                    };
+                    match next {
                         Some(Ok(bytes)) => {
                             encoder.encode(bytes, &mut self.io.write_buf);
-                            if !self.io.write_buf.want_write_buf() {
+                            if !is_tunnel {
                                 self.io.drain_write().await?;
                             }
                         }
                         None => {
-                            encoder.encode_eof(&mut self.io.write_buf);
+                            let mut trailers = self.ctx.take_chunk_trailers();
+                            if let Some(d) = deferred_trailers.as_ref() {
+                                if let Some(extra) = take_deferred_trailers(d).await {
+                                    trailers
+                                        .get_or_insert_with(HeaderMap::new)
+                                        .extend(extra);
+                                }
+                            }
+                            encoder.encode_eof(
+                                &mut self.io.write_buf,
+                                trailers.as_ref().filter(|m| !m.is_empty()),
+                            );
                             break;
                         }
                         Some(Err(e)) => return Err(Error::Body(e)),
@@ -278,7 +383,8 @@ where
                 }
             }
 
-            if !body_reader.decoder.is_eof() {
+            // 隧道结束后连接不可复用为 HTTP/1.1
+            if is_tunnel || !body_reader.decoder.is_eof() {
                 self.ctx.set_close();
                 break;
             }
@@ -287,26 +393,29 @@ where
         Ok(())
     }
 
-    fn encode_head(&mut self, parts: Parts, body: &impl Stream) -> Result<TransferCoding, ProtoError> {
-        self.ctx.encode_head(parts, body, &mut self.io.write_buf)
-    }
-
-    // an associated future of self.service that runs until service is resolved or error produced.
-    async fn request_body_handler(&mut self, body_reader: &mut BodyReader) -> Result<Infallible, Error<S::Error, BE>> {
-        if self.ctx.is_expect_header() {
-            // wait for service future to start polling RequestBody.
-            if body_reader.wait_for_poll().await.is_ok() {
-                // encode continue as service future want a body.
-                self.io.write_buf.write_buf_static(CONTINUE);
-                // use drain write to make sure continue is sent to client.
-                self.io.drain_write().await?;
+    // 隧道模式下持续把客户端 socket 字节喂给 RequestBody。
+    // 客户端 EOF / 读错误时通知 body 结束（由上层传播半关闭），随后停止读取，
+    // 让 upstream → client 方向继续完成。
+    async fn tunnel_read(&mut self, body_reader: &mut BodyReader) -> io::Result<()> {
+        let ready = self.io_ready(body_reader).await?;
+        if ready.is_writable() {
+            self.io.try_write()?;
+        }
+        if ready.is_readable() {
+            if let Err(e) = self.io.try_read() {
+                if e.kind() == io::ErrorKind::UnexpectedEof && body_reader.decoder.is_upgrade() {
+                    body_reader.decoder.set_eof();
+                    body_reader.tx.feed_eof();
+                } else {
+                    body_reader.feed_error(e);
+                }
             }
         }
+        Ok(())
+    }
 
-        loop {
-            body_reader.ready(&mut self.io.read_buf).await;
-            self.io.read().await?;
-        }
+    fn encode_head(&mut self, parts: Parts, body: &impl Stream) -> Result<TransferCoding, ProtoError> {
+        self.ctx.encode_head(parts, body, &mut self.io.write_buf)
     }
 
     #[allow(dead_code)]
@@ -368,6 +477,11 @@ impl BodyReader {
     // a none ready state means the body consumer either is in backpressure or don't expect body.
     pub(super) async fn ready<const READ_BUF_LIMIT: usize>(&mut self, read_buf: &mut ReadBuf<READ_BUF_LIMIT>) {
         loop {
+            if !matches!(self.decoder, TransferCoding::Eof | TransferCoding::Corrupted)
+                && self.tx.ready().await.is_err()
+            {
+                self.decoder.set_corrupted();
+            }
             match self.decoder.decode(&mut *read_buf) {
                 ChunkResult::Ok(bytes) => self.tx.feed_data(bytes),
                 ChunkResult::InsufficientData => match self.tx.ready().await {
@@ -391,6 +505,7 @@ impl BodyReader {
     }
 
     // wait for service start to consume RequestBody.
+    #[allow(dead_code)]
     pub(super) async fn wait_for_poll(&mut self) -> io::Result<()> {
         // IMPORTANT: service future drop RequestBody so marker decoder to corrupted.
         self.tx
@@ -404,4 +519,196 @@ impl BodyReader {
 #[inline(never)]
 pub(super) fn status_only(status: StatusCode) -> Response<NoneBody<Bytes>> {
     Response::builder().status(status).body(NoneBody::default()).unwrap()
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use core::task::{Context as TaskContext, Poll, Waker};
+    use std::{collections::VecDeque, sync::{Arc, Mutex}};
+    use crate::date::SystemTimeDateTimeHandler;
+
+    #[derive(Default)]
+    struct IoState {
+        input: VecDeque<u8>,
+        output: Vec<u8>,
+        eof: bool,
+        blocked: bool,
+    }
+
+    struct TestIo(Arc<Mutex<IoState>>);
+
+    impl io::Read for TestIo {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let mut state = self.0.lock().unwrap();
+            if state.input.is_empty() {
+                return if state.eof { Ok(0) } else { Err(io::ErrorKind::WouldBlock.into()) };
+            }
+            let len = buf.len().min(state.input.len());
+            for byte in &mut buf[..len] {
+                *byte = state.input.pop_front().unwrap();
+            }
+            Ok(len)
+        }
+    }
+
+    impl io::Write for TestIo {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut state = self.0.lock().unwrap();
+            if state.blocked { return Err(io::ErrorKind::WouldBlock.into()); }
+            state.output.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+
+    impl AsyncIo for TestIo {
+        async fn ready(&mut self, interest: Interest) -> io::Result<Ready> {
+            poll_fn(|cx| self.poll_ready(interest, cx)).await
+        }
+
+        fn poll_ready(&mut self, interest: Interest, _: &mut TaskContext<'_>) -> Poll<io::Result<Ready>> {
+            let state = self.0.lock().unwrap();
+            let mut ready = Ready::EMPTY;
+            if interest.is_readable() && (!state.input.is_empty() || state.eof) {
+                ready |= Ready::READABLE;
+            }
+            if interest.is_writable() && !state.blocked { ready |= Ready::WRITABLE; }
+            if ready.is_empty() { Poll::Pending } else { Poll::Ready(Ok(ready)) }
+        }
+
+        fn is_vectored_write(&self) -> bool { false }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct TestService {
+        status: StatusCode,
+        kind: u8,
+        state: Arc<Mutex<IoState>>,
+    }
+
+    impl Service<ExtRequest<RequestBody>> for TestService {
+        type Response = Response<TestBody>;
+        type Error = Infallible;
+
+        async fn call(&self, req: ExtRequest<RequestBody>) -> Result<Self::Response, Self::Error> {
+            let (_, body) = req.into_body().replace_body(());
+            Ok(Response::builder().status(self.status).body(TestBody {
+                body,
+                kind: self.kind,
+                sent: false,
+                state: self.state.clone(),
+            }).unwrap())
+        }
+    }
+
+    struct TestBody {
+        body: RequestBody,
+        kind: u8,
+        sent: bool,
+        state: Arc<Mutex<IoState>>,
+    }
+
+    impl Stream for TestBody {
+        type Item = io::Result<Bytes>;
+
+        fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+            let this = self.get_mut();
+            assert_ne!(this.kind, 0, "bodyless response was polled");
+            assert!(!this.state.lock().unwrap().output.is_empty(), "head was not flushed before body polling");
+            if this.kind == 1 {
+                if this.sent { return Poll::Pending; }
+                this.sent = true;
+                return Poll::Ready(Some(Ok(Bytes::from_static(b"data: small\n\n"))));
+            }
+            if this.sent { return Poll::Ready(None); }
+            match Pin::new(&mut this.body).poll_next(cx) {
+                Poll::Ready(None) => {
+                    this.sent = true;
+                    Poll::Ready(Some(Ok(Bytes::from_static(b"tail"))))
+                }
+                next => next,
+            }
+        }
+    }
+
+    fn check_response(request: &[u8], status: StatusCode, kind: u8) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let _guard = runtime.enter();
+        let state = Arc::new(Mutex::new(IoState::default()));
+        state.lock().unwrap().input.extend(request.iter().copied());
+        let mut io = TestIo(state.clone());
+        let service = TestService { status, kind, state: state.clone() };
+        let date = SystemTimeDateTimeHandler;
+        let mut timer = pin!(KeepAlive::new(tokio::time::Instant::now() + Duration::from_secs(60)));
+        let mut task = pin!(run(&mut io, crate::unspecified_socket_addr(), false, timer.as_mut(),
+            HttpServiceConfig::default(), &service, &date));
+        let mut cx = TaskContext::from_waker(Waker::noop());
+        assert!(task.as_mut().poll(&mut cx).is_pending());
+        assert!(!state.lock().unwrap().output.is_empty());
+        if kind == 1 {
+            assert!(state.lock().unwrap().output.ends_with(b"data: small\n\n\r\n"));
+        }
+        if kind == 2 {
+            {
+                let mut state = state.lock().unwrap();
+                state.input.extend(b"inbound");
+                state.eof = true;
+                state.blocked = true;
+            }
+            assert!(task.as_mut().poll(&mut cx).is_pending());
+            assert!(state.lock().unwrap().input.is_empty());
+            state.lock().unwrap().blocked = false;
+            assert!(matches!(task.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
+            assert!(state.lock().unwrap().output.ends_with(b"inboundtail"));
+        }
+    }
+
+    #[test]
+    fn head_and_bodyless_statuses_do_not_poll_body() {
+        check_response(b"HEAD / HTTP/1.1\r\nHost: a\r\n\r\n", StatusCode::OK, 0);
+        for status in [StatusCode::NO_CONTENT, StatusCode::NOT_MODIFIED] {
+            check_response(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n", status, 0);
+        }
+    }
+
+    #[test]
+    fn small_streaming_chunk_is_flushed_before_next_poll() {
+        check_response(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n", StatusCode::OK, 1);
+    }
+
+    #[test]
+    fn tunnels_flush_handshake_drive_reads_and_preserve_eof_tail() {
+        check_response(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n",
+            StatusCode::SWITCHING_PROTOCOLS, 2);
+        check_response(b"CONNECT a:443 HTTP/1.1\r\nHost: a:443\r\n\r\n", StatusCode::OK, 2);
+    }
+
+    #[test]
+    fn body_reader_preserves_buffer_under_backpressure() {
+        let (mut reader, mut body) = BodyReader::from_coding(TransferCoding::upgrade());
+        let mut buf = ReadBuf::<65536>::new();
+        buf.extend_from_slice(&vec![0; super::super::body::MAX_BUFFER_SIZE]);
+        let mut cx = TaskContext::from_waker(Waker::noop());
+        {
+            let mut ready = pin!(reader.ready(&mut buf));
+            assert!(ready.as_mut().poll(&mut cx).is_pending());
+        }
+        buf.extend_from_slice(b"buffered");
+        {
+            let mut ready = pin!(reader.ready(&mut buf));
+            assert!(ready.as_mut().poll(&mut cx).is_pending());
+        }
+        assert_eq!(&buf[..], b"buffered");
+        assert!(matches!(Pin::new(&mut body).poll_next(&mut cx), Poll::Ready(Some(Ok(_)))));
+        {
+            let mut ready = pin!(reader.ready(&mut buf));
+            assert!(matches!(ready.as_mut().poll(&mut cx), Poll::Ready(())));
+        }
+        assert!(buf.is_empty());
+    }
 }

@@ -30,7 +30,7 @@ features:
     details: Built-in WordPress / Laravel / static site presets, php_fastcgi and acme_email sugar syntax — 8 lines to run a site.
 
   - title: Reverse Proxy & gRPC
-    details: Multiple load balancing strategies, connection pooling, three-state circuit breaker, active health checks, transparent gRPC and WebSocket forwarding.
+    details: Load balancing, connection pooling, circuit breaker, RFC 9111 proxy_cache (cache_lock, use_stale, Cache-Status), transparent gRPC and WebSocket.
 
   - title: Zero-Downtime Ops
     details: Hot reload without dropping connections, Admin REST API, Prometheus /metrics, sweety validate config check.

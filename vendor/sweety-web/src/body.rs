@@ -8,6 +8,11 @@ pub(crate) use sweety_http_core::body::Either;
 
 use crate::error::BodyError;
 
+#[cfg(any(feature = "compress-br", feature = "compress-gz", feature = "compress-de"))]
+mod body_alt;
+#[cfg(any(feature = "compress-br", feature = "compress-gz", feature = "compress-de"))]
+pub(crate) use body_alt::StreamAsBody;
+
 /// an extended trait for [Stream] that specify additional type info of the [Stream::Item] type.
 pub trait BodyStream: Stream<Item = Result<Self::Chunk, Self::Error>> {
     type Chunk: AsRef<[u8]> + 'static;

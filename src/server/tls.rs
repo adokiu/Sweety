@@ -288,14 +288,12 @@ fn generate_self_signed(domain: &str) -> Result<ServerConfig> {
         vec![domain.to_string()]
     };
 
-    let cert = rcgen::generate_simple_self_signed(subject_alt_names)
+    let rcgen::CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(subject_alt_names)
         .context("生成自签名证书失败")?;
 
-    let cert_der = rustls::pki_types::CertificateDer::from(
-        cert.cert.der().to_vec()
-    );
+    let cert_der = cert.der().clone();
     let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
-        rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der())
+        rustls::pki_types::PrivatePkcs8KeyDer::from(signing_key.serialize_der())
     );
 
     let config = ServerConfig::builder_with_provider(make_crypto_provider())
@@ -422,12 +420,12 @@ fn build_quinn_config_self_signed(domain: &str) -> Result<sweety_io::net::QuicCo
         vec![domain.to_string()]
     };
 
-    let cert = rcgen::generate_simple_self_signed(subject_alt_names)
+    let rcgen::CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(subject_alt_names)
         .context("生成自签名证书失败")?;
 
-    let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
+    let cert_der = cert.der().clone();
     let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
-        rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der())
+        rustls::pki_types::PrivatePkcs8KeyDer::from(signing_key.serialize_der())
     );
 
     let mut tls_cfg = ServerConfig::builder_with_provider(make_crypto_provider())
@@ -644,12 +642,12 @@ fn generate_self_signed_key(domain: &str) -> Result<rustls::sign::CertifiedKey> 
         vec![domain.to_string()]
     };
 
-    let cert = rcgen::generate_simple_self_signed(subject_alt_names)
+    let rcgen::CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(subject_alt_names)
         .context("生成自签名证书失败")?;
 
-    let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
+    let cert_der = cert.der().clone();
     let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
-        rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der())
+        rustls::pki_types::PrivatePkcs8KeyDer::from(signing_key.serialize_der())
     );
 
     let signing_key = aws_crypto::sign::any_supported_type(&key_der)
