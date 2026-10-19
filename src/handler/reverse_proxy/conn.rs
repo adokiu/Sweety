@@ -61,9 +61,8 @@ pub async fn forward_request(
     debug!("转发 {} {} → {} (tls={})", method, path, addr_display, use_tls);
 
     // 从 extra_headers 提取 Content-Length（如果客户端提供了就透传，否则用 chunked）
-    let known_content_length: Option<u64> = extra_headers.iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, v)| v.parse().ok());
+    let known_content_length = parse_content_length(extra_headers)?;
+    let retry_safe = can_retry_request(method, &req_body);
 
     // 检测 Expect: 100-continue（大文件上传协商）
     let has_expect_continue = extra_headers.iter()
@@ -112,7 +111,7 @@ pub async fn forward_request(
                 return Ok(resp);
             }
             Err((e, body_consumed)) => {
-                if attempt == 0 && !body_consumed {
+                if attempt == 0 && retry_safe && !body_consumed {
                     // body 还未消费（请求头阶段失败），可安全重试
                     debug!("连接失效（body 未消费），重试: {}", e);
                     continue;
@@ -325,7 +324,8 @@ async fn send_recv_pooled(
     let write_timeout = Duration::from_secs(if write_timeout_secs > 0 { write_timeout_secs } else { 60 });
 
     // 判断是否需要发送请求体（GET/HEAD/OPTIONS 等通常无 body）
-    let has_body = matches!(method, "POST" | "PUT" | "PATCH" | "DELETE");
+    let has_body = request_has_body(&req_body);
+    let retry_safe = can_retry_request(method, &req_body);
     // 未知长度时用 chunked 编码，已知长度时直接写 Content-Length
     let use_chunked = has_body && known_content_length.is_none();
 
@@ -336,18 +336,18 @@ async fn send_recv_pooled(
     req.push_str(method); req.push(' '); req.push_str(path);
     req.push_str(" HTTP/1.1\r\nHost: "); req.push_str(host); req.push_str("\r\n");
     for (k, v) in extra_headers {
-        // content-length / transfer-encoding / expect 由下方统一设置
+        // content-length / transfer-encoding / expect / connection 由下方统一设置
         if k.eq_ignore_ascii_case("content-length")
             || k.eq_ignore_ascii_case("transfer-encoding")
-            || k.eq_ignore_ascii_case("expect") {
+            || k.eq_ignore_ascii_case("expect")
+            || k.eq_ignore_ascii_case("connection") {
             continue;
         }
         // CRLF 注入防护：过滤 header name/value 中的 \r \n，防止 HTTP Request Smuggling
         push_safe_header(&mut req, k, v);
     }
-    req.push_str("X-Real-IP: "); push_sanitized_value(&mut req, client_ip); req.push_str("\r\n");
-    req.push_str("X-Forwarded-For: "); push_sanitized_value(&mut req, client_ip); req.push_str("\r\n");
-    req.push_str("X-Forwarded-Proto: "); push_sanitized_value(&mut req, client_proto); req.push_str("\r\nConnection: keep-alive\r\n");
+    push_forwarding_headers(&mut req, extra_headers, client_ip, Some(client_proto));
+    req.push_str("Connection: keep-alive\r\n");
     if has_body {
         if use_chunked {
             req.push_str("Transfer-Encoding: chunked\r\n");
@@ -360,6 +360,10 @@ async fn send_recv_pooled(
         if has_expect_continue {
             req.push_str("Expect: 100-continue\r\n");
         }
+    } else if known_content_length == Some(0) {
+        req.push_str("Content-Length: 0\r\n");
+    } else if known_content_length.is_some_and(|len| len > 0) {
+        return Err((anyhow::anyhow!("请求体为空但 Content-Length 非零"), true));
     }
     req.push_str("\r\n");
 
@@ -374,10 +378,10 @@ async fn send_recv_pooled(
         Err(_) | Ok(Err(_)) if allow_retry_on_header_fail => {
             // 请求头发送失败，body 未消费，可重试
             let e = anyhow::anyhow!(ProxyError::WriteTimeout { addr: String::new(), timeout_secs: write_timeout.as_secs() });
-            return Err((e, false));
+            return Err((e, !retry_safe));
         }
-        Err(_) => return Err((anyhow::anyhow!(ProxyError::WriteTimeout { addr: String::new(), timeout_secs: write_timeout.as_secs() }), false)),
-        Ok(Err(e)) => return Err((ProxyError::from_io("", e, IoContext::Write).into(), false)),
+        Err(_) => return Err((anyhow::anyhow!(ProxyError::WriteTimeout { addr: String::new(), timeout_secs: write_timeout.as_secs() }), !retry_safe)),
+        Ok(Err(e)) => return Err((ProxyError::from_io("", e, IoContext::Write).into(), !retry_safe)),
         Ok(Ok(())) => {}
     }
 
@@ -386,37 +390,24 @@ async fn send_recv_pooled(
     //   若 100  → 读掉空行 → pipe body → 读真实状态行
     //   若非100 → has_expect_continue=true 说明上游直接拒绝（417等），不发 body
     //   无 Expect → 先 pipe body → 再读状态行
-    let (mut buf, status_code, upstream_http10) = if has_body && has_expect_continue {
+    let (mut buf, mut status_code, mut upstream_http10) = if has_body && has_expect_continue {
         // 发头后等上游决策，BufReader 在此建立，后续所有读取都通过它
         let mut buf = BufReader::new(conn);
-        let mut status_line = String::new();
-        match tokio::time::timeout(Duration::from_secs(5), buf.read_line(&mut status_line)).await {
-            Err(_) | Ok(Err(_)) => return Err((ProxyError::TtfbTimeout { addr: String::new() }.into(), false)),
-            Ok(Ok(_)) => {}
-        }
-        let code = parse_status_code(&status_line);
+        let (code, http10) = read_expect_status(&mut buf, read_timeout).await
+            .map_err(|e| (e.into(), true))?;
         if code == 100 {
             // 读掉 "\r\n" 空行
-            let mut blank = String::new();
-            let _ = buf.read_line(&mut blank).await;
             // 现在发 body
             if let Err(e) = pipe_request_body(buf.get_mut(), req_body, use_chunked, write_timeout).await {
                 return Err((e.into(), true));
             }
             // 读真实状态行
-            status_line.clear();
-            match tokio::time::timeout(read_timeout, buf.read_line(&mut status_line)).await {
-                Err(_) => return Err((ProxyError::TtfbTimeout { addr: String::new() }.into(), true)),
-                Ok(Err(e)) => return Err((ProxyError::from_io("", e, IoContext::Read).into(), true)),
-                Ok(Ok(_)) => {}
-            }
-            let real_code = parse_status_code(&status_line);
-            let http10 = status_line.starts_with("HTTP/1.0");
+            let (real_code, http10) = read_response_status(&mut buf, read_timeout).await
+                .map_err(|e| (e.into(), true))?;
             tracing::debug!("上游 100→{} ← {} {}", real_code, method, path);
             (buf, real_code, http10)
         } else {
             // 上游直接拒绝（417 等），不发 body
-            let http10 = status_line.starts_with("HTTP/1.0");
             tracing::debug!("上游拒绝 {} ← {} {} (expect_continue)", code, method, path);
             (buf, code, http10)
         }
@@ -429,29 +420,42 @@ async fn send_recv_pooled(
         }
         let mut buf = BufReader::new(conn);
         let mut status_line = String::new();
-        match tokio::time::timeout(read_timeout, buf.read_line(&mut status_line)).await {
-            Err(_) => return Err((ProxyError::TtfbTimeout { addr: String::new() }.into(), has_body)),
-            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof && !status_line.is_empty() => {}
-            Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionReset
-                       || e.kind() == std::io::ErrorKind::BrokenPipe => {
-                return Err((ProxyError::ConnReset { addr: String::new() }.into(), has_body));
+        match read_bounded_line(&mut buf, &mut status_line, RESP_MAX_LINE_LEN, read_timeout).await {
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                return Err((ProxyError::TtfbTimeout { addr: String::new() }.into(), !retry_safe));
             }
-            Ok(Err(e)) => return Err((ProxyError::from_io("", e, IoContext::Read).into(), has_body)),
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe) => {
+                return Err((ProxyError::ConnReset { addr: String::new() }.into(), !retry_safe));
+            }
+            Err(e) => return Err((ProxyError::from_io("", e, IoContext::Read).into(), true)),
             // EOF（read_line 返回 Ok(0)）：keepalive 连接被对端关闭，status_line 为空
             // 视为 ConnReset，让 forward_request 的 attempt==1 重试新建连接
-            Ok(Ok(_)) if status_line.is_empty() => {
-                return Err((ProxyError::ConnReset { addr: String::new() }.into(), false));
-            }
-            Ok(Ok(_)) => {}
+            Ok(()) => {}
         }
-        let code = parse_status_code(&status_line);
-        let http10 = status_line.starts_with("HTTP/1.0");
+        let (code, http10) = parse_response_status(&status_line).map_err(|e| (e.into(), true))?;
         tracing::debug!("上游 {} ← {} {}", code, method, path);
         (buf, code, http10)
     };
 
-    let mut resp_content_length: Option<usize> = None;
-    let mut resp_is_chunked = false;
+    // RFC 9110 §15.2：中间响应（100/102/103 等，101 除外）不是最终响应，
+    // 丢弃其头部并继续读取最终响应（客户端侧编码器不支持转发任意 1xx）
+    let mut informational_count = 0;
+    while (100..200).contains(&status_code) && status_code != 101 {
+        informational_count += 1;
+        if informational_count > MAX_INFORMATIONAL_RESPONSES {
+            return Err((protocol_error("上游中间响应数量超过上限").into(), true));
+        }
+        read_header_section(&mut buf, read_timeout, RESP_MAX_HEADERS).await.map_err(|e| (e.into(), true))?;
+        (status_code, upstream_http10) = read_response_status(&mut buf, read_timeout).await.map_err(|e| (e.into(), true))?;
+    }
+    if status_code == 101 {
+        return Err((protocol_error("普通 HTTP 代理收到未请求的协议升级").into(), true));
+    }
+
+    // HEAD 响应无论 Content-Length / Transfer-Encoding 为何都不含 body（RFC 9112 §6.3）
+    let is_head = method.eq_ignore_ascii_case("HEAD");
+
     // HTTP/1.0 默认 close；同时检测 Trailer 头字段（指示有 chunked trailer）
     let mut resp_conn_close = upstream_http10;
     let mut resp_has_trailer = false;
@@ -463,38 +467,30 @@ async fn send_recv_pooled(
     const RESP_MAX_HEADERS: usize = 200;
     const RESP_MAX_LINE_LEN: usize = 16384;
     let mut header_count: usize = 0;
+    let mut header_bytes = 0;
     loop {
-        if header_count >= RESP_MAX_HEADERS {
-            tracing::warn!("上游响应头超过 {} 个上限，截断解析", RESP_MAX_HEADERS);
-            break;
-        }
-        line.clear();
-        match buf.read_line(&mut line).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err((e.into(), true)),
-        }
+        read_bounded_line(&mut buf, &mut line, RESP_MAX_LINE_LEN, read_timeout).await
+            .map_err(|e| (e.into(), true))?;
+        header_bytes += line.len();
         // 超长行：跳过该头（不终止解析，保持协议兼容）
-        if line.len() > RESP_MAX_LINE_LEN {
-            header_count += 1;
-            continue;
+        if header_bytes > RESP_MAX_HEADER_BYTES {
+            return Err((protocol_error("上游响应头总长度超过上限").into(), true));
         }
-        let trimmed = line.trim();
-        if trimmed.is_empty() { break; }
-        if let Some(colon) = trimmed.find(':') {
-            let k = trimmed[..colon].trim().to_string();
-            let v = trimmed[colon + 1..].trim().to_string();
+        if line == "\r\n" { break; }
+        if header_count >= RESP_MAX_HEADERS {
+            return Err((protocol_error("上游响应头数量超过上限").into(), true));
+        }
+        {
+            let (k, v) = parse_header_line(&line).map_err(|e| (e.into(), true))?;
             // 大小写不敏感比较，零堆分配
-            if k.eq_ignore_ascii_case("content-length") { resp_content_length = v.parse().ok(); }
-            if k.eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked") {
-                resp_is_chunked = true;
-            }
             // Trailer 头：指示 chunked body 后有 trailer 头字段（RFC 7230）
             if k.eq_ignore_ascii_case("trailer") {
                 resp_has_trailer = true;
             }
             // 上游要求关闭连接时不归还
-            if k.eq_ignore_ascii_case("connection") && v.to_ascii_lowercase().contains("close") {
+            if k.eq_ignore_ascii_case("connection")
+                && v.split(',').any(|t| t.trim().eq_ignore_ascii_case("close"))
+            {
                 resp_conn_close = true;
             }
             response_headers.push((k, v));
@@ -502,10 +498,17 @@ async fn send_recv_pooled(
         }
     }
 
+    let (resp_content_length, resp_is_chunked) = normalize_response_framing(&mut response_headers)
+        .map_err(|e| (e.into(), true))?;
+    if status_code == 205 {
+        resp_conn_close = true;
+    }
+
     // ── 304/204/205/1xx：HTTP 规范不允许有 body，直接提前返回 ──────────────
     {
         let s = StatusCode::from_u16(status_code).unwrap_or(StatusCode::OK);
-        let no_body_status = s == StatusCode::NOT_MODIFIED
+        let no_body_status = is_head
+            || s == StatusCode::NOT_MODIFIED
             || s == StatusCode::NO_CONTENT
             || s == StatusCode::RESET_CONTENT
             || s.is_informational();
@@ -515,15 +518,27 @@ async fn send_recv_pooled(
             *resp.status_mut() = s;
             apply_response_headers(&mut resp, &response_headers,
                 strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to);
+            // HEAD：保留上游声明的长度（对应 GET 时的表示大小）
+            if is_head {
+                if let Some(len) = resp_content_length {
+                    if let Ok(v) = HeaderValue::from_str(itoa::Buffer::new().format(len)) {
+                        resp.headers_mut().insert(CONTENT_LENGTH, v);
+                    }
+                }
+            }
             return Ok((resp, maybe_conn, true));
         }
     }
+
+    // SSE（text/event-stream）永不结束，必须逐块透传：忽略 buffering / sub_filter / proxy_cache，
+    // 并且不设空闲超时（由客户端断开或上游关闭结束）
+    let event_stream = is_event_stream(&response_headers);
 
     // ── proxy_buffering = false：流式透传响应体 ─────────────────────────────
     // 不把响应体读进内存，直接用 bounded channel stream 透传给客户端。
     // 适用场景：大文件下载、SSE、长轮询、streaming API。
     // 限制：sub_filter / proxy_cache / URL 替换在流式路径下不生效（需 buffering=true）。
-    if !proxy_buffering && sub_filter.is_empty() && proxy_cache.is_none() {
+    if event_stream || (!proxy_buffering && sub_filter.is_empty() && proxy_cache.is_none()) {
         let http_status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::OK);
         let no_body = http_status == StatusCode::NOT_MODIFIED
             || http_status == StatusCode::NO_CONTENT
@@ -541,7 +556,8 @@ async fn send_recv_pooled(
         }
 
         let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(4);
-        let per_chunk_timeout = read_timeout;
+        // SSE 不设空闲超时（心跳间隔由应用决定），客户端断开时 guarded_read 立即结束
+        let per_chunk_timeout = Some(read_timeout);
         // 上游 Connection: close 时不归还连接
         let can_reuse = !resp_conn_close;
 
@@ -552,46 +568,48 @@ async fn send_recv_pooled(
             const STREAM_CHUNKED_MAX_CHUNK: usize = 16 * 1024 * 1024; // 16 MiB per chunk
             tokio::task::spawn_local(async move {
                 let mut reader = buf;
-                let mut size_line = String::new();
-                let mut ok = true;
-                'outer: loop {
-                    size_line.clear();
-                    match tokio::time::timeout(per_chunk_timeout, reader.read_line(&mut size_line)).await {
-                        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => { ok = false; break; }
-                        Ok(Ok(_)) => {}
-                    }
-                    // Prevent unbounded size_line allocation from malicious upstream
-                    if size_line.len() > 64 { ok = false; break; }
-                    let size_str = size_line.trim().split(';').next().unwrap_or("0");
-                    let chunk_size = usize::from_str_radix(size_str, 16).unwrap_or(0);
-                    if chunk_size > STREAM_CHUNKED_MAX_CHUNK { ok = false; break; }
-                    if chunk_size == 0 {
-                        // 0-chunk: 读完结束行
-                        let mut trailer = String::new();
-                        let _ = reader.read_line(&mut trailer).await;
-                        break;
-                    }
-                    let mut chunk_buf = bytes::BytesMut::with_capacity(chunk_size);
-                    chunk_buf.resize(chunk_size, 0);
-                    let mut offset = 0;
-                    while offset < chunk_size {
-                        match tokio::time::timeout(per_chunk_timeout, reader.read(&mut chunk_buf[offset..])).await {
-                            Ok(Ok(0)) => { ok = false; break 'outer; }
-                            Ok(Ok(n)) => offset += n,
-                            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => { ok = false; break 'outer; }
-                            Ok(Err(e)) => { let _ = tx.send(Err(e)).await; ok = false; break 'outer; }
-                            Err(_) => {
-                                let e = std::io::Error::new(std::io::ErrorKind::TimedOut, "上游响应体读取超时");
-                                let _ = tx.send(Err(e)).await;
-                                ok = false; break 'outer;
-                            }
+                let transfer = async {
+                    let mut size_line = String::new();
+                    loop {
+                        // Prevent unbounded size_line allocation from malicious upstream
+                        read_bounded_line(&mut reader, &mut size_line, 64, read_timeout).await?;
+                        // 非法 chunk-size 视为协议错误终止响应，而非当作 0-chunk 静默截断
+                        let chunk_size = parse_chunk_size(&size_line)
+                            .ok_or_else(|| protocol_error("上游 chunk-size 非法"))?;
+                        if chunk_size > STREAM_CHUNKED_MAX_CHUNK {
+                            return Err(protocol_error("上游 chunk 超过上限"));
                         }
+                        if chunk_size == 0 {
+                            // last-chunk 之后是可选 trailer-section，以空行结束；必须读完才能复用连接
+                            read_header_section(&mut reader, read_timeout, CHUNKED_MAX_TRAILERS).await?;
+                            return Ok::<_, std::io::Error>(());
+                        }
+                        let mut remaining = chunk_size;
+                        while remaining > 0 {
+                            let mut chunk = vec![0u8; remaining.min(65536)];
+                            let n = tokio::time::timeout(read_timeout, reader.read(&mut chunk)).await
+                                .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "上游响应体读取超时"))??;
+                            if n == 0 {
+                                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "上游 chunk 提前结束"));
+                            }
+                            remaining -= n;
+                            chunk.truncate(n);
+                            tx.send(Ok(bytes::Bytes::from(chunk))).await
+                                .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "客户端已断开"))?;
+                        }
+                        let mut crlf = [0u8; 2];
+                        tokio::time::timeout(read_timeout, reader.read_exact(&mut crlf)).await
+                            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "上游响应体读取超时"))??;
+                        if &crlf != b"\r\n" { return Err(protocol_error("上游 chunk 后缺少 CRLF")); }
                     }
-                    chunk_buf.truncate(offset);
-                    if tx.send(Ok(chunk_buf.freeze())).await.is_err() { ok = false; break; }
-                    let mut crlf = [0u8; 2];
-                    let _ = reader.read_exact(&mut crlf).await;
-                }
+                };
+                let result = tokio::select! {
+                    biased;
+                    _ = tx.closed() => return,
+                    result = transfer => result,
+                };
+                let ok = result.is_ok();
+                if let Err(e) = result { let _ = tx.send(Err(e)).await; }
                 // ok 且上游未要求关闭：归还连接到池
                 if ok && can_reuse {
                     stream_pool.release(
@@ -616,18 +634,27 @@ async fn send_recv_pooled(
                     if remaining == 0 { break; }
                     let to_read = remaining.min(chunk_size);
                     heap.resize(to_read, 0);
-                    match tokio::time::timeout(per_chunk_timeout, reader.read(&mut heap[..to_read])).await {
-                        Ok(Ok(0)) => break,
+                    match guarded_read(reader.read(&mut heap[..to_read]), per_chunk_timeout, &tx).await {
+                        Ok(Ok(0)) => {
+                            // Content-Length 模式下提前 EOF：响应不完整，必须中止而不是当作正常结束
+                            if !is_eof_mode {
+                                let e = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "上游响应体不完整");
+                                let _ = tx.send(Err(e)).await;
+                                ok = false;
+                            }
+                            break;
+                        }
                         Ok(Ok(n)) => {
                             remaining = remaining.saturating_sub(n);
                             if tx.send(Ok(heap.split_to(n).freeze())).await.is_err() { ok = false; break; }
                         }
                         Ok(Err(e)) => { let _ = tx.send(Err(e)).await; ok = false; break; }
-                        Err(_) => {
+                        Err(StreamStop::TimedOut) => {
                             let e = std::io::Error::new(std::io::ErrorKind::TimedOut, "上游响应体读取超时");
                             let _ = tx.send(Err(e)).await;
                             ok = false; break;
                         }
+                        Err(StreamStop::ClientGone) => { ok = false; break; }
                     }
                 }
                 // Content-Length 模式 + 无错误 + 上游未要求关闭：归还连接到池
@@ -661,29 +688,36 @@ async fn send_recv_pooled(
     }
 
     // ── 读取响应体（支持 chunked / Content-Length / EOF）───────────────────
-    let (body_bytes, trailer_headers) = if resp_is_chunked {
-        let (b, t) = read_chunked_body(&mut buf, resp_has_trailer).await.map_err(|e| (e, true))?;
-        (b, t)
+    // 每次读取都带 read_timeout（等价 Nginx proxy_read_timeout 的包间语义），防止上游不关连接时永久挂起
+    let body_bytes = if resp_is_chunked {
+        // trailer 字段不得合并进响应头（RFC 9110 §6.5.1），buffered 模式下读取后丢弃
+        let (b, _trailers) = read_chunked_body(&mut buf, resp_has_trailer, read_timeout).await.map_err(|e| (e, true))?;
+        b
     } else if let Some(len) = resp_content_length {
-        (read_exact_body(&mut buf, len).await.map_err(|e| (e, true))?, Vec::new())
+        if len > BUFFERED_MAX_BODY {
+            return Err((anyhow::anyhow!("上游响应体 {}B 超过 buffered 上限 {}B", len, BUFFERED_MAX_BODY), true));
+        }
+        read_exact_body(&mut buf, len, read_timeout).await.map_err(|e| (e, true))?
     } else {
         resp_conn_close = true; // EOF 模式：读完即关
         let mut b = Vec::new();
         let mut tmp = [0u8; 65536];
         loop {
-            match buf.read(&mut tmp).await {
-                Ok(0) => break,
-                Ok(n) => {
+            match tokio::time::timeout(read_timeout, buf.read(&mut tmp)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => {
                     b.extend_from_slice(&tmp[..n]);
                     if b.len() > BUFFERED_MAX_BODY {
-                        tracing::warn!("upstream EOF body exceeded {}B limit, truncated", BUFFERED_MAX_BODY);
-                        break;
+                        return Err((anyhow::anyhow!("上游响应体超过 buffered 上限 {}B", BUFFERED_MAX_BODY), true));
                     }
                 }
-                Err(_) => break,
+                // TLS 上游缺少 close_notify 时报 UnexpectedEof，EOF 定界下视为正常结束
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Ok(Err(e)) => return Err((e.into(), true)),
+                Err(_) => return Err((ProxyError::TtfbTimeout { addr: String::new() }.into(), true)),
             }
         }
-        (b, Vec::new())
+        b
     };
 
     let maybe_conn = if !resp_conn_close { Some(buf.into_inner()) } else { drop(buf); None };
@@ -720,8 +754,6 @@ async fn send_recv_pooled(
     *resp.status_mut() = http_status;
     apply_response_headers(&mut resp, &response_headers,
         strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to);
-    // chunked trailer 头透传给客户端（RFC 7230 §4.1.2）
-    append_trailer_headers(&mut resp, &trailer_headers);
     if !no_body {
         if let Ok(v) = HeaderValue::from_str(itoa::Buffer::new().format(body_len)) {
             resp.headers_mut().insert(CONTENT_LENGTH, v);
@@ -738,34 +770,193 @@ async fn send_recv_pooled(
 /// buffered 响应体最大大小（256 MiB），与 chunked 路径对齐
 const BUFFERED_MAX_BODY: usize = 256 << 20;
 
-/// 读取固定长度响应体（循环读取，正确处理 TLS UnexpectedEof）
-async fn read_exact_body<R>(buf: &mut BufReader<R>, len: usize) -> Result<Vec<u8>>
+const RESP_MAX_HEADERS: usize = 200;
+const RESP_MAX_LINE_LEN: usize = 16384;
+const RESP_MAX_HEADER_BYTES: usize = 256 * 1024;
+const MAX_INFORMATIONAL_RESPONSES: usize = 32;
+
+fn protocol_error(message: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message)
+}
+
+fn request_has_body(body: &RequestBody) -> bool {
+    !matches!(body, RequestBody::None)
+}
+
+fn can_retry_request(method: &str, body: &RequestBody) -> bool {
+    !request_has_body(body) && matches!(method, "GET" | "HEAD" | "OPTIONS" | "TRACE" | "PUT" | "DELETE")
+}
+
+async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    out: &mut String,
+    limit: usize,
+    read_timeout: Duration,
+) -> std::io::Result<()> {
+    out.clear();
+    let mut bytes = Vec::with_capacity(limit.min(256));
+    loop {
+        let available = tokio::time::timeout(read_timeout, reader.fill_buf()).await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "上游行读取超时"))??;
+        if available.is_empty() {
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "上游行未完整结束"));
+        }
+        let end = available.iter().position(|&b| b == b'\n');
+        let take = end.map_or(available.len(), |i| i + 1);
+        if take > limit.saturating_sub(bytes.len()) {
+            return Err(protocol_error("上游行长度超过上限"));
+        }
+        bytes.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if end.is_some() {
+            if !bytes.ends_with(b"\r\n") || bytes[..bytes.len() - 2].contains(&b'\r') {
+                return Err(protocol_error("上游行缺少合法 CRLF"));
+            }
+            *out = String::from_utf8(bytes).map_err(|_| protocol_error("上游行不是合法 UTF-8"))?;
+            return Ok(());
+        }
+        if bytes.len() >= limit {
+            return Err(protocol_error("上游行长度超过上限"));
+        }
+    }
+}
+
+fn parse_response_status(line: &str) -> std::io::Result<(u16, bool)> {
+    let text = line.strip_suffix("\r\n").ok_or_else(|| protocol_error("上游状态行缺少 CRLF"))?;
+    let mut parts = text.splitn(3, ' ');
+    let version = parts.next().unwrap_or_default();
+    let code = parts.next().unwrap_or_default();
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1")
+        || code.len() != 3 || !code.bytes().all(|b| b.is_ascii_digit())
+        || parts.next().is_none()
+    {
+        return Err(protocol_error("上游状态行非法"));
+    }
+    let status = parse_status_code(line);
+    if !(100..600).contains(&status) {
+        return Err(protocol_error("上游状态码非法"));
+    }
+    Ok((status, version == "HTTP/1.0"))
+}
+
+async fn read_response_status<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    read_timeout: Duration,
+) -> std::io::Result<(u16, bool)> {
+    let mut line = String::new();
+    read_bounded_line(reader, &mut line, RESP_MAX_LINE_LEN, read_timeout).await?;
+    parse_response_status(&line)
+}
+
+fn parse_header_line(line: &str) -> std::io::Result<(String, String)> {
+    let text = line.strip_suffix("\r\n").ok_or_else(|| protocol_error("上游头缺少 CRLF"))?;
+    let (name, value) = text.split_once(':').ok_or_else(|| protocol_error("上游头缺少冒号"))?;
+    if sweety_web::http::header::HeaderName::from_bytes(name.as_bytes()).is_err()
+        || HeaderValue::from_bytes(value.as_bytes()).is_err()
+    {
+        return Err(protocol_error("上游头字段非法"));
+    }
+    Ok((name.to_owned(), value.trim_matches([' ', '\t']).to_owned()))
+}
+
+async fn read_header_section<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    read_timeout: Duration,
+    max_headers: usize,
+) -> std::io::Result<Vec<(String, String)>> {
+    let mut headers = Vec::new();
+    let mut line = String::new();
+    let mut total = 0;
+    loop {
+        read_bounded_line(reader, &mut line, RESP_MAX_LINE_LEN, read_timeout).await?;
+        total += line.len();
+        if total > RESP_MAX_HEADER_BYTES {
+            return Err(protocol_error("上游头总长度超过上限"));
+        }
+        if line == "\r\n" { return Ok(headers); }
+        if headers.len() >= max_headers {
+            return Err(protocol_error("上游头数量超过上限"));
+        }
+        headers.push(parse_header_line(&line)?);
+    }
+}
+
+async fn read_expect_status<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    read_timeout: Duration,
+) -> std::io::Result<(u16, bool)> {
+    for _ in 0..MAX_INFORMATIONAL_RESPONSES {
+        let status = read_response_status(reader, read_timeout).await?;
+        if status.0 == 101 || status.0 >= 200 { return Ok(status); }
+        read_header_section(reader, read_timeout, RESP_MAX_HEADERS).await?;
+        if status.0 == 100 { return Ok(status); }
+    }
+    Err(protocol_error("上游中间响应数量超过上限"))
+}
+
+fn parse_content_length(headers: &[(String, String)]) -> std::io::Result<Option<u64>> {
+    let mut length = None;
+    for (_, value) in headers.iter().filter(|(name, _)| name.eq_ignore_ascii_case("content-length")) {
+        for item in value.split(',') {
+            let item = item.trim_matches([' ', '\t']);
+            if item.is_empty() || !item.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(protocol_error("Content-Length 非法"));
+            }
+            let parsed = item.parse::<u64>().map_err(|_| protocol_error("Content-Length 溢出"))?;
+            if length.is_some_and(|previous| previous != parsed) {
+                return Err(protocol_error("Content-Length 存在冲突"));
+            }
+            length = Some(parsed);
+        }
+    }
+    Ok(length)
+}
+
+fn normalize_response_framing(headers: &mut Vec<(String, String)>) -> std::io::Result<(Option<usize>, bool)> {
+    let length = parse_content_length(headers)?
+        .map(usize::try_from).transpose().map_err(|_| protocol_error("Content-Length 溢出"))?;
+    let codings: Vec<&str> = headers.iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding"))
+        .flat_map(|(_, value)| value.split(','))
+        .map(|coding| coding.trim_matches([' ', '\t']))
+        .collect();
+    let chunked = !codings.is_empty();
+    if chunked && (codings.len() != 1 || !is_final_chunked(codings[0])) {
+        return Err(protocol_error("不支持或非法的 Transfer-Encoding"));
+    }
+    headers.retain(|(name, _)| !name.eq_ignore_ascii_case("content-length"));
+    if chunked {
+        Ok((None, true))
+    } else {
+        if let Some(length) = length {
+            headers.push(("Content-Length".to_owned(), length.to_string()));
+        }
+        Ok((length, false))
+    }
+}
+
+/// 读取固定长度响应体（每次读取带超时；上游提前关闭视为错误，避免以截断内容 + 错误 Content-Length 回复客户端）
+async fn read_exact_body<R>(buf: &mut BufReader<R>, len: usize, read_timeout: Duration) -> Result<Vec<u8>>
 where R: AsyncRead + Unpin {
-    let capped = len.min(BUFFERED_MAX_BODY);
-    let mut b = Vec::with_capacity(capped);
+    let mut b = Vec::with_capacity(len);
     // 64KB 栈 buf：减少 syscall 次数，对标 Nginx proxy_buffer_size 64k
     let mut tmp = [0u8; 65536];
-    let mut remaining = capped;
-    loop {
-        if remaining == 0 { break; }
-        match buf.read(&mut tmp[..remaining.min(65536)]).await {
-            Ok(0) => break,
-            Ok(n) => { b.extend_from_slice(&tmp[..n]); remaining -= n; }
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e.into()),
+    let mut remaining = len;
+    while remaining > 0 {
+        match tokio::time::timeout(read_timeout, buf.read(&mut tmp[..remaining.min(65536)])).await {
+            Ok(Ok(0)) => anyhow::bail!("上游响应体不完整：缺少 {} 字节", remaining),
+            Ok(Ok(n)) => { b.extend_from_slice(&tmp[..n]); remaining -= n; }
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                anyhow::bail!("上游响应体不完整：缺少 {} 字节", remaining)
+            }
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => anyhow::bail!("上游响应体读取超时"),
         }
     }
     Ok(b)
 }
 
-/// 解码 Transfer-Encoding: chunked 响应体
-///
-/// 格式：`<hex_size>\r\n<data>\r\n` ... `0\r\n\r\n[trailer-headers]\r\n`
-///
-/// `collect_trailers = true` 时收集 0-chunk 后面的 trailer 头（RFC 7230 §4.1.2），
-/// 返回 `(body_bytes, trailer_headers)`。
-/// buffered chunked body 最大累积大小（256 MiB）
-/// 超过此限制截断返回已读部分，防止恶意上游 OOM
+/// buffered chunked body 最大累积大小（256 MiB），超过则报错终止，防止恶意上游 OOM
 const CHUNKED_MAX_BODY: usize = 256 << 20;
 /// 单个 chunk 最大声明长度（64 MiB）
 /// 防止恶意 chunk size 值一次性分配数 GB 内存
@@ -773,95 +964,77 @@ const CHUNKED_MAX_CHUNK: usize = 64 << 20;
 /// trailer 头最大数量
 const CHUNKED_MAX_TRAILERS: usize = 100;
 
+/// 解码 Transfer-Encoding: chunked 响应体（RFC 9112 §7.1）
+///
+/// 格式：`<hex_size>[;ext]\r\n<data>\r\n` ... `0\r\n[trailer-fields]\r\n`
+///
+/// 无论是否收集 trailer，都会把 trailer-section 读到空行为止，保证连接可安全复用。
+/// `collect_trailers = true` 时返回解析出的 trailer 字段。
+/// 非法 chunk-size、缺失 CRLF、超限、超时均返回错误。
 pub async fn read_chunked_body<R>(
     buf: &mut BufReader<R>,
     collect_trailers: bool,
+    read_timeout: Duration,
 ) -> Result<(Vec<u8>, Vec<(String, String)>)>
 where R: AsyncRead + Unpin {
+    async fn line<R: AsyncRead + Unpin>(buf: &mut BufReader<R>, out: &mut String, tmo: Duration) -> Result<()> {
+        read_bounded_line(buf, out, RESP_MAX_LINE_LEN, tmo).await?;
+        Ok(())
+    }
+
     let mut body = Vec::new();
     let mut trailers: Vec<(String, String)> = Vec::new();
+    let mut size_line = String::new();
     loop {
-        // 读取 chunk size 行（16进制）
-        let mut size_line = String::new();
-        match buf.read_line(&mut size_line).await {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
+        line(buf, &mut size_line, read_timeout).await?;
         // Prevent unbounded allocation from malicious upstream (no newline)
-        if size_line.len() > 64 { break; }
-        // 去掉可能的 chunk extension（分号后面的部分）
-        let size_str = size_line.trim().split(';').next().unwrap_or("0");
-        let chunk_size = usize::from_str_radix(size_str, 16).unwrap_or(0);
+        if size_line.len() > 64 { anyhow::bail!("上游 chunk-size 行过长"); }
+        let chunk_size = parse_chunk_size(&size_line)
+            .ok_or_else(|| anyhow::anyhow!("上游 chunk-size 非法: {:?}", size_line.trim()))?;
 
         if chunk_size == 0 {
-            // 0-chunk 后面是可选的 trailer 头（RFC 7230 §4.1.2）
-            if collect_trailers {
-                let mut tline = String::new();
-                loop {
-                    if trailers.len() >= CHUNKED_MAX_TRAILERS { break; }
-                    tline.clear();
-                    match buf.read_line(&mut tline).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {}
-                    }
-                    let trimmed = tline.trim();
-                    if trimmed.is_empty() { break; } // 空行表示 trailer 结束
-                    if let Some(colon) = trimmed.find(':') {
-                        let k = trimmed[..colon].trim().to_string();
-                        let v = trimmed[colon + 1..].trim().to_string();
-                        trailers.push((k, v));
-                    }
-                }
-            } else {
-                // 无 trailer：只读掉 CRLF
-                let mut skip = String::new();
-                let _ = buf.read_line(&mut skip).await;
+            // last-chunk 之后是 trailer-section，以空行结束
+            let mut tline = String::new();
+            let mut count = 0usize;
+            let mut total = 0usize;
+            loop {
+                line(buf, &mut tline, read_timeout).await?;
+                total += tline.len();
+                if total > RESP_MAX_HEADER_BYTES { anyhow::bail!("上游 trailer 总长度超过上限"); }
+                if tline == "\r\n" { break; }
+                count += 1;
+                if count > CHUNKED_MAX_TRAILERS { anyhow::bail!("上游 trailer 字段过多"); }
+                let header = parse_header_line(&tline)?;
+                if collect_trailers { trailers.push(header); }
             }
             break;
         }
 
-        // 安全限制：单个 chunk 声明超过 64MB 或累积超过 256MB 则截断
         if chunk_size > CHUNKED_MAX_CHUNK || body.len().saturating_add(chunk_size) > CHUNKED_MAX_BODY {
-            tracing::warn!(
-                "upstream chunked body exceeded size limit (chunk_size={}, total={}), truncated",
-                chunk_size, body.len()
-            );
-            break;
+            anyhow::bail!("上游 chunked 响应体超过上限 (chunk_size={}, total={})", chunk_size, body.len());
         }
 
-        // 读取 chunk 数据
-        let mut chunk = vec![0u8; chunk_size];
-        let mut offset = 0;
-        while offset < chunk_size {
-            match buf.read(&mut chunk[offset..]).await {
-                Ok(0) => break,
-                Ok(n) => offset += n,
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e.into()),
+        let start = body.len();
+        body.resize(start + chunk_size, 0);
+        let mut offset = start;
+        while offset < body.len() {
+            match tokio::time::timeout(read_timeout, buf.read(&mut body[offset..])).await {
+                Ok(Ok(0)) => anyhow::bail!("上游 chunked 响应提前结束"),
+                Ok(Ok(n)) => offset += n,
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => anyhow::bail!("上游响应体读取超时"),
             }
         }
-        body.extend_from_slice(&chunk[..offset]);
 
-        // 读取并丢弃 chunk 后面的 \r\n
-        let mut crlf = String::new();
-        let _ = buf.read_line(&mut crlf).await;
+        let mut crlf = [0u8; 2];
+        match tokio::time::timeout(read_timeout, buf.read_exact(&mut crlf)).await {
+            Ok(Ok(_)) if &crlf == b"\r\n" => {}
+            Ok(Ok(_)) => anyhow::bail!("上游 chunk 数据后缺少 CRLF"),
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => anyhow::bail!("上游响应体读取超时"),
+        }
     }
     Ok((body, trailers))
-}
-
-/// 将 chunked trailer 头 append 到响应（hop-by-hop 头除外）
-/// 等价 Nginx proxy_pass 的 trailer 透传行为
-fn append_trailer_headers(resp: &mut WebResponse, trailers: &[(String, String)]) {
-    use sweety_web::http::header::HeaderName;
-    for (k, v) in trailers {
-        if super::response::is_hop_by_hop(k) { continue; }
-        if let (Ok(name), Ok(val)) = (
-            HeaderName::from_bytes(k.as_bytes()),
-            HeaderValue::from_str(v),
-        ) {
-            resp.headers_mut().append(name, val);
-        }
-    }
 }
 
 /// 对文本类型响应体做 URL 替换（处理上游硬编码 URL 的情况）
@@ -966,4 +1139,82 @@ pub(super) fn push_safe_header(buf: &mut String, name: &str, value: &str) {
     buf.push_str(": ");
     push_sanitized_value(buf, value);
     buf.push_str("\r\n");
+}
+
+/// 追加 X-Real-IP / X-Forwarded-For / X-Forwarded-Proto
+///
+/// 上层（reverse_proxy::handle_sweety）已把客户端原有 X-Forwarded-For 与连接 IP 合并为单条，
+/// 并剔除了客户端伪造的 X-Real-IP / X-Forwarded-Proto；此处仅在 extra_headers 未提供时补齐，
+/// 保证同名头只出现一次（gRPC 等直接调用方也能得到正确的转发头）
+pub(super) fn push_forwarding_headers(
+    buf: &mut String,
+    extra_headers: &[(String, String)],
+    client_ip: &str,
+    client_proto: Option<&str>,
+) {
+    let has = |name: &str| extra_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name));
+    if !has("x-real-ip") {
+        push_safe_header(buf, "X-Real-IP", client_ip);
+    }
+    if !has("x-forwarded-for") {
+        push_safe_header(buf, "X-Forwarded-For", client_ip);
+    }
+    if let Some(proto) = client_proto {
+        if !has("x-forwarded-proto") {
+            push_safe_header(buf, "X-Forwarded-Proto", proto);
+        }
+    }
+}
+
+/// 解析 Transfer-Encoding：最终编码为 chunked 才按 chunked 定界（RFC 9112 §6.3）
+#[inline]
+fn is_final_chunked(te: &str) -> bool {
+    te.rsplit(',')
+        .map(str::trim)
+        .find(|c| !c.is_empty())
+        .is_some_and(|c| c.eq_ignore_ascii_case("chunked"))
+}
+
+/// 解析 chunk-size 行（忽略 chunk-ext），非法十六进制返回 None
+#[inline]
+fn parse_chunk_size(line: &str) -> Option<usize> {
+    let s = line.strip_suffix("\r\n")?.split(';').next()?.trim_end_matches([' ', '\t']);
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    usize::from_str_radix(s, 16).ok()
+}
+
+/// 判断上游响应是否为流式事件（SSE），此类响应必须逐块透传
+#[inline]
+fn is_event_stream(headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("content-type")
+            && v.split(';').next().is_some_and(|m| m.trim().eq_ignore_ascii_case("text/event-stream"))
+    })
+}
+
+/// 流式读取的终止原因
+enum StreamStop {
+    TimedOut,
+    ClientGone,
+}
+
+/// 流式透传中的单次上游读取：带可选空闲超时，并在客户端断开（rx 被 drop）时立即结束，
+/// 避免 SSE 等长连接在客户端离开后仍占用上游连接
+async fn guarded_read<T>(
+    fut: impl std::future::Future<Output = std::io::Result<T>>,
+    tmo: Option<Duration>,
+    tx: &tokio::sync::mpsc::Sender<std::io::Result<bytes::Bytes>>,
+) -> Result<std::io::Result<T>, StreamStop> {
+    tokio::select! {
+        biased;
+        _ = tx.closed() => Err(StreamStop::ClientGone),
+        r = async {
+            match tmo {
+                Some(d) => tokio::time::timeout(d, fut).await.map_err(|_| StreamStop::TimedOut),
+                None => Ok(fut.await),
+            }
+        } => r,
+    }
 }

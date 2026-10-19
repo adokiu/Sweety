@@ -6,6 +6,8 @@
 
 pub(super) const FCGI_VERSION:       u8    = 1;
 pub(super) const FCGI_BEGIN_REQUEST: u8    = 1;
+pub(super) const FCGI_END_REQUEST:   u8    = 3;
+pub(super) const FCGI_REQUEST_COMPLETE: u8 = 0;
 pub(super) const FCGI_PARAMS:        u8    = 4;
 pub(super) const FCGI_STDIN:         u8    = 5;
 pub(super) const FCGI_STDOUT:        u8    = 6;
@@ -59,6 +61,7 @@ pub(super) fn encode_nv_pair(buf: &mut Vec<u8>, name: &[u8], value: &[u8]) {
 
 pub(super) struct FcgiRecord {
     pub(super) rec_type: u8,
+    pub(super) request_id: u16,
     pub(super) data:     Vec<u8>,
 }
 
@@ -66,28 +69,33 @@ pub(super) struct FcgiRecord {
 pub(super) async fn read_fcgi_conn(
     conn: &mut crate::handler::fastcgi_pool::FcgiConn,
 ) -> std::io::Result<FcgiRecord> {
-    use tokio::io::AsyncReadExt;
     use crate::handler::fastcgi_pool::FcgiConn;
-    let mut hdr = [0u8; 8];
     match conn {
-        FcgiConn::Tcp(s)  => s.read_exact(&mut hdr).await?,
+        FcgiConn::Tcp(s) => read_fcgi_record(s).await,
         #[cfg(unix)]
-        FcgiConn::Unix(s) => s.read_exact(&mut hdr).await?,
-    };
+        FcgiConn::Unix(s) => read_fcgi_record(s).await,
+    }
+}
+
+pub(super) async fn read_fcgi_record<S>(stream: &mut S) -> std::io::Result<FcgiRecord>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut hdr = [0u8; 8];
+    stream.read_exact(&mut hdr).await?;
+    if hdr[0] != FCGI_VERSION {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid FastCGI version"));
+    }
     let rec_type    = hdr[1];
+    let request_id  = u16::from_be_bytes([hdr[2], hdr[3]]);
     let content_len = u16::from_be_bytes([hdr[4], hdr[5]]) as usize;
     let padding_len = hdr[6] as usize;
     let total = content_len + padding_len;
     let mut buf = vec![0u8; total];
-    if total > 0 {
-        match conn {
-            FcgiConn::Tcp(s)  => s.read_exact(&mut buf).await?,
-            #[cfg(unix)]
-            FcgiConn::Unix(s) => s.read_exact(&mut buf).await?,
-        };
-    }
+    if total > 0 { stream.read_exact(&mut buf).await?; }
     buf.truncate(content_len);
-    Ok(FcgiRecord { rec_type, data: buf })
+    Ok(FcgiRecord { rec_type, request_id, data: buf })
 }
 
 // ─────────────────────────────────────────────

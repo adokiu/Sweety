@@ -53,15 +53,46 @@ where
                 error!("response with 1xx status code not supported");
                 return Err(ProtoError::Status);
             }
+            // RFC 9110 §8.6 / RFC 9112 §6.1：204 不得携带 Content-Length / Transfer-Encoding，
+            // 304 不得携带 Transfer-Encoding（Content-Length 为可选，统一省略）；两者均不得有响应体
+            StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED => {
+                headers.remove(CONTENT_LENGTH);
+                headers.remove(TRANSFER_ENCODING);
+                true
+            }
             _ => false,
         };
+        let is_tunnel = status == StatusCode::SWITCHING_PROTOCOLS
+            || (self.is_connect_method() && status.is_success());
+        let no_body = !is_tunnel && (self.is_head_method()
+            || matches!(status, StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED));
+        if is_tunnel {
+            headers.remove(CONTENT_LENGTH);
+            headers.remove(TRANSFER_ENCODING);
+        }
+        if version == Version::HTTP_10 {
+            self.set_http10();
+        }
+        if self.is_http10() {
+            headers.remove(TRANSFER_ENCODING);
+        }
 
         // encode version, status code and reason
         encode_version_status_reason(buf, version, status);
 
         let size = BodySize::from_stream(body);
 
-        self.encode_headers(&mut headers, size, buf, skip_ct_te).inspect(|_| {
+        self.encode_headers(&mut headers, size, buf, skip_ct_te)
+            .map(|encoding| {
+                if is_tunnel {
+                    TransferCoding::upgrade()
+                } else if no_body {
+                    TransferCoding::eof()
+                } else {
+                    encoding
+                }
+            })
+            .inspect(|_| {
             // put header map back to cache.
             self.replace_headers(headers);
 
@@ -179,12 +210,17 @@ where
 
         // special handling for head method request by removing potential unwanted response body.
         if self.is_head_method() {
-            try_remove_body(buf, skip_ct_te, size, &mut encoding);
+            try_remove_body(buf, skip_ct_te, self.is_http10(), size, &mut encoding);
         // encode transfer-encoding or content-length if header map didn't provide them.
         } else if !skip_ct_te {
             match size {
                 BodySize::None => {
                     encoding = TransferCoding::eof();
+                }
+                // RFC 9112 §7.1：HTTP/1.0 接收方不支持 chunked，改为关闭连接定界（原样写出 body）
+                BodySize::Stream if self.is_http10() => {
+                    self.set_close();
+                    encoding = TransferCoding::upgrade();
                 }
                 BodySize::Stream => {
                     buf.extend_from_slice(CHUNKED_HEADER);
@@ -219,12 +255,12 @@ const CLOSE_HEADER: &[u8; 19] = b"\r\nconnection: close";
 
 #[cold]
 #[inline(never)]
-fn try_remove_body(buf: &mut BytesMut, skip_ct_te: bool, size: BodySize, encoding: &mut TransferCoding) {
+fn try_remove_body(buf: &mut BytesMut, skip_ct_te: bool, http10: bool, size: BodySize, encoding: &mut TransferCoding) {
     *encoding = TransferCoding::eof();
 
     match size {
         BodySize::None => return,
-        BodySize::Stream if !skip_ct_te => {
+        BodySize::Stream if !skip_ct_te && !http10 => {
             buf.extend_from_slice(CHUNKED_HEADER);
         }
         BodySize::Sized(size) if !skip_ct_te => {
@@ -254,6 +290,85 @@ mod test {
     };
 
     use super::*;
+
+    struct NeverBody;
+
+    impl Stream for NeverBody {
+        type Item = Result<Bytes, core::convert::Infallible>;
+
+        fn poll_next(self: core::pin::Pin<&mut Self>, _: &mut core::task::Context<'_>) -> core::task::Poll<Option<Self::Item>> {
+            panic!("body must not be polled while encoding the head")
+        }
+    }
+
+    #[test]
+    fn bodyless_and_tunnel_framing() {
+        for (head, connect, status) in [
+            (true, false, StatusCode::OK),
+            (false, false, StatusCode::NO_CONTENT),
+            (false, false, StatusCode::NOT_MODIFIED),
+            (false, false, StatusCode::SWITCHING_PROTOCOLS),
+            (false, true, StatusCode::OK),
+            (false, true, StatusCode::NO_CONTENT),
+        ] {
+            let mut ctx = Context::<_, 64>::new(&SystemTimeDateTimeHandler);
+            if head { ctx.set_head_method(); }
+            if connect { ctx.set_connect_method(); }
+            let res = Response::builder().status(status)
+                .header(CONTENT_LENGTH, "123")
+                .body(NeverBody).unwrap();
+            let (parts, body) = res.into_parts();
+            let mut buf = BytesMut::new();
+            let mut encoder = ctx.encode_head(parts, &body, &mut buf).unwrap();
+            let encoded_head = std::str::from_utf8(&buf).unwrap();
+            assert!(!encoded_head.contains("transfer-encoding:"));
+            assert_eq!(encoded_head.contains("content-length: 123"), head);
+            let tunnel = connect || status == StatusCode::SWITCHING_PROTOCOLS;
+            if tunnel {
+                assert!(encoder.is_upgrade());
+                buf.clear();
+                encoder.encode(Bytes::from_static(b"raw"), &mut buf);
+                encoder.encode_eof(&mut buf);
+                assert_eq!(&buf[..], b"raw");
+            } else {
+                assert!(matches!(encoder, TransferCoding::Eof));
+            }
+        }
+    }
+
+    #[test]
+    fn tunnel_discards_explicit_transfer_encoding() {
+        for connect in [false, true] {
+            let mut ctx = Context::<_, 64>::new(&SystemTimeDateTimeHandler);
+            if connect { ctx.set_connect_method(); }
+            let status = if connect { StatusCode::OK } else { StatusCode::SWITCHING_PROTOCOLS };
+            let res = Response::builder().status(status).header(TRANSFER_ENCODING, "chunked")
+                .body(NeverBody).unwrap();
+            let (parts, body) = res.into_parts();
+            let mut buf = BytesMut::new();
+            assert!(ctx.encode_head(parts, &body, &mut buf).unwrap().is_upgrade());
+            assert!(!std::str::from_utf8(&buf).unwrap().contains("transfer-encoding:"));
+        }
+    }
+
+    #[test]
+    fn http10_discards_explicit_transfer_encoding() {
+        for response_version in [Version::HTTP_10, Version::HTTP_11] {
+            let mut ctx = Context::<_, 64>::new(&SystemTimeDateTimeHandler);
+            ctx.set_http10();
+            let res = Response::builder().version(response_version)
+                .header(TRANSFER_ENCODING, "chunked").body(NeverBody).unwrap();
+            let (parts, body) = res.into_parts();
+            let mut buf = BytesMut::new();
+            let mut encoder = ctx.encode_head(parts, &body, &mut buf).unwrap();
+            assert!(ctx.is_connection_closed());
+            assert!(!std::str::from_utf8(&buf).unwrap().contains("transfer-encoding:"));
+            buf.clear();
+            encoder.encode(Bytes::from_static(b"raw"), &mut buf);
+            encoder.encode_eof(&mut buf);
+            assert_eq!(&buf[..], b"raw");
+        }
+    }
 
     #[test]
     fn append_header() {

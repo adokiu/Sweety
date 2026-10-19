@@ -5,6 +5,9 @@ pub enum ProtoError {
     HeaderName,
     HeaderValue,
     HeaderTooLarge,
+    UnsupportedTransferCoding,
+    // request-target exceeds read buffer limit (RFC 9110 §15.5.15 → 414).
+    UriTooLong,
     Method,
     Uri,
     NewLine,

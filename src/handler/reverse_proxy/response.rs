@@ -38,6 +38,21 @@ pub fn is_hop_by_hop(name: &str) -> bool {
     HOP_BY_HOP_SET.contains(lower)
 }
 
+/// 解析 Connection 头列出的连接选项（RFC 9110 §7.6.1），返回小写字段名列表。
+/// 这些字段只对当前连接有效，代理转发前必须移除。
+pub fn connection_tokens<'a>(values: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for v in values {
+        for t in v.split(',') {
+            let t = t.trim();
+            if !t.is_empty() {
+                tokens.push(t.to_ascii_lowercase());
+            }
+        }
+    }
+    tokens
+}
+
 /// 对响应体内容做 sub_filter 替换（等价 Nginx sub_filter）
 ///
 /// - pattern 以 `~` 开头：按正则替换（支持 $1 $2 捕获组）
@@ -117,9 +132,15 @@ pub fn apply_response_headers(
 ) {
     use sweety_web::http::header::HeaderName;
 
+    // 上游 Connection 头列出的字段同样不得转发（RFC 9110 §7.6.1）
+    let conn_tokens = connection_tokens(
+        headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("connection")).map(|(_, v)| v.as_str()),
+    );
+
     for (k, v) in headers {
         // hop-by-hop 头不透传给客户端，phf O(1) 查找
         if is_hop_by_hop(k) { continue; }
+        if !conn_tokens.is_empty() && conn_tokens.iter().any(|t| t.eq_ignore_ascii_case(k)) { continue; }
 
         // Location：将上游 URL 前缀替换为客户端 URL（等价 Nginx proxy_redirect）
         if k.eq_ignore_ascii_case("location") {

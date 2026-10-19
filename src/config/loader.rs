@@ -85,6 +85,12 @@ pub fn validate_config_pub(cfg: &AppConfig) -> Result<()> {
 
 /// 配置校验：检查必填字段、端口合法性等
 fn validate_config(cfg: &AppConfig) -> Result<()> {
+    if !(16384..=16777215).contains(&cfg.global.h2_max_frame_size) {
+        bail!(
+            "global.h2_max_frame_size 必须在 16384..=16777215 范围内，实际为 {}",
+            cfg.global.h2_max_frame_size
+        );
+    }
     for site in &cfg.sites {
         // 校验站点名称非空
         if site.name.is_empty() {
@@ -175,6 +181,43 @@ mod tests {
         let f = write_temp(yaml, "yaml");
         let cfg = load_config(f.path()).unwrap();
         assert_eq!(cfg.sites[0].name, "demo");
+    }
+
+    #[test]
+    fn test_h2_max_frame_size_boundaries() {
+        for size in [16384, 65535, 16777215] {
+            let mut cfg = AppConfig::default();
+            cfg.global.h2_max_frame_size = size;
+            validate_config_pub(&cfg).unwrap();
+            assert_eq!(cfg.global.h2_max_frame_size, size);
+        }
+        for size in [0, 16383, 16777216, u32::MAX] {
+            let mut cfg = AppConfig::default();
+            cfg.global.h2_max_frame_size = size;
+            let err = validate_config_pub(&cfg).unwrap_err().to_string();
+            assert!(err.contains("global.h2_max_frame_size"));
+            assert!(err.contains("16384..=16777215"));
+            assert_eq!(cfg.global.h2_max_frame_size, size);
+        }
+    }
+
+    #[test]
+    fn test_load_h2_max_frame_size_boundaries() {
+        for size in [16383, 16384, 16777215, 16777216] {
+            for (ext, content) in [
+                ("toml", format!("[global]\nh2_max_frame_size = {size}\n")),
+                ("json", format!(r#"{{"global":{{"h2_max_frame_size":{size}}}}}"#)),
+                ("yaml", format!("global:\n  h2_max_frame_size: {size}\n")),
+            ] {
+                let f = write_temp(&content, ext);
+                let result = load_config(f.path());
+                if (16384..=16777215).contains(&size) {
+                    assert_eq!(result.unwrap().global.h2_max_frame_size, size);
+                } else {
+                    assert!(result.unwrap_err().to_string().contains("global.h2_max_frame_size"));
+                }
+            }
+        }
     }
 
     #[test]

@@ -28,6 +28,8 @@ impl ContextState {
     const CLOSE: u8 = 0b_1000;
     // Enable when current connection is TLS (HTTPS/WSS).
     const IS_TLS: u8 = 0b_0001_0000;
+    // Enable when current request is HTTP/1.0 (chunked transfer coding MUST NOT be used, RFC 9112 §7.1).
+    const HTTP10: u8 = 0b_0010_0000;
 
     const fn new() -> Self {
         Self(0)
@@ -146,6 +148,18 @@ impl<'a, D, const HEADER_LIMIT: usize> Context<'a, D, HEADER_LIMIT> {
     #[inline]
     pub fn remove_close(&mut self) {
         self.state.remove(ContextState::CLOSE)
+    }
+
+    /// Set Context's state to HTTP/1.0 request received.
+    #[inline]
+    pub fn set_http10(&mut self) {
+        self.state.insert(ContextState::HTTP10)
+    }
+
+    /// Get HTTP/1.0 request state.
+    #[inline]
+    pub const fn is_http10(&self) -> bool {
+        self.state.contains(ContextState::HTTP10)
     }
 
     /// Get expect header state.

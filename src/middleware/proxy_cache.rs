@@ -152,6 +152,12 @@ impl ProxyCache {
             if !self.ignore_set_cookie && k.eq_ignore_ascii_case("set-cookie") {
                 return false;
             }
+            // SSE 是实时事件流，缓存后回放没有意义且会把旧事件发给新客户端
+            if k.eq_ignore_ascii_case("content-type")
+                && v.split(';').next().is_some_and(|m| m.trim().eq_ignore_ascii_case("text/event-stream"))
+            {
+                return false;
+            }
         }
         true
     }

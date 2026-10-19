@@ -143,6 +143,10 @@ where
                 Err(Error::Proto(ProtoError::HeaderTooLarge)) => {
                     self.request_error(|| status_only(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE))
                 }
+                Err(Error::Proto(ProtoError::UriTooLong)) => self.request_error(|| status_only(StatusCode::URI_TOO_LONG)),
+                Err(Error::Proto(ProtoError::UnsupportedTransferCoding)) => {
+                    self.request_error(|| status_only(StatusCode::NOT_IMPLEMENTED))
+                }
                 Err(Error::Proto(_)) => self.request_error(|| status_only(StatusCode::BAD_REQUEST)),
                 Err(e) => return Err(e),
             }
@@ -192,7 +196,10 @@ where
 
             let (parts, body) = self.service.call(req).await.map_err(Error::Service)?.into_parts();
 
+            let is_tunnel = parts.status == StatusCode::SWITCHING_PROTOCOLS
+                || (self.ctx.is_connect_method() && parts.status.is_success());
             let mut encoder = self.ctx.encode_head(parts, &body, &mut *self.write_buf)?;
+            self.write_buf.write_io(&*self.io).await?;
 
             // this block is necessary. ResB has to be dropped asap as it may hold ownership of
             // Body type which if not dropped before Notifier::notify is called would prevent

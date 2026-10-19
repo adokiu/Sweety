@@ -92,12 +92,14 @@ pub async fn handle_sweety(
     // H1 WS：GET + Upgrade: websocket（RFC 6455）
     // 非 WS CONNECT（正向代理隧道）不命中，在入口已拦截返回 400
     let is_ws_h2 = ctx.req().body().is_h2_ws();
+    // Upgrade 是逗号分隔的协议列表（RFC 9110 §7.8），按 token 匹配而非整值比较
     let is_ws_h1 = !is_ws_h2
         && ctx.req().headers()
-            .get(sweety_web::http::header::UPGRADE)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.eq_ignore_ascii_case("websocket"))
-            .unwrap_or(false);
+            .get_all(sweety_web::http::header::UPGRADE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .any(|t| t.trim().eq_ignore_ascii_case("websocket"));
     let is_ws = is_ws_h1 || is_ws_h2;
 
     // ── 过滤并收集请求头────────────────
@@ -108,32 +110,68 @@ pub async fn handle_sweety(
     let scheme_str = if ctx.req().body().is_tls() { "https" } else {
         ctx.req().uri().scheme_str().unwrap_or("http")
     };
-    let header_count = ctx.req().headers().len();
-    let mut client_headers: Vec<(String, String)> = Vec::with_capacity(header_count + 4);
-    client_headers.extend(
-        ctx.req().headers()
-            .iter()
-            .filter_map(|(k, v)| {
-                let name = k.as_str();
-                // WS 请求保留 Upgrade 和 Sec-WebSocket-* 头（不被 hop-by-hop 过滤）
-                let is_ws_header = is_ws
-                    && (name.eq_ignore_ascii_case("upgrade")
-                        || name.to_ascii_lowercase().starts_with("sec-websocket-"));
-                if !is_ws_header && crate::handler::reverse_proxy::response::is_hop_by_hop(name) {
-                    return None;
-                }
-                v.to_str().ok().map(|val| (name.to_string(), val.to_string()))
-            })
+    // RFC 9110 §7.6.1：Connection 头中列出的字段同样是 hop-by-hop，转发前必须移除
+    let connection_tokens = response::connection_tokens(
+        ctx.req().headers().get_all(sweety_web::http::header::CONNECTION).iter().filter_map(|v| v.to_str().ok()),
     );
+    // 客户端原有 X-Forwarded-For（多条按出现顺序合并），稍后追加连接 IP（等价 Nginx $proxy_add_x_forwarded_for）
+    let mut forwarded_for = String::new();
+    let mut via = String::new();
+    let header_count = ctx.req().headers().len();
+    let mut client_headers: Vec<(String, String)> = Vec::with_capacity(header_count + 6);
+    for (k, v) in ctx.req().headers().iter() {
+        let name = k.as_str();
+        // WS 请求保留 Upgrade 和 Sec-WebSocket-* 头（不被 hop-by-hop 过滤）
+        let is_ws_header = is_ws && (name == "upgrade" || name.starts_with("sec-websocket-"));
+        if !is_ws_header
+            && (response::is_hop_by_hop(name) || connection_tokens.iter().any(|t| t == name))
+        {
+            continue;
+        }
+        let Ok(val) = v.to_str() else { continue };
+        match name {
+            "x-forwarded-for" => {
+                if !forwarded_for.is_empty() { forwarded_for.push_str(", "); }
+                forwarded_for.push_str(val);
+            }
+            "via" => {
+                if !via.is_empty() { via.push_str(", "); }
+                via.push_str(val);
+            }
+            // 由代理根据连接信息生成，丢弃客户端提供的值防止伪造
+            "x-real-ip" | "x-forwarded-proto" => {}
+            _ => client_headers.push((name.to_string(), val.to_string())),
+        }
+    }
+    if !forwarded_for.is_empty() { forwarded_for.push_str(", "); }
+    forwarded_for.push_str(client_ip_str_ref);
+    client_headers.push(("X-Forwarded-For".to_string(), forwarded_for));
+    client_headers.push(("X-Real-IP".to_string(), client_ip_str.clone()));
+    client_headers.push(("X-Forwarded-Proto".to_string(), scheme_str.to_string()));
+    // RFC 9110 §7.6.3：网关转发请求时必须追加 Via（received-protocol + received-by）
+    let received_protocol = match ctx.req().version() {
+        sweety_web::http::Version::HTTP_10 => "1.0",
+        sweety_web::http::Version::HTTP_2  => "2",
+        sweety_web::http::Version::HTTP_3  => "3",
+        _ => "1.1",
+    };
+    if !via.is_empty() { via.push_str(", "); }
+    via.push_str(received_protocol);
+    via.push_str(" sweety");
+    client_headers.push(("Via".to_string(), via));
 
-
-    // 应用 proxy_set_headers：重写指定请求头（支持 $remote_addr/$host/$scheme/$request_uri 变量）
+    // 应用 proxy_set_headers：重写指定请求头（支持 $remote_addr/$host/$scheme/$request_uri/$http_upgrade 变量）
+    let http_upgrade = ctx.req().headers()
+        .get(sweety_web::http::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     for h in &location.proxy_set_headers {
         let val = h.value
             .replace("$remote_addr", client_ip_str_ref)
             .replace("$host", upstream_host)
             .replace("$scheme", scheme_str)
-            .replace("$request_uri", path);
+            .replace("$request_uri", path)
+            .replace("$http_upgrade", http_upgrade);
         client_headers.retain(|(k, _)| !k.eq_ignore_ascii_case(&h.name));
         client_headers.push((h.name.clone(), val));
     }
@@ -142,7 +180,8 @@ pub async fn handle_sweety(
     // 不全量 collect 到内存：大文件上传零内存拷贝，chunked body 直接 pipe 给上游
     // 100-continue 处理、流式写上游均在 conn::forward_request 内完成
     // GET/HEAD 等无 body 方法：take_body_ref() 返回 RequestBody::None，conn 层会跳过发送
-    let request_body = ctx.take_body_ref();
+    // WS 请求不能在此取走 body：ws_proxy 需要它做 client → upstream 方向转发
+    let request_body = if is_ws { Default::default() } else { ctx.take_body_ref() };
 
     // ── Location 配置 ─────────────────────────────────────────────────────
     // 自动检测：上游 TLS + 客户端非 TLS → 自动剥离 Set-Cookie 的 Secure 标志
@@ -164,7 +203,7 @@ pub async fn handle_sweety(
 
     if let Some(ref cache) = proxy_cache {
         // 直接传 HeaderMap，跳过中间 Vec 堆分配
-        if cache.should_lookup(method, ctx.req().headers()) {
+        if !is_ws && cache.should_lookup(method, ctx.req().headers()) {
             if let Some(entry) = cache.get(&cache_key) {
                 // 缓存命中，直接构造响应返回
                 use sweety_web::body::ResponseBody;
@@ -340,7 +379,7 @@ pub async fn handle_sweety(
 
     // ── 代理压缩（等价 Nginx gzip_proxied）──────────────────────────────────
     // 条件：上游未压缩（无 Content-Encoding）+ mime 可压缩 + 压缩已开启
-    {
+    if !is_ws && method != "HEAD" {
         let global_cfg = ctx.state().cfg.load();
         let (gz_en, gz_lv, br_en, br_lv, zst_en, zst_lv) =
             crate::handler::compress::effective_compress(site, &global_cfg.global);
@@ -471,10 +510,11 @@ async fn forward_request_h2(
             builder = builder.header(name, val);
         }
     }
-    builder = builder
-        .header("x-real-ip", client_ip)
-        .header("x-forwarded-for", client_ip)
-        .header("x-forwarded-proto", scheme);
+    // 上层已合并的转发头存在时不再重复追加（同名头只出现一次）
+    let has = |name: &str| extra_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name));
+    if !has("x-real-ip") { builder = builder.header("x-real-ip", client_ip); }
+    if !has("x-forwarded-for") { builder = builder.header("x-forwarded-for", client_ip); }
+    if !has("x-forwarded-proto") { builder = builder.header("x-forwarded-proto", scheme); }
 
     // 全量 collect 请求体（H2 stream 层已有流量控制）
     let body_bytes: Option<Bytes> = {
@@ -502,8 +542,9 @@ async fn forward_request_h2(
         }
     }
 
-    // 304/204/205/1xx 无 body
-    let no_body = status == StatusCode::NOT_MODIFIED
+    // HEAD / 304/204/205/1xx 无 body
+    let no_body = method.eq_ignore_ascii_case("HEAD")
+        || status == StatusCode::NOT_MODIFIED
         || status == StatusCode::NO_CONTENT
         || status == StatusCode::RESET_CONTENT
         || status.is_informational();
@@ -518,11 +559,17 @@ async fn forward_request_h2(
 
     // 流式透传响应体（bounded channel，背压）
     // spawn_local：在同一 worker 线程驱动，避免跨线程调度开销
+    // SSE：不设空闲超时，客户端断开（rx drop）时结束
     let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(4);
     tokio::task::spawn_local(async move {
         let mut stream = recv_stream;
         loop {
-            match tokio::time::timeout(read_timeout, stream.data()).await {
+            let next = tokio::select! {
+                biased;
+                _ = tx.closed() => break,
+                r = tokio::time::timeout(read_timeout, stream.data()) => r,
+            };
+            match next {
                 Ok(Some(Ok(data))) => {
                     let _ = stream.flow_control().release_capacity(data.len());
                     if tx.send(Ok(data)).await.is_err() { break; }

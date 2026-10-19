@@ -33,6 +33,8 @@ where
     type Error = HttpServiceError<S::Error, BE>;
 
     async fn call(&self, (io, addr): (St, SocketAddr)) -> Result<Self::Response, Self::Error> {
+        validate_max_frame_size(self.config.h2_max_frame_size)?;
+
         // tls accept timer.
         let timer = self.keep_alive();
         let mut timer = pin!(timer);
@@ -93,6 +95,30 @@ where
         dispatcher.run().await?;
 
         Ok(())
+    }
+}
+
+fn validate_max_frame_size(size: u32) -> Result<(), ::h2::Error> {
+    if !(16384..=16777215).contains(&size) {
+        tracing::error!(size, "h2_max_frame_size must be within 16384..=16777215");
+        return Err(::h2::Reason::INTERNAL_ERROR.into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_max_frame_size;
+
+    #[test]
+    fn max_frame_size_boundaries() {
+        for size in [16384, 65535, 16777215] {
+            assert!(validate_max_frame_size(size).is_ok());
+        }
+        for size in [0, 16383, 16777216, u32::MAX] {
+            let error = validate_max_frame_size(size).unwrap_err();
+            assert_eq!(error.reason(), Some(::h2::Reason::INTERNAL_ERROR));
+        }
     }
 }
 

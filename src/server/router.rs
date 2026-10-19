@@ -309,7 +309,7 @@ pub(super) async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebRes
             }
         }
         HandlerType::Websocket => {
-            crate::handler::websocket::handle_sweety(ctx, &location).await
+            crate::handler::websocket::handle_sweety(ctx, &site, &location).await
         }
         HandlerType::ReverseProxy => {
             crate::handler::reverse_proxy::handle_sweety(ctx, &site, &location).await
