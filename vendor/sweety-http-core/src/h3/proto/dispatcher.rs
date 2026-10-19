@@ -82,6 +82,8 @@ where
         let conn = h3_quinn::Connection::new(h3_quic.quinn);
         let mut builder = server::builder();
         builder.max_field_section_size(65536);
+        // RFC 9220 / extended CONNECT（WebSocket over HTTP/3）
+        builder.enable_extended_connect(true);
         let mut conn = builder.build(conn).await?;
 
         use futures_util::{FutureExt as _, stream::FuturesUnordered};
@@ -94,8 +96,17 @@ where
         let mut request_count: u64 = 0;
         const MAX_CONCURRENT: usize = 1024;
         const READY_DRAIN_BUDGET: usize = 32;
+        let mut draining_goaway = false;
 
         loop {
+            if !draining_goaway && crate::service::h3_draining() {
+                draining_goaway = true;
+                let pending = handlers.len();
+                match conn.shutdown(pending).await {
+                    Err(e) => debug!(addr = %self.addr, error = %e, "h3 停机 GOAWAY 发送失败"),
+                    Ok(()) => debug!(addr = %self.addr, pending, "h3 停机 GOAWAY 已发送"),
+                }
+            }
             // 小批量清理已完成 handler，降低队列堆积导致的抖动
             for _ in 0..READY_DRAIN_BUDGET {
                 match handlers.next().now_or_never() {
@@ -385,11 +396,21 @@ where
         }
         return Ok(());
     }
+    let is_h3_ws = *req.method() == Method::CONNECT
+        && req.extensions().get::<::h3::ext::Protocol>()
+            .map(|p| p.as_str().eq_ignore_ascii_case("websocket"))
+            .unwrap_or(false);
+
     let (mut tx, rx): (_, RequestStream<QuinnRecvStream, Bytes>) = stream.split();
     let body = RequestBody::new(rx);
 
     let http_req = req.map(|_| {
-        RequestExt::from_parts(ReqB::from(body), Extension::new(addr, true))
+        let ext = if is_h3_ws {
+            Extension::new_h2_ws(addr, true)
+        } else {
+            Extension::new(addr, true)
+        };
+        RequestExt::from_parts(ReqB::from(body), ext)
     });
     let resp = service.call(http_req).await.map_err(Error::Service)?;
     let (mut parts, res_body) = resp.into_parts();

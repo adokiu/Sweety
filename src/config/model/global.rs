@@ -24,6 +24,8 @@ fn default_h2_max_concurrent_reset_streams() -> usize { 200 }
 fn default_h2_max_frame_size() -> u32 { 65535 }
 fn default_h2_max_requests_per_conn() -> usize { 1000 }
 fn default_h3_max_requests_per_conn() -> usize { 1000 }
+fn default_upstream_max_response_headers() -> usize { 200 }
+fn default_upstream_max_response_header_kb() -> usize { 256 }
 fn default_true() -> bool { true }
 
 /// 全局配置项
@@ -146,6 +148,14 @@ pub struct GlobalConfig {
     #[serde(default = "default_h3_max_requests_per_conn")]
     pub h3_max_requests_per_conn: usize,
 
+    /// 上游 HTTP/1.1 响应头字段数上限（RFC 9110 安全限制，默认 200）
+    #[serde(default = "default_upstream_max_response_headers")]
+    pub upstream_max_response_headers: usize,
+
+    /// 上游响应头总字节上限（KB，默认 256）
+    #[serde(default = "default_upstream_max_response_header_kb")]
+    pub upstream_max_response_header_kb: usize,
+
 }
 
 impl Default for GlobalConfig {
@@ -180,6 +190,8 @@ impl Default for GlobalConfig {
             h2_max_requests_per_conn: default_h2_max_requests_per_conn(),
             h3_max_pending_per_conn: 0,
             h3_max_requests_per_conn: default_h3_max_requests_per_conn(),
+            upstream_max_response_headers: default_upstream_max_response_headers(),
+            upstream_max_response_header_kb: default_upstream_max_response_header_kb(),
         }
     }
 }

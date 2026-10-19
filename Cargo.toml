@@ -156,6 +156,10 @@ quinn        = { version = "0.11", default-features = false, features = ["rustls
 [target.'cfg(not(windows))'.dependencies]
 tikv-jemallocator = { version = "0.6", optional = true }
 
+# hyperium/h3：crates.io 0.0.8 尚无 RFC 9220 `:protocol=websocket`，跟踪 upstream 至发布新版本
+[patch.crates-io]
+h3 = { git = "https://github.com/hyperium/h3", rev = "0e54a16df76102809ad99b03663b559dfc203917" }
+
 # ─────────────────────────────────────────────
 # Features
 # ─────────────────────────────────────────────

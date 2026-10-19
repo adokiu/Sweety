@@ -189,7 +189,7 @@ where
 
 /// 处理 WS/WSS 反向代理请求的公开入口
 ///
-/// H2 extended CONNECT（RFC 8441）：返回 501，浏览器自动降级 HTTP/1.1 重试
+/// H2 extended CONNECT（RFC 8441）/ H3（RFC 9220）：返回 200，双向流透传
 /// H1 Upgrade：正常代理，返回 101 Switching Protocols
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_ws_proxy(
@@ -465,8 +465,7 @@ where
     let mut final_resp = WebResponse::new(ResponseBody::box_stream(ws_stream));
 
     if is_h2_ws {
-        // H2 extended CONNECT（RFC 8441）：返回 200，无 Upgrade/Connection 头
-        // H2 DATA 帧天然双向，框架持续 poll bidir stream 驱动转发
+        // H2/H3 extended CONNECT：返回 200，无 Upgrade/Connection 头
         *final_resp.status_mut() = StatusCode::OK;
     } else {
         // H1 Upgrade：需要验证客户端握手头（Sec-WebSocket-Key 等），返回 101

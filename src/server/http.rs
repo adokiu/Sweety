@@ -204,6 +204,11 @@ impl SweetyServer {
 
         let mut server = sweety_web::HttpServer::serve(app.finish());
 
+        crate::handler::reverse_proxy::conn::set_upstream_response_limits(
+            cfg.global.upstream_max_response_headers,
+            cfg.global.upstream_max_response_header_kb.saturating_mul(1024),
+        );
+
         // 根据 worker 线程数配置并发
         let workers = if cfg.global.worker_threads == 0 {
             std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)

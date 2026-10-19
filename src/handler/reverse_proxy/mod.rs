@@ -39,10 +39,11 @@ pub async fn handle_sweety(
     site: &SiteInfo,
     location: &LocationConfig,
 ) -> WebResponse {
+    let client_version = ctx.req().version();
     // ── 找到上游配置 ─────────────────────────────────────────
     let upstream_name = match &location.upstream {
         Some(n) => n.as_str(),
-        None => return response::proxy_error(StatusCode::INTERNAL_SERVER_ERROR, "未配置 upstream"),
+        None => return response::proxy_error(StatusCode::INTERNAL_SERVER_ERROR, "未配置 upstream", client_version),
     };
     // 直接从预构建的池查表，零堆分配
     let pool = match site.upstream_pools.get(upstream_name) {
@@ -50,6 +51,7 @@ pub async fn handle_sweety(
         None => return response::proxy_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("上游组 '{}' 未找到", upstream_name),
+            client_version,
         ),
     };
 
@@ -60,7 +62,7 @@ pub async fn handle_sweety(
         let m = ctx.req().method().as_str();
         if m.eq_ignore_ascii_case("CONNECT") && !ctx.req().body().is_h2_ws() {
             // 纯隧道 CONNECT，Nginx 也不支持，返回 400
-            return response::proxy_error(StatusCode::BAD_REQUEST, "CONNECT tunneling not supported");
+            return response::proxy_error(StatusCode::BAD_REQUEST, "CONNECT tunneling not supported", client_version);
         }
     }
 
@@ -68,7 +70,7 @@ pub async fn handle_sweety(
     let client_ip_str = ctx.req().body().socket_addr().ip().to_string();
     let node = match pool.pick(Some(&client_ip_str)) {
         Some(n) => n,
-        None => return response::proxy_error(StatusCode::BAD_GATEWAY, "所有上游节点均不可用"),
+        None => return response::proxy_error(StatusCode::BAD_GATEWAY, "所有上游节点均不可用", client_version),
     };
 
     // ── 提取请求信息（用 &str 借用，避免堆分配）────────────────────────────
@@ -264,7 +266,7 @@ pub async fn handle_sweety(
             Err(e) => {
                 node.record_failure();
                 error!("H2 反向代理失败 → {}: {}", node.addr.as_str(), e);
-                response::proxy_error(StatusCode::BAD_GATEWAY, &format!("上游 H2 {} 失败: {}", node.addr.as_str(), e))
+                response::proxy_error(StatusCode::BAD_GATEWAY, &format!("上游 H2 {} 失败: {}", node.addr.as_str(), e), client_version)
             }
         }
     } else {
@@ -349,7 +351,7 @@ pub async fn handle_sweety(
         }
 
         resp_opt.unwrap_or_else(|| {
-            response::proxy_error(StatusCode::BAD_GATEWAY, &format!("上游 {} 响应失败: {}", current_node.addr.as_str(), last_err))
+            response::proxy_error(StatusCode::BAD_GATEWAY, &format!("上游 {} 响应失败: {}", current_node.addr.as_str(), last_err), client_version)
         })
     };
 
@@ -389,6 +391,7 @@ pub async fn handle_sweety(
         );
     }
 
+    response::append_gateway_via(&mut resp, client_version);
     resp
 }
 

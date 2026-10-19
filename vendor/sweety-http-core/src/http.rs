@@ -184,10 +184,16 @@ impl<B> RequestExt<B> {
         Self { body, ext }
     }
 
-    /// 是否为 H2 extended CONNECT WebSocket（RFC 8441）
+    /// 是否为 H2/H3 extended CONNECT WebSocket（RFC 8441 / RFC 9220）
     #[inline]
     pub fn is_h2_ws(&self) -> bool {
         self.ext.0.h2_ws
+    }
+
+    /// 与 [`is_h2_ws`](Self::is_h2_ws) 相同，涵盖 H2 与 H3 extended CONNECT。
+    #[inline]
+    pub fn is_extended_connect_ws(&self) -> bool {
+        self.is_h2_ws()
     }
 
     /// 当前连接是否为 TLS（HTTPS/WSS）

@@ -2,7 +2,7 @@
 use std::sync::Arc;
 
 #[cfg(feature = "http3")]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// H3 连接限流：原子计数器 + 原子限制值，支持热更新
 /// 每个 QUIC 连接实际占用约 2-4MB（含 quinn buffer、协议栈状态）
@@ -12,9 +12,26 @@ static H3_CONN_LIMIT: AtomicUsize = AtomicUsize::new(0); // 0 = 未初始化，�
 static H3_CONN_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "http3")]
 static H3_CONN_NOTIFY: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+#[cfg(feature = "http3")]
+static H3_DRAINING: AtomicBool = AtomicBool::new(false);
 
 /// 设置/热更新 H3 最大并发连接数（0 = 自动检测）
 /// 可在运行时任意时刻调用，立即生效（原子写入）
+#[cfg(feature = "http3")]
+/// 优雅停机：现有 H3 连接发 GOAWAY，不再接受新流（由 dispatcher 轮询）
+#[cfg(feature = "http3")]
+pub fn set_h3_draining(draining: bool) {
+    H3_DRAINING.store(draining, Ordering::SeqCst);
+    if draining {
+        tracing::info!("H3 进入 draining：活跃连接将发送 GOAWAY");
+    }
+}
+
+#[cfg(feature = "http3")]
+pub(crate) fn h3_draining() -> bool {
+    H3_DRAINING.load(Ordering::Acquire)
+}
+
 #[cfg(feature = "http3")]
 pub fn set_h3_max_connections(max: usize) {
     let max = if max == 0 {

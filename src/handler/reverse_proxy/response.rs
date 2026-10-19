@@ -4,8 +4,8 @@
 use sweety_web::{
     body::ResponseBody,
     http::{
-        StatusCode, WebResponse,
-        header::{CONTENT_TYPE, HeaderValue},
+        StatusCode, Version, WebResponse,
+        header::{CONTENT_TYPE, HeaderName, HeaderValue, VIA},
     },
 };
 
@@ -116,6 +116,27 @@ fn sub_filter_regex(pattern: &str) -> Option<regex::Regex> {
     }
 }
 
+/// 网关生成的响应追加 Via（RFC 9110 §7.6.3），与请求侧 `Via` 语义一致。
+pub fn append_gateway_via(resp: &mut WebResponse, version: Version) {
+    let received_protocol = match version {
+        Version::HTTP_10 => "1.0",
+        Version::HTTP_2 => "2",
+        Version::HTTP_3 => "3",
+        _ => "1.1",
+    };
+    let hop = format!("{received_protocol} sweety");
+    let merged = resp.headers().get(VIA).and_then(|v| v.to_str().ok()).map(|existing| {
+        if existing.is_empty() {
+            hop.clone()
+        } else {
+            format!("{existing}, {hop}")
+        }
+    }).unwrap_or(hop);
+    if let Ok(val) = HeaderValue::from_str(&merged) {
+        resp.headers_mut().insert(VIA, val);
+    }
+}
+
 /// 将上游响应头全量透传给客户端（Nginx proxy_pass 默认行为）
 ///
 /// - 跳过 hop-by-hop 头（Connection / Transfer-Encoding 等）
@@ -178,6 +199,22 @@ pub fn apply_response_headers(
     }
 }
 
+#[cfg(test)]
+mod via_tests {
+    use super::*;
+    use sweety_web::http::Version;
+
+    #[test]
+    fn append_gateway_via_merges_existing() {
+        let mut resp = WebResponse::new(ResponseBody::empty());
+        resp.headers_mut().insert(VIA, HeaderValue::from_static("1.1 upstream"));
+        append_gateway_via(&mut resp, Version::HTTP_2);
+        let via = resp.headers().get(VIA).unwrap().to_str().unwrap();
+        assert!(via.contains("1.1 upstream"));
+        assert!(via.contains("2 sweety"));
+    }
+}
+
 /// 修改 Set-Cookie 属性：
 /// - 去掉 `Secure` 标志（HTTP 代理 HTTPS 上游时必须，否则浏览器不存 Cookie）
 /// - 替换 `Domain=upstream` 为指定值
@@ -209,8 +246,8 @@ pub fn parse_status_code(status_line: &str) -> u16 {
         .unwrap_or(502)
 }
 
-/// 构造 HTML 错误响应
-pub fn proxy_error(status: StatusCode, _msg: &str) -> WebResponse {
+/// 构造 HTML 错误响应（含网关 Via）
+pub fn proxy_error(status: StatusCode, _msg: &str, client_version: Version) -> WebResponse {
     let body = crate::handler::error_page::build_default_html(status.as_u16());
     let mut resp = WebResponse::new(ResponseBody::from(body));
     *resp.status_mut() = status;
@@ -218,5 +255,6 @@ pub fn proxy_error(status: StatusCode, _msg: &str) -> WebResponse {
         CONTENT_TYPE,
         HeaderValue::from_static("text/html; charset=utf-8"),
     );
+    append_gateway_via(&mut resp, client_version);
     resp
 }

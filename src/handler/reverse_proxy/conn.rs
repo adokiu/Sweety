@@ -19,8 +19,29 @@ use super::error::{IoContext, ProxyError};
 use super::pool::{ConnPool, PooledConn};
 use super::response::{apply_response_headers, parse_status_code};
 use super::tls_client::tls_connect;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::config::model::UpstreamAddr;
 use crate::middleware::proxy_cache::{CacheKey, ProxyCache};
+
+static UPSTREAM_RESP_MAX_HEADERS: AtomicUsize = AtomicUsize::new(200);
+static UPSTREAM_RESP_MAX_HEADER_BYTES: AtomicUsize = AtomicUsize::new(256 * 1024);
+
+/// 启动时或热重载后更新上游响应头安全上限（RFC 9110 网关防护）
+pub fn set_upstream_response_limits(max_headers: usize, max_header_bytes: usize) {
+    UPSTREAM_RESP_MAX_HEADERS.store(max_headers.max(1), Ordering::Relaxed);
+    UPSTREAM_RESP_MAX_HEADER_BYTES.store(max_header_bytes.max(1024), Ordering::Relaxed);
+}
+
+#[inline]
+fn resp_max_headers() -> usize {
+    UPSTREAM_RESP_MAX_HEADERS.load(Ordering::Relaxed)
+}
+
+#[inline]
+fn resp_max_header_bytes() -> usize {
+    UPSTREAM_RESP_MAX_HEADER_BYTES.load(Ordering::Relaxed)
+}
 
 /// 向上游转发请求，优先复用连接池里的 idle 连接
 /// body 只能消耗一次；外层 retry 循环已做 take，第一次 attempt 传 Some，重试传 None
@@ -446,7 +467,7 @@ async fn send_recv_pooled(
         if informational_count > MAX_INFORMATIONAL_RESPONSES {
             return Err((protocol_error("上游中间响应数量超过上限").into(), true));
         }
-        read_header_section(&mut buf, read_timeout, RESP_MAX_HEADERS).await.map_err(|e| (e.into(), true))?;
+        read_header_section(&mut buf, read_timeout, resp_max_headers()).await.map_err(|e| (e.into(), true))?;
         (status_code, upstream_http10) = read_response_status(&mut buf, read_timeout).await.map_err(|e| (e.into(), true))?;
     }
     if status_code == 101 {
@@ -462,10 +483,10 @@ async fn send_recv_pooled(
     let mut response_headers: Vec<(String, String)> = Vec::with_capacity(24);
     // 复用 line 缓冲，避免每行都堆分配
     let mut line = String::with_capacity(128);
-    // 安全限制：最大 200 个响应头（Nginx 默认 large_client_header_buffers 不限制上游响应头数，Sweety 更安全）
-    // 单行最大 16 KiB（超长则跳过该头，不终止解析，保持协议兼容）
-    const RESP_MAX_HEADERS: usize = 200;
+    // 安全限制：响应头数量/总字节（可配置，默认 200 / 256 KiB）
     const RESP_MAX_LINE_LEN: usize = 16384;
+    let resp_max_headers = resp_max_headers();
+    let resp_max_header_bytes = resp_max_header_bytes();
     let mut header_count: usize = 0;
     let mut header_bytes = 0;
     loop {
@@ -473,11 +494,11 @@ async fn send_recv_pooled(
             .map_err(|e| (e.into(), true))?;
         header_bytes += line.len();
         // 超长行：跳过该头（不终止解析，保持协议兼容）
-        if header_bytes > RESP_MAX_HEADER_BYTES {
+        if header_bytes > resp_max_header_bytes {
             return Err((protocol_error("上游响应头总长度超过上限").into(), true));
         }
         if line == "\r\n" { break; }
-        if header_count >= RESP_MAX_HEADERS {
+        if header_count >= resp_max_headers {
             return Err((protocol_error("上游响应头数量超过上限").into(), true));
         }
         {
@@ -770,9 +791,7 @@ async fn send_recv_pooled(
 /// buffered 响应体最大大小（256 MiB），与 chunked 路径对齐
 const BUFFERED_MAX_BODY: usize = 256 << 20;
 
-const RESP_MAX_HEADERS: usize = 200;
 const RESP_MAX_LINE_LEN: usize = 16384;
-const RESP_MAX_HEADER_BYTES: usize = 256 * 1024;
 const MAX_INFORMATIONAL_RESPONSES: usize = 32;
 
 fn protocol_error(message: &str) -> std::io::Error {
@@ -870,7 +889,7 @@ async fn read_header_section<R: tokio::io::AsyncBufRead + Unpin>(
     loop {
         read_bounded_line(reader, &mut line, RESP_MAX_LINE_LEN, read_timeout).await?;
         total += line.len();
-        if total > RESP_MAX_HEADER_BYTES {
+        if total > resp_max_header_bytes() {
             return Err(protocol_error("上游头总长度超过上限"));
         }
         if line == "\r\n" { return Ok(headers); }
@@ -888,7 +907,7 @@ async fn read_expect_status<R: tokio::io::AsyncBufRead + Unpin>(
     for _ in 0..MAX_INFORMATIONAL_RESPONSES {
         let status = read_response_status(reader, read_timeout).await?;
         if status.0 == 101 || status.0 >= 200 { return Ok(status); }
-        read_header_section(reader, read_timeout, RESP_MAX_HEADERS).await?;
+        read_header_section(reader, read_timeout, resp_max_headers()).await?;
         if status.0 == 100 { return Ok(status); }
     }
     Err(protocol_error("上游中间响应数量超过上限"))
@@ -1000,7 +1019,7 @@ where R: AsyncRead + Unpin {
             loop {
                 line(buf, &mut tline, read_timeout).await?;
                 total += tline.len();
-                if total > RESP_MAX_HEADER_BYTES { anyhow::bail!("上游 trailer 总长度超过上限"); }
+                if total > resp_max_header_bytes() { anyhow::bail!("上游 trailer 总长度超过上限"); }
                 if tline == "\r\n" { break; }
                 count += 1;
                 if count > CHUNKED_MAX_TRAILERS { anyhow::bail!("上游 trailer 字段过多"); }
