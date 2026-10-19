@@ -1,6 +1,7 @@
-//! QUIC / HTTP3 服务器模块
-//! 负责：Quinn 集成、HTTP/3 连接管理
-//! 当前为骨架实现，完整功能规划于 v0.4 迭代
+//! QUIC / HTTP3 预留入口（未接线）
+//!
+//! 生产环境 HTTP/3 由 `server/http.rs` 通过 sweety-web 的 `bind_h3`（Quinn）启动，
+//! 与 HTTP/1.1、HTTP/2 共用同一套 dispatcher。本文件的 `start_quic_server` 仅为历史占位。
 
 use anyhow::Result;
 use tracing::info;

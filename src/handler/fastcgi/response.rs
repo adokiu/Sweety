@@ -178,12 +178,21 @@ pub(super) async fn build_streaming_response(
     parsed: FcgiParsedHeaders,
     pool: std::sync::Arc<crate::handler::fastcgi_pool::FcgiPool>,
     addr: String,
+    method: &str,
     fcgi_cache: Option<std::sync::Arc<crate::middleware::proxy_cache::ProxyCache>>,
     cache_key: Option<crate::middleware::proxy_cache::CacheKey>,
+    vary_req_headers: sweety_web::http::HeaderMap,
 ) -> WebResponse {
     if parsed.body_done {
         pool.release(&addr, parsed.conn);
-        write_fcgi_cache(&fcgi_cache, &cache_key, parsed.status, &parsed.headers, &parsed.body_prefix);
+        write_fcgi_cache(
+            &fcgi_cache,
+            &cache_key,
+            parsed.status,
+            &parsed.headers,
+            &parsed.body_prefix,
+            &vary_req_headers,
+        );
         return make_complete_response(parsed.status, parsed.headers, parsed.body_prefix);
     }
 
@@ -203,12 +212,28 @@ pub(super) async fn build_streaming_response(
     loop {
         let rec = match read_response_record(&mut conn, pool.read_timeout_secs).await {
             Ok(r) => r,
-            Err(e) => return failed_response(e),
+            Err(e) => {
+                return stale_or_failed_response(
+                    e,
+                    method,
+                    &fcgi_cache,
+                    &cache_key,
+                    &vary_req_headers,
+                );
+            }
         };
         match state.accept(&rec) {
             Ok(true) => break,
             Ok(false) => {}
-            Err(e) => return failed_response(e),
+            Err(e) => {
+                return stale_or_failed_response(
+                    e,
+                    method,
+                    &fcgi_cache,
+                    &cache_key,
+                    &vary_req_headers,
+                );
+            }
         }
         match rec.rec_type {
             t if t == FCGI_STDOUT => {
@@ -230,8 +255,41 @@ pub(super) async fn build_streaming_response(
     }
 
     pool.release(&addr, conn);
-    write_fcgi_cache(&fcgi_cache, &cache_key, parsed.status, &parsed.headers, &body);
+    write_fcgi_cache(
+        &fcgi_cache,
+        &cache_key,
+        parsed.status,
+        &parsed.headers,
+        &body,
+        &vary_req_headers,
+    );
     make_complete_response(parsed.status, parsed.headers, body)
+}
+
+fn stale_or_failed_response(
+    error: std::io::Error,
+    method: &str,
+    fcgi_cache: &Option<std::sync::Arc<crate::middleware::proxy_cache::ProxyCache>>,
+    cache_key: &Option<crate::middleware::proxy_cache::CacheKey>,
+    req_headers: &sweety_web::http::HeaderMap,
+) -> WebResponse {
+    let upstream_status = if error.kind() == std::io::ErrorKind::TimedOut {
+        504
+    } else {
+        502
+    };
+    if let (Some(cache), Some(key)) = (fcgi_cache, cache_key) {
+        if let Some(resp) = crate::middleware::proxy_cache::try_stale_error_serve(
+            cache,
+            method,
+            key,
+            req_headers,
+            upstream_status,
+        ) {
+            return resp;
+        }
+    }
+    failed_response(error)
 }
 
 fn failed_response(error: std::io::Error) -> WebResponse {
@@ -252,10 +310,17 @@ fn write_fcgi_cache(
     status: u16,
     headers: &[(String, String)],
     body: &[u8],
+    vary_req_headers: &sweety_web::http::HeaderMap,
 ) {
     if let (Some(cache), Some(key)) = (cache, key) {
         if cache.is_cacheable(status, headers) {
-            cache.set(key.clone(), status, headers.to_vec(), bytes::Bytes::copy_from_slice(body));
+            cache.set(
+                key.clone(),
+                status,
+                headers.to_vec(),
+                bytes::Bytes::copy_from_slice(body),
+                vary_req_headers,
+            );
         }
     }
 }

@@ -73,7 +73,7 @@ unsafe impl<S: Send> Send for WsMetricsStream<S> {}
 /// - upstream → client：从 upstream read half 读帧，输出给框架
 ///
 /// 与 Nginx 单 worker 事件循环等价：一次 poll 同时检查两个 fd 的 ready 状态。
-struct BiDirStream<R, W> {
+pub(crate) struct BiDirStream<R, W> {
     upstream_read:  R,
     upstream_write: W,
     client_body:    RequestBody,
@@ -99,7 +99,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    fn new(upstream_read: R, upstream_write: W, client_body: RequestBody, prefetched_upstream: Option<Bytes>) -> Self {
+    pub(crate) fn new(upstream_read: R, upstream_write: W, client_body: RequestBody, prefetched_upstream: Option<Bytes>) -> Self {
         let mut read_buf = bytes::BytesMut::with_capacity(65536);
         read_buf.resize(65536, 0);
         Self {
@@ -357,7 +357,7 @@ async fn do_ws_proxy(
         proxy_redirect_from: Option<&str>, proxy_redirect_to: Option<&str>,
     ) -> Result<WebResponse> {
         if use_tls {
-            let tls = tls_connect(io, tls_sni, tls_insecure).await?;
+            let tls = tls_connect(io, tls_sni, tls_insecure, super::tls_client::TlsAlpn::Http11).await?;
             ws_handshake_and_relay(
                 ctx, tls, upgrade_req, is_h2_ws,
                 strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to,
@@ -516,7 +516,7 @@ where IO: AsyncRead + Unpin {
 }
 
 /// 读取上游 HTTP 响应头，返回（状态码，头列表）
-async fn read_upstream_headers<IO>(io: &mut IO) -> Result<(u16, Vec<(String, String)>, Option<Bytes>)>
+pub(crate) async fn read_upstream_headers<IO>(io: &mut IO) -> Result<(u16, Vec<(String, String)>, Option<Bytes>)>
 where IO: AsyncReadExt + Unpin {
     // 16 KiB：容纳较大的 Set-Cookie / 扩展协商头
     let mut buf = vec![0u8; 16384];

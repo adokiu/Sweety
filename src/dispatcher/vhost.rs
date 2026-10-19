@@ -13,6 +13,7 @@ use crate::dispatcher::rewrite::CompiledRewrite;
 use crate::handler::reverse_proxy::lb::UpstreamPool;
 use crate::middleware::access_log::AccessLogger;
 use crate::middleware::proxy_cache::ProxyCache;
+use crate::middleware::rate_limit::SiteRateLimiter;
 
 /// 运行时站点信息（从 SiteConfig 提取，去掉不需要运行时使用的字段）
 ///
@@ -75,6 +76,8 @@ pub struct SiteInfo {
     pub proxy_cache_arc: Option<Arc<ProxyCache>>,
     /// FastCGI 响应缓存（直接持有，避免每请求 HashMap 查找）
     pub fcgi_cache_arc: Option<Arc<ProxyCache>>,
+    /// 站点限流（配置 `[sites.rate_limit]` 时构建）
+    pub rate_limiter: Option<Arc<SiteRateLimiter>>,
 }
 
 impl SiteInfo {
@@ -145,6 +148,9 @@ impl SiteInfo {
             access_logger: None,
             proxy_cache_arc: None,
             fcgi_cache_arc: None,
+            rate_limiter: cfg.rate_limit.as_ref().map(|rl| {
+                Arc::new(SiteRateLimiter::from_rules(rl.rules.clone()))
+            }),
         }
     }
 }

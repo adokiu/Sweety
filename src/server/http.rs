@@ -113,15 +113,7 @@ impl SweetyServer {
             let fcgi_cache_arc: Option<Arc<ProxyCache>> = site.fastcgi.as_ref()
                 .and_then(|fcgi| fcgi.cache.as_ref())
                 .map(|cache_cfg| {
-                    let proxy_cfg = crate::config::model::ProxyCacheConfig {
-                        path: cache_cfg.path.clone(),
-                        max_entries: cache_cfg.max_entries,
-                        ttl: cache_cfg.ttl,
-                        cacheable_statuses: cache_cfg.cacheable_statuses.clone(),
-                        cacheable_methods: cache_cfg.cacheable_methods.clone(),
-                        bypass_headers: cache_cfg.bypass_headers.clone(),
-                        ignore_headers: cache_cfg.ignore_headers.clone(),
-                    };
+                    let proxy_cfg = crate::config::model::ProxyCacheConfig::from_fcgi(cache_cfg);
                     info!("站点 '{}' FastCGI 缓存已开启（max_entries={}, ttl={}s)",
                         site.name, cache_cfg.max_entries, cache_cfg.ttl);
                     ProxyCache::from_config(&proxy_cfg)
@@ -132,6 +124,20 @@ impl SweetyServer {
                 .map(|cache_cfg| {
                     info!("站点 '{}' 反代缓存已开启（max_entries={}, ttl={}s）",
                         site.name, cache_cfg.max_entries, cache_cfg.ttl);
+                    if cache_cfg.cache_require_buffering {
+                        for loc in &site.locations {
+                            if loc.handler == crate::config::model::HandlerType::ReverseProxy
+                                && !loc.proxy_buffering
+                            {
+                                tracing::warn!(
+                                    "站点 '{}' location '{}'：proxy_buffering=false 与 proxy_cache 同时开启；\
+                                     已强制缓冲响应体以写入缓存（cache_require_buffering=true）",
+                                    site.name,
+                                    loc.path
+                                );
+                            }
+                        }
+                    }
                     ProxyCache::from_config(cache_cfg)
                 });
 

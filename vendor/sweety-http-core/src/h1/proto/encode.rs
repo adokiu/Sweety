@@ -7,8 +7,9 @@ use crate::{
     date::DateTime,
     http::{
         StatusCode, Version,
-        header::{CONNECTION, CONTENT_LENGTH, DATE, HeaderMap, SET_COOKIE, TE, TRANSFER_ENCODING, UPGRADE},
+        header::{CONNECTION, CONTENT_LENGTH, DATE, HeaderMap, HeaderValue, SET_COOKIE, TE, TRAILER, TRANSFER_ENCODING, UPGRADE},
         response::Parts,
+        take_staged_trailers,
     },
 };
 
@@ -43,6 +44,8 @@ where
             ..
         } = parts;
 
+        let staged_trailers = take_staged_trailers(&mut headers);
+
         // decide if content-length or transfer-encoding header would be skipped.
         let skip_ct_te = match status {
             StatusCode::SWITCHING_PROTOCOLS => true,
@@ -76,6 +79,21 @@ where
         if self.is_http10() {
             headers.remove(TRANSFER_ENCODING);
         }
+        if let Some(ref t) = staged_trailers {
+            if !t.is_empty() && !self.is_http10() {
+                let list = t
+                    .keys()
+                    .map(|k| k.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if let Ok(v) = HeaderValue::from_str(&list) {
+                    headers.insert(TRAILER, v);
+                }
+            }
+        }
+        self.set_chunk_trailers(
+            staged_trailers.filter(|m| !m.is_empty() && !self.is_http10()),
+        );
 
         // encode version, status code and reason
         encode_version_status_reason(buf, version, status);
@@ -101,6 +119,31 @@ where
             self.replace_extensions(extensions);
         })
     }
+}
+
+/// 编码 1xx 中间响应（如 103 Early Hints），无 body
+pub(crate) fn encode_informational_response<D: DateTime>(
+    date: &D,
+    status: StatusCode,
+    mut headers: HeaderMap,
+    buf: &mut BytesMut,
+) -> Result<(), ProtoError> {
+    use crate::http::proxy_ext::strip_connection_headers;
+    if !headers.contains_key(DATE) {
+        if let Ok(v) = date.with_date(HeaderValue::from_bytes) {
+            headers.insert(DATE, v);
+        }
+    }
+    strip_connection_headers(&mut headers);
+    encode_version_status_reason(buf, Version::HTTP_11, status);
+    for (name, value) in headers.iter() {
+        buf.extend_from_slice(b"\r\n");
+        buf.extend_from_slice(name.as_str().as_bytes());
+        buf.extend_from_slice(b": ");
+        buf.extend_from_slice(value.as_bytes());
+    }
+    buf.extend_from_slice(b"\r\n\r\n");
+    Ok(())
 }
 
 #[inline]
@@ -328,7 +371,7 @@ mod test {
                 assert!(encoder.is_upgrade());
                 buf.clear();
                 encoder.encode(Bytes::from_static(b"raw"), &mut buf);
-                encoder.encode_eof(&mut buf);
+                encoder.encode_eof(&mut buf, None);
                 assert_eq!(&buf[..], b"raw");
             } else {
                 assert!(matches!(encoder, TransferCoding::Eof));
@@ -365,7 +408,7 @@ mod test {
             assert!(!std::str::from_utf8(&buf).unwrap().contains("transfer-encoding:"));
             buf.clear();
             encoder.encode(Bytes::from_static(b"raw"), &mut buf);
-            encoder.encode_eof(&mut buf);
+            encoder.encode_eof(&mut buf, None);
             assert_eq!(&buf[..], b"raw");
         }
     }

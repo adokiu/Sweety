@@ -40,6 +40,8 @@ pub async fn handle_sweety(
 ) -> WebResponse {
     use crate::middleware::proxy_cache::CacheKey;
 
+    let client_version = ctx.req().version();
+
     // ── FastCGI 缓存查询 ────────────────────────────────────────────────
     let fcgi_cache = site.fcgi_cache_arc.clone();
     let method_str = ctx.req().method().as_str();
@@ -50,36 +52,21 @@ pub async fn handle_sweety(
         .unwrap_or_default();
     let host_str = host_str_owned.as_str();
 
+    let cache_key = CacheKey::new(method_str, host_str, req_path);
+    let mut fcgi_origin_revalidate: Option<crate::middleware::proxy_cache::CacheEntry> = None;
     if let Some(cache) = &fcgi_cache {
-        // \u76f4\u63a5\u4f20 HeaderMap\uff0c\u8df3\u8fc7\u4e2d\u95f4 Vec \u5806\u5206\u914d
         if cache.should_lookup(method_str, ctx.req().headers()) {
-            let key = CacheKey::new(method_str, host_str, req_path);
-            if let Some(entry) = cache.get(&key) {
-                // 命中：直接返回缓存响应
-                use sweety_web::http::header::HeaderName;
-                let mut resp = WebResponse::new(
-                    sweety_web::body::ResponseBody::from(entry.body.to_vec())
-                );
-                *resp.status_mut() = StatusCode::from_u16(entry.status).unwrap_or(StatusCode::OK);
-                for (k, v) in &entry.headers {
-                    if let (Ok(name), Ok(val)) = (
-                        HeaderName::from_bytes(k.as_bytes()),
-                        HeaderValue::from_bytes(v.as_bytes()),
-                    ) {
-                        resp.headers_mut().append(name, val);
-                    }
+            use crate::middleware::proxy_cache::{plan_cache, CachePlan};
+            match plan_cache(cache, method_str, &cache_key, ctx.req().headers()) {
+                CachePlan::Serve { mut response, .. } => {
+                    crate::handler::reverse_proxy::response::append_gateway_via(
+                        &mut response,
+                        client_version,
+                    );
+                    return response;
                 }
-                // X-Cache / X-Cache-Status 是业界通用的缓存状态头
-                // WordPress 健康检查、Varnish、Nginx 缓存均使用此头
-                resp.headers_mut().insert(
-                    sweety_web::http::header::HeaderName::from_static("x-cache"),
-                    HeaderValue::from_static("HIT"),
-                );
-                resp.headers_mut().insert(
-                    sweety_web::http::header::HeaderName::from_static("x-cache-status"),
-                    HeaderValue::from_static("HIT"),
-                );
-                return resp;
+                CachePlan::OriginRevalidate(e) => fcgi_origin_revalidate = Some(e),
+                CachePlan::Forward => {}
             }
         }
     }
@@ -130,7 +117,7 @@ pub async fn handle_sweety(
     // ── 站点 root ─────────────────────────────────────────────────────────
     let root = match location.root.as_ref().or(site.root.as_ref()) {
         Some(r) => r.to_string_lossy().into_owned(),
-        None => return fcgi_error(StatusCode::INTERNAL_SERVER_ERROR, "FastCGI: 未配置 root 目录"),
+        None => return fcgi_error(StatusCode::INTERNAL_SERVER_ERROR, "FastCGI: 未配置 root 目录", client_version),
     };
 
     // ── SCRIPT_FILENAME / SCRIPT_NAME / PATH_INFO ────────────────────────
@@ -146,6 +133,11 @@ pub async fn handle_sweety(
         (format!("{}{}", root.trim_end_matches('/'), sname), sname.to_string(), pinfo.to_string())
     };
 
+    sweety_web::http::notify_expect_continue(
+        ctx.req().headers(),
+        ctx.req().body().informational_sink(),
+    );
+
     // ── 请求体 ────────────────────────────────────────────────────────────
     let max_body = (ctx.state().cfg.load().global.client_max_body_size as u64) * 1024 * 1024;
     let content_length = ctx.req().headers()
@@ -154,7 +146,7 @@ pub async fn handle_sweety(
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
     if content_length > max_body && max_body > 0 {
-        return fcgi_error(StatusCode::PAYLOAD_TOO_LARGE, "请求体超过 client_max_body_size 限制");
+        return fcgi_error(StatusCode::PAYLOAD_TOO_LARGE, "请求体超过 client_max_body_size 限制", client_version);
     }
     let content_type = ctx.req().headers()
         .get(sweety_web::http::header::CONTENT_TYPE)
@@ -259,6 +251,33 @@ pub async fn handle_sweety(
         params.push((key, v));
     }
 
+    if let Some(ref entry) = fcgi_origin_revalidate {
+        params.retain(|(k, _)| {
+            let u = k.to_ascii_uppercase();
+            !matches!(
+                u.as_str(),
+                "HTTP_IF_NONE_MATCH"
+                    | "HTTP_IF_MODIFIED_SINCE"
+                    | "HTTP_IF_MATCH"
+                    | "HTTP_IF_UNMODIFIED_SINCE"
+            )
+        });
+        let mut cond = Vec::new();
+        crate::middleware::proxy_cache::inject_revalidation_request_headers(entry, &mut cond);
+        for (k, v) in cond {
+            let mut key = String::with_capacity(5 + k.len());
+            key.push_str("HTTP_");
+            for c in k.chars() {
+                if c == '-' {
+                    key.push('_');
+                } else {
+                    key.extend(c.to_uppercase());
+                }
+            }
+            params.push((key, v));
+        }
+    }
+
     // ── 发送 FastCGI 请求（连接池 + 超时控制）─────────────────────────────
     let pool      = ctx.state().fcgi_pool.clone();
     let read_tmo  = std::time::Duration::from_secs(pool.read_timeout_secs);
@@ -267,10 +286,8 @@ pub async fn handle_sweety(
         FcgiAddr::Tcp(p)  => (p.clone(), false),
     };
 
-    // 缓存键：与删除查询时一致
-    let cache_key = fcgi_cache.as_ref().map(|_| {
-        crate::middleware::proxy_cache::CacheKey::new(method_str, host_str, req_path)
-    });
+    let cache_vary_headers = ctx.req().headers().clone();
+    let cache_key_for_store = fcgi_cache.as_ref().map(|_| cache_key.clone());
 
     // FastCGI I/O 是异步的：等待 PHP-FPM 响应时 tokio 会让出 worker 给其他请求
     // 慢 PHP 请求不会"占死" worker，只是 task 在等待，其他 task 正常调度
@@ -283,7 +300,17 @@ pub async fn handle_sweety(
             Ok(c) => c,
             Err(e) => {
                 tracing::error!("FastCGI 连接失败 {}: {}", addr_str, e);
-                return fcgi_error(StatusCode::BAD_GATEWAY, "PHP-FPM 连接失败");
+                if let Some(resp) = try_fcgi_stale_error_response(
+                    &fcgi_cache,
+                    method_str,
+                    &cache_key,
+                    ctx.req().headers(),
+                    502,
+                    client_version,
+                ) {
+                    return resp;
+                }
+                return fcgi_error(StatusCode::BAD_GATEWAY, "PHP-FPM 连接失败", client_version);
             }
         };
 
@@ -296,18 +323,58 @@ pub async fn handle_sweety(
             Ok(Ok(parsed)) => {
                 match tokio::time::timeout(
                     read_tmo,
-                    build_streaming_response(parsed, pool.clone(), addr_str, fcgi_cache.clone(), cache_key.clone()),
+                    build_streaming_response(
+                        parsed,
+                        pool.clone(),
+                        addr_str,
+                        method_str,
+                        fcgi_cache.clone(),
+                        cache_key_for_store.clone(),
+                        cache_vary_headers.clone(),
+                    ),
                 ).await {
-                    Ok(resp) => {
+                    Ok(mut resp) => {
+                        if let Some(entry) = fcgi_origin_revalidate {
+                            use crate::middleware::proxy_cache::{
+                                build_cache_hit_response, decorate_cache_hit_response,
+                                origin_revalidate_same_entity, CacheHitAction,
+                            };
+                            if let Some(ref cache) = fcgi_cache {
+                                if resp.status() == StatusCode::NOT_MODIFIED {
+                                    cache.apply_origin_not_modified(&cache_key, &entry, resp.headers());
+                                    resp = decorate_cache_hit_response(
+                                        build_cache_hit_response(
+                                            method_str,
+                                            CacheHitAction::NotModified(entry),
+                                        ),
+                                        true,
+                                        cache,
+                                        None,
+                                    );
+                                } else if resp.status().is_success()
+                                    && origin_revalidate_same_entity(&entry, resp.headers())
+                                {
+                                    cache.apply_origin_not_modified(&cache_key, &entry, resp.headers());
+                                    resp = decorate_cache_hit_response(
+                                        build_cache_hit_response(method_str, CacheHitAction::Respond(entry)),
+                                        true,
+                                        cache,
+                                        None,
+                                    );
+                                }
+                            }
+                        }
                         let global_cfg = ctx.state().cfg.load();
                         let (gz_en, gz_lv, br_en, br_lv, zst_en, zst_lv) =
                             crate::handler::compress::effective_compress(site, &global_cfg.global);
-                        return crate::handler::compress::compress_response(
+                        let mut out = crate::handler::compress::compress_response(
                             resp, ctx.req().headers(),
                             gz_en, gz_lv, br_en, br_lv, zst_en, zst_lv,
                         );
+                        crate::handler::reverse_proxy::response::append_gateway_via(&mut out, client_version);
+                        return out;
                     }
-                    Err(_) => return fcgi_error(StatusCode::GATEWAY_TIMEOUT, "PHP-FPM body 读取超时"),
+                    Err(_) => return fcgi_error(StatusCode::GATEWAY_TIMEOUT, "PHP-FPM body 读取超时", client_version),
                 }
             }
             Ok(Err(e)) if attempt == 0 => {
@@ -316,16 +383,36 @@ pub async fn handle_sweety(
             }
             Ok(Err(e)) => {
                 tracing::error!("FastCGI 请求失败 {}: {}", addr_str, e);
-                return fcgi_error(StatusCode::BAD_GATEWAY, &format!("PHP-FPM 响应失败: {}", e));
+                if let Some(resp) = try_fcgi_stale_error_response(
+                    &fcgi_cache,
+                    method_str,
+                    &cache_key,
+                    ctx.req().headers(),
+                    502,
+                    client_version,
+                ) {
+                    return resp;
+                }
+                return fcgi_error(StatusCode::BAD_GATEWAY, &format!("PHP-FPM 响应失败: {}", e), client_version);
             }
             Err(_) => {
                 tracing::error!("FastCGI 读超时 {}s {}", pool.read_timeout_secs, addr_str);
-                return fcgi_error(StatusCode::GATEWAY_TIMEOUT, "PHP-FPM 响应超时");
+                if let Some(resp) = try_fcgi_stale_error_response(
+                    &fcgi_cache,
+                    method_str,
+                    &cache_key,
+                    ctx.req().headers(),
+                    504,
+                    client_version,
+                ) {
+                    return resp;
+                }
+                return fcgi_error(StatusCode::GATEWAY_TIMEOUT, "PHP-FPM 响应超时", client_version);
             }
         }
     }
 
-    fcgi_error(StatusCode::BAD_GATEWAY, "PHP-FPM 不可用")
+    fcgi_error(StatusCode::BAD_GATEWAY, "PHP-FPM 不可用", client_version)
 }
 
 /// FastCGI 后端地址枚举（Unix socket 或 TCP）
@@ -354,12 +441,33 @@ fn split_script_path(path: &str) -> (&str, &str) {
     ("/index.php", path)
 }
 
+fn try_fcgi_stale_error_response(
+    cache: &Option<std::sync::Arc<crate::middleware::proxy_cache::ProxyCache>>,
+    method: &str,
+    key: &crate::middleware::proxy_cache::CacheKey,
+    req_headers: &sweety_web::http::HeaderMap,
+    upstream_status: u16,
+    client_version: sweety_web::http::Version,
+) -> Option<WebResponse> {
+    let cache = cache.as_ref()?;
+    let mut stale = crate::middleware::proxy_cache::try_stale_error_serve(
+        cache,
+        method,
+        key,
+        req_headers,
+        upstream_status,
+    )?;
+    crate::handler::reverse_proxy::response::append_gateway_via(&mut stale, client_version);
+    Some(stale)
+}
+
 /// 构造 FastCGI 错误响应
-fn fcgi_error(status: StatusCode, msg: &str) -> WebResponse {
+fn fcgi_error(status: StatusCode, msg: &str, client_version: sweety_web::http::Version) -> WebResponse {
     tracing::warn!("FastCGI 错误 {}: {}", status.as_u16(), msg);
     let body = crate::handler::error_page::build_default_html(status.as_u16());
     let mut resp = WebResponse::new(ResponseBody::from(body));
     *resp.status_mut() = status;
     resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+    crate::handler::reverse_proxy::response::append_gateway_via(&mut resp, client_version);
     resp
 }

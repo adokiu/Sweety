@@ -1,4 +1,4 @@
-﻿use core::{
+use core::{
     cmp, fmt,
     future::{Future, poll_fn},
     marker::PhantomData,
@@ -27,8 +27,10 @@ use crate::{
     date::{DateTime, DateTimeHandle},
     h2::{body::RequestBody, error::Error},
     http::{
-        Extension, Method, Request, RequestExt, Response, StatusCode, Version,
+        Extension, InformationalResponse, InformationalSink, Method, Request, RequestExt,
+        Response, StatusCode, Version,
         header::{CONNECTION, CONTENT_LENGTH, DATE, HeaderMap, HeaderName, HeaderValue, TRAILER},
+        proxy_ext::{TrailersAfterBody, take_deferred_trailers},
     },
     util::timer::KeepAlive,
 };
@@ -77,7 +79,7 @@ where
 
     async fn run_handler(
         req: Request<::h2::RecvStream>,
-        respond: ::h2::server::SendResponse<Bytes>,
+        mut respond: ::h2::server::SendResponse<Bytes>,
         service: Arc<S>,
         date: Rc<DateTimeHandle>,
         addr: SocketAddr,
@@ -91,17 +93,32 @@ where
             .map(|p| p.as_str().eq_ignore_ascii_case("websocket"))
             .unwrap_or(false);
         let is_head = req.method() == Method::HEAD;
+        let (info_tx, mut info_rx) = InformationalSink::pair();
         let req = req.map(|body| {
             let ext = if is_h2_ws {
                 Extension::new_h2_ws(addr, is_tls)
             } else {
                 Extension::new(addr, is_tls)
             };
-            RequestExt::from_parts(RequestBody::from(body).into(), ext)
+            let mut req_ext = RequestExt::from_parts(RequestBody::from(body).into(), ext);
+            req_ext.set_informational_sink(info_tx);
+            req_ext
         });
-        let resp = match service.call(req).await {
-            Ok(r) => r,
-            Err(e) => { trace!("h2 service error: {:?}", e); return Ok(true); }
+        let mut service_fut = pin!(service.call(req));
+        let resp = loop {
+            tokio::select! {
+                Some(info) = info_rx.recv() => {
+                    if send_h2_informational(&mut respond, &date, info).await.is_err() {
+                        return Ok(true);
+                    }
+                }
+                res = &mut service_fut => {
+                    break match res {
+                        Ok(r) => r,
+                        Err(e) => { trace!("h2 service error: {:?}", e); return Ok(true); }
+                    };
+                }
+            }
         };
         h2_handler(resp, respond, &date, raw_fd, is_head).await
     }
@@ -307,6 +324,40 @@ fn prepare_response_body(res: &mut Response<()>, body_size: BodySize, is_head: b
     }
 }
 
+async fn merge_deferred_trailers(
+    mut trailers: Option<HeaderMap>,
+    deferred: Option<TrailersAfterBody>,
+) -> Option<HeaderMap> {
+    if let Some(d) = deferred {
+        if let Some(extra) = take_deferred_trailers(&d).await {
+            trailers
+                .get_or_insert_with(HeaderMap::new)
+                .extend(extra);
+        }
+    }
+    trailers
+}
+
+async fn send_h2_informational(
+    respond: &mut SendResponse<Bytes>,
+    date: &DateTimeHandle,
+    info: InformationalResponse,
+) -> Result<(), ()> {
+    let mut res = Response::builder()
+        .status(info.status)
+        .version(Version::HTTP_2)
+        .body(())
+        .map_err(|_| ())?;
+    *res.headers_mut() = info.headers;
+    if !res.headers().contains_key(DATE) {
+        let d = date.with_date(HeaderValue::from_bytes).map_err(|_| ())?;
+        res.headers_mut().insert(DATE, d);
+    }
+    strip_connection_headers(res.headers_mut());
+    respond.send_response(res, false).map_err(|_| ())?;
+    Ok(())
+}
+
 async fn h2_handler<B, BE>(
     resp: Response<B>,
     mut respond: SendResponse<Bytes>,
@@ -318,6 +369,7 @@ where
     B: Stream<Item = Result<Bytes, BE>>,
     BE: fmt::Debug,
 {
+    let deferred_trailers = resp.extensions().get::<TrailersAfterBody>().cloned();
     let (res, body) = resp.into_parts();
     let mut res = Response::from_parts(res, ());
     *res.version_mut() = Version::HTTP_2;
@@ -337,7 +389,15 @@ where
     // 无 body
     if is_eof {
         set_tcp_cork(raw_fd, true);
-        send_result(respond.send_response(res, true), raw_fd)?;
+        let merged = merge_deferred_trailers(trailers, deferred_trailers).await;
+        if merged.is_some() {
+            let mut stream = send_result(respond.send_response(res, false), raw_fd)?;
+            if let Some(t) = merged {
+                send_result(stream.send_trailers(t), raw_fd)?;
+            }
+        } else {
+            send_result(respond.send_response(res, true), raw_fd)?;
+        }
         set_tcp_cork(raw_fd, false);
         return Ok(keep_alive);
     }
@@ -416,12 +476,23 @@ where
                     return Err(());
                 }
             };
-            let has_trailers = trailers.is_some();
             set_tcp_cork(raw_fd, true);
             match data {
-                None => { send_result(respond.send_response(res, true), raw_fd)?; }
+                None => {
+                    let merged_trailers = merge_deferred_trailers(trailers, deferred_trailers.clone()).await;
+                    if merged_trailers.is_some() {
+                        let mut stream = send_result(respond.send_response(res, false), raw_fd)?;
+                        if let Some(t) = merged_trailers {
+                            send_result(stream.send_trailers(t), raw_fd)?;
+                        }
+                    } else {
+                        send_result(respond.send_response(res, true), raw_fd)?;
+                    }
+                }
                 Some(data) => match respond.send_response(res, false) {
                     Ok(mut stream) => {
+                        let merged_trailers = merge_deferred_trailers(trailers, deferred_trailers.clone()).await;
+                        let has_trailers = merged_trailers.is_some();
                         // 先申请容量：初始流控窗口仅 65535，直接 send_data 超过窗口会被丢弃导致 EOF
                         let total = data.len();
                         stream.reserve_capacity(total);
@@ -456,7 +527,9 @@ where
                             }
                             // 分块完成后不再需要重新 CORK（后续直接 UNCORK）
                         }
-                        if let Some(t) = trailers { send_result(stream.send_trailers(t), raw_fd)?; }
+                        if let Some(t) = merged_trailers {
+                            send_result(stream.send_trailers(t), raw_fd)?;
+                        }
                     }
                     Err(e) => return send_result(Err(e), raw_fd),
                 }
@@ -531,7 +604,7 @@ where
         }
     }
 
-    if let Some(t) = trailers {
+    if let Some(t) = merge_deferred_trailers(trailers, deferred_trailers).await {
         send_result(stream.send_trailers(t), raw_fd)?;
     } else {
         send_result(stream.send_data(Bytes::new(), true), raw_fd)?;

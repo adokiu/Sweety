@@ -8,9 +8,14 @@
 
 use std::sync::Arc;
 
+use std::collections::HashMap;
+
 use sweety_web::{
     body::ResponseBody,
-    http::{StatusCode, WebResponse, header::{CONTENT_TYPE, LOCATION, HeaderValue}},
+    http::{
+        Method, StatusCode, WebResponse,
+        header::{CONTENT_TYPE, LOCATION, RETRY_AFTER, HeaderValue},
+    },
     WebContext,
 };
 
@@ -43,6 +48,17 @@ pub(super) async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebRes
 
     state.metrics.inc_requests();
     let _req_guard = RequestGuard(state.metrics.clone());
+
+    let global = state.cfg.load().global.clone();
+    let method = ctx.req().method();
+    if *method == Method::TRACE && global.disable_http_trace {
+        state.metrics.record_status(405);
+        return make_method_not_allowed();
+    }
+    if *method == Method::CONNECT && !ctx.req().body().is_h2_ws() && !global.allow_http_connect_tunnel {
+        state.metrics.record_status(405);
+        return make_method_not_allowed();
+    }
 
     // ACME HTTP-01 challenge 响应（优先于所有站点匹配）
     {
@@ -115,6 +131,27 @@ pub(super) async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebRes
     } else {
         conn_ip
     };
+
+    if let Some(ref limiter) = site.rate_limiter {
+        let ua = ctx
+            .req()
+            .headers()
+            .get(sweety_web::http::header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let hdr_map: HashMap<String, String> = ctx
+            .req()
+            .headers()
+            .iter()
+            .filter_map(|(k, v)| v.to_str().ok().map(|vs| (k.as_str().to_string(), vs.to_string())))
+            .collect();
+        if let crate::middleware::rate_limit::RateLimitResult::Deny { retry_after_secs } =
+            limiter.check_all(&effective_client_ip.to_string(), path, &hdr_map, ua)
+        {
+            state.metrics.record_status(429);
+            return make_rate_limited_resp(retry_after_secs);
+        }
+    }
 
     // force_https 重定向（启用 ACME 但尚无有效证书时跳过，避免阻塞首次申请）
     let acme_cert_ready = !site.acme || crate::server::tls::ACME_CERTS_READY.contains(&site.name);
@@ -452,11 +489,29 @@ pub(super) async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebRes
 
 /// 构造 HTML 错误响应（不依赖 ctx）
 #[inline(always)]
+fn make_method_not_allowed() -> WebResponse {
+    let mut resp = make_error_resp(StatusCode::METHOD_NOT_ALLOWED);
+    crate::handler::reverse_proxy::response::attach_standard_allow(&mut resp);
+    resp
+}
+
+fn make_rate_limited_resp(retry_after_secs: u64) -> WebResponse {
+    let mut resp = make_error_resp(StatusCode::TOO_MANY_REQUESTS);
+    if let Ok(v) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+        resp.headers_mut().insert(RETRY_AFTER, v);
+    }
+    resp
+}
+
 pub(crate) fn make_error_resp(status: StatusCode) -> WebResponse {
     let body = crate::handler::error_page::get_error_bytes(status.as_u16());
     let mut resp = WebResponse::new(ResponseBody::from(body));
     *resp.status_mut() = status;
     resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+    if status == StatusCode::METHOD_NOT_ALLOWED {
+        crate::handler::reverse_proxy::response::attach_standard_allow(&mut resp);
+    }
+    crate::handler::reverse_proxy::response::attach_http_date(&mut resp);
     resp
 }
 

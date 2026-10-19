@@ -10,6 +10,8 @@ pub struct Context<'a, D, const HEADER_LIMIT: usize> {
     header: Option<HeaderMap>,
     // http extensions reused by next request.
     exts: Extensions,
+    /// H1 chunked 响应尾（由 encode_head 从 `Trailer:` 拆出，EOF 时写出）
+    chunk_trailers: Option<HeaderMap>,
     date: &'a D,
 }
 
@@ -74,6 +76,7 @@ impl<'a, D, const HEADER_LIMIT: usize> Context<'a, D, HEADER_LIMIT> {
             state,
             header: None,
             exts: Extensions::new(),
+            chunk_trailers: None,
             date,
         }
     }
@@ -118,6 +121,17 @@ impl<'a, D, const HEADER_LIMIT: usize> Context<'a, D, HEADER_LIMIT> {
     pub fn reset(&mut self) {
         let keep = self.state.0 & ContextState::IS_TLS;
         self.state = ContextState(keep);
+        self.chunk_trailers = None;
+    }
+
+    #[inline]
+    pub fn set_chunk_trailers(&mut self, trailers: Option<HeaderMap>) {
+        self.chunk_trailers = trailers;
+    }
+
+    #[inline]
+    pub fn take_chunk_trailers(&mut self) -> Option<HeaderMap> {
+        self.chunk_trailers.take()
     }
 
     /// Set Context's state to EXPECT header received.

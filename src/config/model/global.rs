@@ -156,6 +156,18 @@ pub struct GlobalConfig {
     #[serde(default = "default_upstream_max_response_header_kb")]
     pub upstream_max_response_header_kb: usize,
 
+    /// 拒绝 TRACE（默认 true，RFC 7231 安全实践）
+    #[serde(default = "default_true")]
+    pub disable_http_trace: bool,
+
+    /// 允许非 extended CONNECT 的 HTTP/1 隧道（默认 false；WebSocket 用 RFC 8441/9220 不受影响）
+    #[serde(default)]
+    pub allow_http_connect_tunnel: bool,
+
+    /// 静态文件多 Range 时返回 multipart/byteranges（默认 false，RFC 9110 允许忽略多区间）
+    #[serde(default)]
+    pub static_multipart_byteranges: bool,
+
 }
 
 impl Default for GlobalConfig {
@@ -192,6 +204,9 @@ impl Default for GlobalConfig {
             h3_max_requests_per_conn: default_h3_max_requests_per_conn(),
             upstream_max_response_headers: default_upstream_max_response_headers(),
             upstream_max_response_header_kb: default_upstream_max_response_header_kb(),
+            disable_http_trace: true,
+            allow_http_connect_tunnel: false,
+            static_multipart_byteranges: false,
         }
     }
 }

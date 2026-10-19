@@ -182,7 +182,7 @@ where
             } else {
                 let body = Body::new(
                     self.io.clone(),
-                    self.ctx.is_expect_header(),
+                    false,
                     R_LIMIT,
                     decoder,
                     mem::take(&mut self.read_buf),
@@ -225,7 +225,7 @@ where
                             }
                         }
                         SelectOutput::A(Some(Err(e))) => return self.on_body_error(e).await,
-                        SelectOutput::A(None) => break encoder.encode_eof(buf),
+                        SelectOutput::A(None) => break encoder.encode_eof(buf, None),
                         SelectOutput::B(_) => {}
                     }
 

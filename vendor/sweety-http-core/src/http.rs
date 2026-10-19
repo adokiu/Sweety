@@ -1,6 +1,13 @@
-﻿//! re-export of [http] crate types.
+//! re-export of [http] crate types.
 
 pub use ::http::*;
+
+pub mod proxy_ext;
+pub use proxy_ext::{
+    InformationalResponse, InformationalSink, TrailersAfterBody, header_map_from_pairs,
+    complete_deferred_trailers, notify_expect_continue, stage_trailers_on_headers,
+    strip_connection_headers, take_deferred_trailers, take_staged_trailers,
+};
 
 use core::{
     borrow::{Borrow, BorrowMut},
@@ -151,6 +158,7 @@ impl Extension {
             addr,
             h2_ws: false,
             is_tls,
+            info_sink: None,
             #[cfg(feature = "router")]
             params: Default::default(),
         }))
@@ -162,6 +170,7 @@ impl Extension {
             addr,
             h2_ws: true,
             is_tls,
+            info_sink: None,
             #[cfg(feature = "router")]
             params: Default::default(),
         }))
@@ -175,6 +184,8 @@ struct _Extension {
     pub h2_ws: bool,
     /// 当前连接是否为 TLS（HTTPS/WSS），用于 force_https 等需要区分协议的场景
     pub is_tls: bool,
+    /// 反代转发上游 1xx 时使用（由协议 dispatcher 注入 receiver 端）
+    info_sink: Option<InformationalSink>,
     #[cfg(feature = "router")]
     params: Params,
 }
@@ -200,6 +211,18 @@ impl<B> RequestExt<B> {
     #[inline]
     pub fn is_tls(&self) -> bool {
         self.ext.0.is_tls
+    }
+
+    /// 注入 1xx 转发 sink（协议栈在 dispatch 时调用）
+    #[inline]
+    pub fn set_informational_sink(&mut self, sink: InformationalSink) {
+        self.ext.0.info_sink = Some(sink);
+    }
+
+    /// 反代读取上游 1xx 时转发给客户端
+    #[inline]
+    pub fn informational_sink(&self) -> Option<&InformationalSink> {
+        self.ext.0.info_sink.as_ref()
     }
 
     /// retrieve remote peer's socket address.

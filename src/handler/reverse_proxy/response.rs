@@ -1,13 +1,34 @@
-﻿//! 响应处理模块
+//! 响应处理模块
 //! 负责：响应头透传（跳过 hop-by-hop）、Set-Cookie 改写、Location 重写、proxy_error
+
+use std::time::SystemTime;
 
 use sweety_web::{
     body::ResponseBody,
     http::{
         StatusCode, Version, WebResponse,
-        header::{CONTENT_TYPE, HeaderValue, VIA},
+        header::{ALLOW, CONTENT_TYPE, DATE, HeaderName, HeaderValue, VIA},
+        stage_trailers_on_headers,
     },
 };
+
+/// RFC 9110 §6.6.1：错误响应携带当前 Date
+pub fn attach_http_date(resp: &mut WebResponse) {
+    if resp.headers().contains_key(DATE) {
+        return;
+    }
+    if let Ok(v) = HeaderValue::from_str(&httpdate::fmt_http_date(SystemTime::now())) {
+        resp.headers_mut().insert(DATE, v);
+    }
+}
+
+/// RFC 9110 §15.5.6：405 应声明本网关支持的方法
+pub const STANDARD_HTTP_ALLOW: &str = "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS";
+
+pub fn attach_standard_allow(resp: &mut WebResponse) {
+    resp.headers_mut()
+        .insert(ALLOW, HeaderValue::from_static(STANDARD_HTTP_ALLOW));
+}
 
 /// 编译期 hop-by-hop 头完美哈希表（全小写 key，O(1) 查找）
 static HOP_BY_HOP_SET: phf::Set<&'static str> = phf::phf_set! {
@@ -246,6 +267,33 @@ pub fn parse_status_code(status_line: &str) -> u16 {
         .unwrap_or(502)
 }
 
+/// 将上游 chunked trailer 或 gRPC 尾部头挂到响应（H2/H3 由栈拆成 TRAILERS 帧）
+pub fn apply_upstream_trailers(resp: &mut WebResponse, pairs: &[(String, String)]) {
+    if pairs.is_empty() {
+        return;
+    }
+    stage_trailers_on_headers(resp.headers_mut(), pairs);
+}
+
+/// gRPC：把误放在响应头里的 grpc-* 挪到 trailer（HTTP/2 规范要求）
+pub fn promote_grpc_headers_to_trailers(resp: &mut WebResponse) {
+    let ct = resp.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    if !ct.contains("application/grpc") {
+        return;
+    }
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for name in ["grpc-status", "grpc-message", "grpc-status-details-bin"] {
+        if let Some(v) = resp.headers().get(name).and_then(|v| v.to_str().ok()) {
+            pairs.push((name.to_string(), v.to_string()));
+            resp.headers_mut().remove(HeaderName::from_static(name));
+        }
+    }
+    if pairs.is_empty() {
+        pairs.push(("grpc-status".to_string(), "0".to_string()));
+    }
+    apply_upstream_trailers(resp, &pairs);
+}
+
 /// 构造 HTML 错误响应（含网关 Via）
 pub fn proxy_error(status: StatusCode, _msg: &str, client_version: Version) -> WebResponse {
     let body = crate::handler::error_page::build_default_html(status.as_u16());
@@ -255,6 +303,10 @@ pub fn proxy_error(status: StatusCode, _msg: &str, client_version: Version) -> W
         CONTENT_TYPE,
         HeaderValue::from_static("text/html; charset=utf-8"),
     );
+    if status == StatusCode::METHOD_NOT_ALLOWED {
+        attach_standard_allow(&mut resp);
+    }
+    attach_http_date(&mut resp);
     append_gateway_via(&mut resp, client_version);
     resp
 }

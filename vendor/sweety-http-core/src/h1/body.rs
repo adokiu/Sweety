@@ -146,6 +146,7 @@ impl RequestBodySender {
     // Lazily wait until RequestBody is already polled.
     // For specific use case body must not be eagerly polled.
     // For example: Request with Expect: Continue header.
+    #[allow(dead_code)]
     pub(super) fn wait_for_poll(&mut self) -> impl Future<Output = io::Result<()>> + '_ {
         self.ready_with(|inner| inner.waiting())
     }

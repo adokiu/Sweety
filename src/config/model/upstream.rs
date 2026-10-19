@@ -309,11 +309,60 @@ pub struct FastCgiCacheConfig {
     pub cacheable_methods: Vec<String>,
 
     /// 跳过缓存的请求头（如 Cookie 存在时不缓存）
-    #[serde(default)]
+    #[serde(default = "super::location::default_no_cache_headers")]
     pub bypass_headers: Vec<String>,
 
     /// 忽略响应头对缓存决策的影响（等价 Nginx fastcgi_ignore_headers）
     /// WordPress 必须设为 ["Cache-Control", "Set-Cookie"] 才能命中缓存
     #[serde(default)]
     pub ignore_headers: Vec<String>,
+
+    /// 缓存 HIT 时条件再验证（RFC 9111）
+    #[serde(default = "super::location::default_true")]
+    pub revalidate: bool,
+
+    #[serde(default = "super::location::default_true")]
+    pub origin_revalidate: bool,
+
+    #[serde(default = "super::location::default_true")]
+    pub use_stale_error: bool,
+
+    #[serde(default)]
+    pub background_update: bool,
+
+    #[serde(default)]
+    pub status_ttl: std::collections::HashMap<u16, u64>,
+
+    #[serde(default)]
+    pub request_no_cache: crate::middleware::cache_types::RequestNoCacheMode,
+
+    #[serde(default)]
+    pub cache_key_headers: Vec<String>,
+
+    #[serde(default)]
+    pub heuristic_freshness: bool,
+
+    #[serde(default = "super::location::default_true")]
+    pub cache_status_header: bool,
+
+    #[serde(default = "super::location::default_cache_min_uses")]
+    pub min_uses: u32,
+
+    #[serde(default = "super::location::default_true")]
+    pub cache_lock: bool,
+
+    #[serde(default = "super::location::default_cache_lock_timeout")]
+    pub cache_lock_timeout_secs: u64,
+
+    #[serde(default = "super::location::default_true")]
+    pub cache_require_buffering: bool,
+
+    #[serde(default)]
+    pub use_stale: Vec<String>,
+
+    #[serde(default)]
+    pub no_store_response_headers: Vec<String>,
+
+    #[serde(default)]
+    pub cache_key_include_scheme: bool,
 }

@@ -216,6 +216,11 @@ pub fn compress_response(
         || ct.contains("xml")        || ct.contains("svg");
     if !compressible { return resp; }
 
+    // 压缩会改变 body 语义：不得再声明 chunked trailer（RFC 9112）
+    use sweety_web::http::{TrailersAfterBody, take_staged_trailers};
+    let _ = take_staged_trailers(resp.headers_mut());
+    resp.extensions_mut().remove::<TrailersAfterBody>();
+
     // ④ 严格解析 Accept-Encoding，自适应算法选择（读取 Content-Length 作为大小提示）
     let size_hint: Option<u64> = resp.headers()
         .get(CONTENT_LENGTH)

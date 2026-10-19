@@ -4,7 +4,10 @@ use std::io;
 
 use tracing::{trace, warn};
 
-use crate::bytes::{Buf, Bytes, BytesMut};
+use crate::{
+    bytes::{Buf, Bytes, BytesMut},
+    http::header::HeaderMap,
+};
 
 use super::{buf_write::H1BufWrite, error::ProtoError};
 
@@ -23,6 +26,29 @@ pub enum TransferCoding {
     EncodeChunked,
     /// Upgrade type coder that pass through body as is without transforming.
     Upgrade,
+}
+
+fn encode_chunked_eof<W: H1BufWrite>(buf: &mut W, trailers: Option<&HeaderMap>) {
+    buf.write_buf_static(b"0\r\n");
+    if let Some(trailers) = trailers {
+        for (name, value) in trailers.iter() {
+            let _ = buf.write_buf(|b| {
+                use core::fmt::Write as _;
+                let mut w = crate::bytes::BufMutWriter(b);
+                let _ = write!(w, "{}: ", name.as_str());
+                if let Ok(v) = value.to_str() {
+                    let _ = write!(w, "{v}");
+                } else {
+                    for byte in value.as_bytes() {
+                        let _ = write!(w, "{byte:02X}");
+                    }
+                }
+                let _ = write!(w, "\r\n");
+                Ok::<_, core::convert::Infallible>(())
+            });
+        }
+    }
+    buf.write_buf_static(b"\r\n");
 }
 
 impl TransferCoding {
@@ -303,14 +329,14 @@ impl TransferCoding {
         }
     }
 
-    /// Encode eof. Return `EOF` state of encoder
-    pub fn encode_eof<W>(&mut self, buf: &mut W)
+    /// Encode eof. `trailers` 仅对 chunked 编码有效（RFC 9112 §7.1 trailer-section）
+    pub fn encode_eof<W>(&mut self, buf: &mut W, trailers: Option<&HeaderMap>)
     where
         W: H1BufWrite,
     {
         match *self {
             Self::Eof | Self::Upgrade | Self::Length(0) => {}
-            Self::EncodeChunked => buf.write_buf_static(b"0\r\n\r\n"),
+            Self::EncodeChunked => encode_chunked_eof(buf, trailers),
             Self::Length(n) => warn!(target: "h1_encode", "encode_eof: connection closed with {} bytes remaining in Content-Length body", n),
             _ => unreachable!(),
         }
@@ -562,7 +588,7 @@ mod test {
 
         assert_eq!(dst.buf(), b"7\r\nfoo bar\r\nD\r\nbaz quux herp\r\n");
 
-        encoder.encode_eof(dst);
+        encoder.encode_eof(dst, None);
 
         assert_eq!(dst.buf(), b"7\r\nfoo bar\r\nD\r\nbaz quux herp\r\n0\r\n\r\n");
     }
@@ -587,7 +613,7 @@ mod test {
             assert_eq!(dst.buf(), b"foo barb");
         }
 
-        encoder.encode_eof(dst);
+        encoder.encode_eof(dst, None);
         assert_eq!(dst.buf().len(), max_len);
         assert_eq!(dst.buf(), b"foo barb");
     }

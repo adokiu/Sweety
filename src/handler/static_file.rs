@@ -113,7 +113,7 @@ pub async fn handle_sweety(
     // 缓存 key 在写入时已经是 canonical path，查缓存只需 root.join + cache.get
     // 命中时完全跳过 canonicalize/stat/open 系统调用
     // Range 请求也走此热路径：小文件数据在内存中，直接 slice，零 syscall
-    if !is_head {
+    if !(is_head && is_range_req) {
         // 快速 `..` 检查（不做 syscall）
         let path_only = path.as_str();
         let has_traversal = path_only.split('/').any(|s| s == "..");
@@ -165,6 +165,19 @@ pub async fn handle_sweety(
             // 选择最优编码（br > zstd > gzip > 原始），严格 q= 解析，复用缓存中预压缩结果
             let (body_bytes, enc) = pick_encoding(req_headers, &entry);
             let body_bytes = body_bytes.clone();
+
+            if is_head {
+                let mut resp = WebResponse::new(ResponseBody::none());
+                let h = resp.headers_mut();
+                h.insert(CONTENT_TYPE, entry.hv_content_type.clone());
+                h.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
+                h.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+                h.insert(CONTENT_LENGTH, entry.hv_content_length.clone());
+                h.insert(ETAG, entry.hv_etag.clone());
+                h.insert(LAST_MODIFIED, entry.hv_last_modified.clone());
+                h.insert(CACHE_CONTROL, entry.hv_cache_control.clone());
+                return resp;
+            }
 
             // 直接插入预构建的头，零 from_str 分配
             let mut resp = WebResponse::new(ResponseBody::from(body_bytes.clone()));

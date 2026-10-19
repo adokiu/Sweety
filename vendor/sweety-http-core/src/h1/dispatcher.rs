@@ -1,4 +1,4 @@
-﻿use core::{
+use core::{
     convert::Infallible,
     future::{pending, poll_fn},
     marker::PhantomData,
@@ -25,8 +25,8 @@ use crate::{
         error::Error,
     },
     http::{
-        StatusCode,
-        response::{Parts, Response},
+        InformationalResponse, InformationalSink, StatusCode, TrailersAfterBody,
+        header::HeaderMap, response::{Parts, Response}, take_deferred_trailers,
     },
     util::{
         buffered::{BufferedIo, ListWriteBuf, ReadBuf, WriteBuf},
@@ -38,7 +38,6 @@ use super::proto::{
     buf_write::H1BufWrite,
     codec::{ChunkResult, TransferCoding},
     context::Context,
-    encode::CONTINUE,
     error::ProtoError,
 };
 
@@ -157,6 +156,37 @@ impl<'a> Timer<'a> {
     }
 }
 
+/// 读取客户端请求体，并在等待 socket 可读时 interleave 写出 103 等 1xx（RFC 8297）
+async fn pump_client_request_body<St, W, D, const HEADER_LIMIT: usize, const READ_BUF_LIMIT: usize, SE, BE>(
+    io: &mut BufferedIo<'_, St, W, READ_BUF_LIMIT>,
+    ctx: &mut Context<'_, D, HEADER_LIMIT>,
+    body_reader: &mut BodyReader,
+    info_rx: &mut tokio::sync::mpsc::UnboundedReceiver<InformationalResponse>,
+) -> Result<Infallible, Error<SE, BE>>
+where
+    St: AsyncIo,
+    W: H1BufWrite,
+    D: DateTime,
+{
+    use super::proto::encode::encode_informational_response;
+
+    // Expect: 100-continue 仅经 InformationalSink 下发（反代转发上游 100；本地 handler 调 notify_expect_continue）
+
+    loop {
+        tokio::select! {
+            biased;
+            Some(info) = info_rx.recv() => {
+                io.write_buf
+                    .write_buf_head(|buf| encode_informational_response(ctx.date(), info.status, info.headers, buf))
+                    .map_err(Error::Proto)?;
+                io.drain_write().await.map_err(Error::from)?;
+            }
+            _ = body_reader.ready(&mut io.read_buf) => {}
+        }
+        io.read().await.map_err(Error::from)?;
+    }
+}
+
 impl<'a, St, S, ReqB, ResB, BE, W, D, const HEADER_LIMIT: usize, const READ_BUF_LIMIT: usize>
     Dispatcher<'a, St, S, ReqB, W, D, HEADER_LIMIT, READ_BUF_LIMIT>
 where
@@ -227,15 +257,28 @@ where
             self.timer.reset_state();
 
             let (mut body_reader, body) = BodyReader::from_coding(decoder);
-            let req = req.map(|ext| ext.map_body(|_| ReqB::from(body)));
+            let (info_tx, mut info_rx) = InformationalSink::pair();
+            let req = req.map(|mut ext| {
+                ext.set_informational_sink(info_tx);
+                ext.map_body(|_| ReqB::from(body))
+            });
 
-            let (parts, body) = match self
+            let (parts, body, deferred_trailers) = match self
                 .service
                 .call(req)
-                .select(self.request_body_handler(&mut body_reader))
+                .select(pump_client_request_body(
+                    &mut self.io,
+                    &mut self.ctx,
+                    &mut body_reader,
+                    &mut info_rx,
+                ))
                 .await
             {
-                SelectOutput::A(Ok(res)) => res.into_parts(),
+                SelectOutput::A(Ok(res)) => {
+                    let deferred_trailers = res.extensions().get::<TrailersAfterBody>().cloned();
+                    let (parts, body) = res.into_parts();
+                    (parts, body, deferred_trailers)
+                }
                 SelectOutput::A(Err(e)) => return Err(Error::Service(e)),
                 SelectOutput::B(Err(e)) => return Err(e),
                 SelectOutput::B(Ok(i)) => match i {},
@@ -272,27 +315,46 @@ where
             // 隧道（WebSocket 等）：响应 body 期间必须继续读取客户端 socket，
             // 否则 client → upstream 方向在握手后永久停滞（RFC 9110 §7.8 / RFC 6455 双向全双工）
             if !did_sendfile && !no_body {
-                // 参考 H2 实现：顺序「拉取 body → encode → drain 写出」
-                // 确保 TLS 路径下数据立即加密并刷到 socket，不依赖 select io_ready
+                use super::proto::encode::encode_informational_response;
+                // 响应体写出期间 interleave 103/100 等 1xx（与 H2/H3 dispatcher 一致）
                 loop {
                     let next = if is_tunnel {
                         let want_buf = self.io.write_buf.want_write_buf();
-                        match self.tunnel_read(&mut body_reader)
-                            .select(poll_fn(|cx| {
+                        tokio::select! {
+                            biased;
+                            Some(info) = info_rx.recv() => {
+                                self.io.write_buf
+                                    .write_buf_head(|buf| encode_informational_response(self.ctx.date(), info.status, info.headers, buf))
+                                    .map_err(Error::Proto)?;
+                                self.io.drain_write().await.map_err(Error::from)?;
+                                continue;
+                            }
+                            r = self.tunnel_read(&mut body_reader) => {
+                                match r {
+                                    Err(e) => return Err(e.into()),
+                                    Ok(()) => continue,
+                                }
+                            }
+                            next = poll_fn(|cx| {
                                 if want_buf {
                                     body.as_mut().poll_next(cx)
                                 } else {
                                     core::task::Poll::Pending
                                 }
-                            }))
-                            .await
-                        {
-                            SelectOutput::A(Err(e)) => return Err(e.into()),
-                            SelectOutput::A(Ok(())) => continue,
-                            SelectOutput::B(next) => next,
+                            }) => next,
                         }
                     } else {
-                        poll_fn(|cx| body.as_mut().poll_next(cx)).await
+                        tokio::select! {
+                            biased;
+                            Some(info) = info_rx.recv() => {
+                                self.io.write_buf
+                                    .write_buf_head(|buf| encode_informational_response(self.ctx.date(), info.status, info.headers, buf))
+                                    .map_err(Error::Proto)?;
+                                self.io.drain_write().await.map_err(Error::from)?;
+                                continue;
+                            }
+                            next = poll_fn(|cx| body.as_mut().poll_next(cx)) => next,
+                        }
                     };
                     match next {
                         Some(Ok(bytes)) => {
@@ -302,7 +364,18 @@ where
                             }
                         }
                         None => {
-                            encoder.encode_eof(&mut self.io.write_buf);
+                            let mut trailers = self.ctx.take_chunk_trailers();
+                            if let Some(d) = deferred_trailers.as_ref() {
+                                if let Some(extra) = take_deferred_trailers(d).await {
+                                    trailers
+                                        .get_or_insert_with(HeaderMap::new)
+                                        .extend(extra);
+                                }
+                            }
+                            encoder.encode_eof(
+                                &mut self.io.write_buf,
+                                trailers.as_ref().filter(|m| !m.is_empty()),
+                            );
                             break;
                         }
                         Some(Err(e)) => return Err(Error::Body(e)),
@@ -343,24 +416,6 @@ where
 
     fn encode_head(&mut self, parts: Parts, body: &impl Stream) -> Result<TransferCoding, ProtoError> {
         self.ctx.encode_head(parts, body, &mut self.io.write_buf)
-    }
-
-    // an associated future of self.service that runs until service is resolved or error produced.
-    async fn request_body_handler(&mut self, body_reader: &mut BodyReader) -> Result<Infallible, Error<S::Error, BE>> {
-        if self.ctx.is_expect_header() {
-            // wait for service future to start polling RequestBody.
-            if body_reader.wait_for_poll().await.is_ok() {
-                // encode continue as service future want a body.
-                self.io.write_buf.write_buf_static(CONTINUE);
-                // use drain write to make sure continue is sent to client.
-                self.io.drain_write().await?;
-            }
-        }
-
-        loop {
-            body_reader.ready(&mut self.io.read_buf).await;
-            self.io.read().await?;
-        }
     }
 
     #[allow(dead_code)]
@@ -450,6 +505,7 @@ impl BodyReader {
     }
 
     // wait for service start to consume RequestBody.
+    #[allow(dead_code)]
     pub(super) async fn wait_for_poll(&mut self) -> io::Result<()> {
         // IMPORTANT: service future drop RequestBody so marker decoder to corrupted.
         self.tx

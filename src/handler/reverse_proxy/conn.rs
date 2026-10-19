@@ -1,4 +1,4 @@
-﻿//! HTTP 连接层
+//! HTTP 连接层
 //! 负责：与上游建立连接、发送请求、读取响应（支持 chunked/gzip）、健康检查探活
 
 use std::time::{Duration, Instant};
@@ -12,13 +12,17 @@ use tokio::net::UnixStream;
 use tracing::debug;
 use sweety_web::{
     body::{RequestBody, ResponseBody},
-    http::{StatusCode, WebResponse, header::{CONTENT_LENGTH, HeaderValue}},
+    http::{
+        InformationalSink, StatusCode, TrailersAfterBody, WebResponse,
+        header::{CONTENT_LENGTH, HeaderValue},
+        header_map_from_pairs,
+    },
 };
 
 use super::error::{IoContext, ProxyError};
 use super::pool::{ConnPool, PooledConn};
 use super::response::{apply_response_headers, parse_status_code};
-use super::tls_client::tls_connect;
+use super::tls_client::{tls_connect, TlsAlpn};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::model::UpstreamAddr;
@@ -63,7 +67,7 @@ pub async fn forward_request(
     proxy_redirect_from: Option<&str>,
     proxy_redirect_to: Option<&str>,
     sub_filter: &[crate::config::model::SubFilter],
-    proxy_cache: Option<(&std::sync::Arc<ProxyCache>, &CacheKey)>,
+    proxy_cache: Option<(&std::sync::Arc<ProxyCache>, &CacheKey, &sweety_web::http::HeaderMap)>,
     client_proto: &str,
     keepalive_requests: u64,
     keepalive_time: u64,
@@ -77,6 +81,7 @@ pub async fn forward_request(
     send_proxy_protocol: u8,
     // 客户端真实 socket 地址（用于 PROXY protocol src）
     client_addr: Option<std::net::SocketAddr>,
+    informational_sink: Option<&InformationalSink>,
 ) -> Result<WebResponse> {
     let addr_display = upstream_addr.as_str();
     debug!("转发 {} {} → {} (tls={})", method, path, addr_display, use_tls);
@@ -92,7 +97,11 @@ pub async fn forward_request(
     let key = PooledConn::key_from_addr(upstream_addr, use_tls);
 
     // body 用 Option 包装：首次 take() 消费，若 body 未消费则可重试（idle 连接失效场景）
+    // 无 body 幂等请求：连接前 drop RequestBody（H1 变体含 Rc，跨 await 会导致 future 非 Send）
     let mut body_slot = Some(req_body);
+    if retry_safe {
+        body_slot.take();
+    }
 
     for attempt in 0..2u8 {
         let (conn, created_at, req_count) = if attempt == 0 {
@@ -110,7 +119,7 @@ pub async fn forward_request(
         };
 
         // take()：消费 body，后续 body_slot = None
-        let body = body_slot.take().unwrap_or_default();
+        let body = body_slot.take().unwrap_or(RequestBody::None);
 
         match send_recv_pooled(conn, method, path, host, extra_headers, client_ip,
             body,
@@ -119,7 +128,8 @@ pub async fn forward_request(
             sub_filter, proxy_cache, client_proto,
             read_timeout_secs, write_timeout_secs, proxy_buffering, attempt == 0,
             pool.clone(), key.clone(), created_at, req_count,
-            keepalive_requests, keepalive_time, keepalive_max_idle).await
+            keepalive_requests, keepalive_time, keepalive_max_idle,
+            informational_sink).await
         {
             Ok((resp, maybe_conn, _body_consumed)) => {
                 if let Some(c) = maybe_conn {
@@ -239,7 +249,7 @@ async fn new_conn(
             }
 
             if use_tls {
-                let tls = tls_connect(tcp, tls_sni, tls_insecure).await?;
+                let tls = tls_connect(tcp, tls_sni, tls_insecure, TlsAlpn::Http11).await?;
                 Ok(PooledConn::Tls(Box::new(tls)))
             } else {
                 Ok(PooledConn::Tcp(tcp))
@@ -267,7 +277,7 @@ async fn new_conn(
             }
 
             if use_tls {
-                let tls = tls_connect(uds, tls_sni, tls_insecure).await?;
+                let tls = tls_connect(uds, tls_sni, tls_insecure, TlsAlpn::Http11).await?;
                 Ok(PooledConn::TlsUnix(Box::new(tls)))
             } else {
                 Ok(PooledConn::Unix(uds))
@@ -325,7 +335,7 @@ async fn send_recv_pooled(
     proxy_redirect_from: Option<&str>,
     proxy_redirect_to: Option<&str>,
     sub_filter: &[crate::config::model::SubFilter],
-    proxy_cache: Option<(&std::sync::Arc<ProxyCache>, &CacheKey)>,
+    proxy_cache: Option<(&std::sync::Arc<ProxyCache>, &CacheKey, &sweety_web::http::HeaderMap)>,
     client_proto: &str,
     read_timeout_secs: u64,
     write_timeout_secs: u64,
@@ -340,6 +350,7 @@ async fn send_recv_pooled(
     stream_ka_requests: u64,
     stream_ka_time: u64,
     stream_ka_max_idle: usize,
+    informational_sink: Option<&InformationalSink>,
 ) -> Result<(WebResponse, Option<PooledConn>, bool), (anyhow::Error, bool)> {
     let read_timeout  = Duration::from_secs(if read_timeout_secs  > 0 { read_timeout_secs  } else { 60 });
     let write_timeout = Duration::from_secs(if write_timeout_secs > 0 { write_timeout_secs } else { 60 });
@@ -414,7 +425,7 @@ async fn send_recv_pooled(
     let (mut buf, mut status_code, mut upstream_http10) = if has_body && has_expect_continue {
         // 发头后等上游决策，BufReader 在此建立，后续所有读取都通过它
         let mut buf = BufReader::new(conn);
-        let (code, http10) = read_expect_status(&mut buf, read_timeout).await
+        let (code, http10) = read_expect_status(&mut buf, read_timeout, informational_sink).await
             .map_err(|e| (e.into(), true))?;
         if code == 100 {
             // 读掉 "\r\n" 空行
@@ -459,15 +470,19 @@ async fn send_recv_pooled(
         (buf, code, http10)
     };
 
-    // RFC 9110 §15.2：中间响应（100/102/103 等，101 除外）不是最终响应，
-    // 丢弃其头部并继续读取最终响应（客户端侧编码器不支持转发任意 1xx）
+    // RFC 9110 §15.2：中间响应（100/102/103 等，101 除外）不是最终响应；103 等转发给客户端
     let mut informational_count = 0;
     while (100..200).contains(&status_code) && status_code != 101 {
         informational_count += 1;
         if informational_count > MAX_INFORMATIONAL_RESPONSES {
             return Err((protocol_error("上游中间响应数量超过上限").into(), true));
         }
-        read_header_section(&mut buf, read_timeout, resp_max_headers()).await.map_err(|e| (e.into(), true))?;
+        let info_headers = read_header_section(&mut buf, read_timeout, resp_max_headers())
+            .await
+            .map_err(|e| (e.into(), true))?;
+        if let Some(sink) = informational_sink {
+            sink.send_headers(status_code, &info_headers);
+        }
         (status_code, upstream_http10) = read_response_status(&mut buf, read_timeout).await.map_err(|e| (e.into(), true))?;
     }
     if status_code == 101 {
@@ -479,7 +494,6 @@ async fn send_recv_pooled(
 
     // HTTP/1.0 默认 close；同时检测 Trailer 头字段（指示有 chunked trailer）
     let mut resp_conn_close = upstream_http10;
-    let mut resp_has_trailer = false;
     let mut response_headers: Vec<(String, String)> = Vec::with_capacity(24);
     // 复用 line 缓冲，避免每行都堆分配
     let mut line = String::with_capacity(128);
@@ -504,10 +518,6 @@ async fn send_recv_pooled(
         {
             let (k, v) = parse_header_line(&line).map_err(|e| (e.into(), true))?;
             // 大小写不敏感比较，零堆分配
-            // Trailer 头：指示 chunked body 后有 trailer 头字段（RFC 7230）
-            if k.eq_ignore_ascii_case("trailer") {
-                resp_has_trailer = true;
-            }
             // 上游要求关闭连接时不归还
             if k.eq_ignore_ascii_case("connection")
                 && v.split(',').any(|t| t.trim().eq_ignore_ascii_case("close"))
@@ -559,7 +569,14 @@ async fn send_recv_pooled(
     // 不把响应体读进内存，直接用 bounded channel stream 透传给客户端。
     // 适用场景：大文件下载、SSE、长轮询、streaming API。
     // 限制：sub_filter / proxy_cache / URL 替换在流式路径下不生效（需 buffering=true）。
-    if event_stream || (!proxy_buffering && sub_filter.is_empty() && proxy_cache.is_none()) {
+    let cache_requires_buffer = proxy_cache
+        .map(|(cache, _, _)| cache.requires_buffering())
+        .unwrap_or(false);
+    if event_stream
+        || (!proxy_buffering
+            && sub_filter.is_empty()
+            && (!cache_requires_buffer || proxy_cache.is_none()))
+    {
         let http_status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::OK);
         let no_body = http_status == StatusCode::NOT_MODIFIED
             || http_status == StatusCode::NO_CONTENT
@@ -582,11 +599,13 @@ async fn send_recv_pooled(
         // 上游 Connection: close 时不归还连接
         let can_reuse = !resp_conn_close;
 
+        let trailers_after = TrailersAfterBody::default();
         if resp_is_chunked {
             // chunked 上游：解码后用 BytesMut.freeze() 零拷贝转 Bytes
             // 读完整个 chunked 流后把连接归还到池
             // spawn_local：连接归还在同一 worker 线程执行，正确写回 thread_local ConnPool
             const STREAM_CHUNKED_MAX_CHUNK: usize = 16 * 1024 * 1024; // 16 MiB per chunk
+            let deferred_done = trailers_after.clone();
             tokio::task::spawn_local(async move {
                 let mut reader = buf;
                 let transfer = async {
@@ -602,8 +621,10 @@ async fn send_recv_pooled(
                         }
                         if chunk_size == 0 {
                             // last-chunk 之后是可选 trailer-section，以空行结束；必须读完才能复用连接
-                            read_header_section(&mut reader, read_timeout, CHUNKED_MAX_TRAILERS).await?;
-                            return Ok::<_, std::io::Error>(());
+                            let pairs = read_header_section(&mut reader, read_timeout, CHUNKED_MAX_TRAILERS).await?;
+                            let map = header_map_from_pairs(&pairs);
+                            let trailers = Some(map).filter(|m| !m.is_empty());
+                            return Ok::<_, std::io::Error>(trailers);
                         }
                         let mut remaining = chunk_size;
                         while remaining > 0 {
@@ -626,11 +647,22 @@ async fn send_recv_pooled(
                 };
                 let result = tokio::select! {
                     biased;
-                    _ = tx.closed() => return,
+                    _ = tx.closed() => {
+                        sweety_web::http::complete_deferred_trailers(&deferred_done, None).await;
+                        return;
+                    }
                     result = transfer => result,
                 };
                 let ok = result.is_ok();
-                if let Err(e) = result { let _ = tx.send(Err(e)).await; }
+                match result {
+                    Ok(trailers) => {
+                        sweety_web::http::complete_deferred_trailers(&deferred_done, trailers).await;
+                    }
+                    Err(e) => {
+                        sweety_web::http::complete_deferred_trailers(&deferred_done, None).await;
+                        let _ = tx.send(Err(e)).await;
+                    }
+                }
                 // ok 且上游未要求关闭：归还连接到池
                 if ok && can_reuse {
                     stream_pool.release(
@@ -696,6 +728,9 @@ async fn send_recv_pooled(
         *resp.status_mut() = http_status;
         apply_response_headers(&mut resp, &response_headers,
             strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to);
+        if resp_is_chunked {
+            resp.extensions_mut().insert(trailers_after);
+        }
         // chunked 路径：移除上游的 Transfer-Encoding 头，由框架重新决定编码方式
         // Content-Length 路径：保留 Content-Length 告知框架用 length 模式而非 chunked
         if resp_is_chunked {
@@ -710,9 +745,10 @@ async fn send_recv_pooled(
 
     // ── 读取响应体（支持 chunked / Content-Length / EOF）───────────────────
     // 每次读取都带 read_timeout（等价 Nginx proxy_read_timeout 的包间语义），防止上游不关连接时永久挂起
+    let mut upstream_trailer_pairs: Vec<(String, String)> = Vec::new();
     let body_bytes = if resp_is_chunked {
-        // trailer 字段不得合并进响应头（RFC 9110 §6.5.1），buffered 模式下读取后丢弃
-        let (b, _trailers) = read_chunked_body(&mut buf, resp_has_trailer, read_timeout).await.map_err(|e| (e, true))?;
+        let (b, upstream_trailers) = read_chunked_body(&mut buf, true, read_timeout).await.map_err(|e| (e, true))?;
+        upstream_trailer_pairs = upstream_trailers;
         b
     } else if let Some(len) = resp_content_length {
         if len > BUFFERED_MAX_BODY {
@@ -749,14 +785,15 @@ async fn send_recv_pooled(
     let final_body = super::response::apply_sub_filter(body_after_url, &response_headers, sub_filter);
 
     // ── proxy_cache 写入（在 body 完整且未被消耗之前）────────────
-    if let Some((cache, cache_key)) = proxy_cache {
+    if let Some((cache, cache_key, vary_req)) = proxy_cache {
         if cache.is_cacheable(status_code, &response_headers) {
             let body_clone = bytes::Bytes::from(final_body.clone());
             let headers_clone = response_headers.clone();
             let cache_clone = cache.clone();
             let key_clone = cache_key.clone();
+            let vary_req = vary_req.clone();
             tokio::spawn(async move {
-                cache_clone.set(key_clone, status_code, headers_clone, body_clone);
+                cache_clone.set(key_clone, status_code, headers_clone, body_clone, &vary_req);
             });
         }
     }
@@ -775,6 +812,7 @@ async fn send_recv_pooled(
     *resp.status_mut() = http_status;
     apply_response_headers(&mut resp, &response_headers,
         strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to);
+    super::response::apply_upstream_trailers(&mut resp, &upstream_trailer_pairs);
     if !no_body {
         if let Ok(v) = HeaderValue::from_str(itoa::Buffer::new().format(body_len)) {
             resp.headers_mut().insert(CONTENT_LENGTH, v);
@@ -903,12 +941,23 @@ async fn read_header_section<R: tokio::io::AsyncBufRead + Unpin>(
 async fn read_expect_status<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
     read_timeout: Duration,
+    informational_sink: Option<&InformationalSink>,
 ) -> std::io::Result<(u16, bool)> {
     for _ in 0..MAX_INFORMATIONAL_RESPONSES {
         let status = read_response_status(reader, read_timeout).await?;
-        if status.0 == 101 || status.0 >= 200 { return Ok(status); }
-        read_header_section(reader, read_timeout, resp_max_headers()).await?;
-        if status.0 == 100 { return Ok(status); }
+        if status.0 == 101 || status.0 >= 200 {
+            return Ok(status);
+        }
+        let info_headers = read_header_section(reader, read_timeout, resp_max_headers()).await?;
+        if status.0 == 100 {
+            if let Some(sink) = informational_sink {
+                sink.send_headers(100, &info_headers);
+            }
+            return Ok(status);
+        }
+        if let Some(sink) = informational_sink {
+            sink.send_headers(status.0, &info_headers);
+        }
     }
     Err(protocol_error("上游中间响应数量超过上限"))
 }
@@ -1093,7 +1142,7 @@ pub async fn probe_health(addr: &UpstreamAddr, path: &str, use_tls: bool, sni: &
         io: IO, req: &[u8], use_tls: bool, sni: &str, insecure: bool,
     ) -> Result<u16> {
         if use_tls {
-            let tls = tls_connect(io, sni, insecure).await?;
+            let tls = tls_connect(io, sni, insecure, TlsAlpn::Http11).await?;
             let (r, mut w) = tokio::io::split(tls);
             w.write_all(req).await?;
             w.flush().await?;

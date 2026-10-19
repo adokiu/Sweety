@@ -115,6 +115,16 @@ open_file_cache_inactive = 60
 # Larger files use fd cache + sendfile(2)/pread streaming
 open_file_cache_total_mb = 512
 
+# Reject TRACE (RFC 7231 security practice; default true)
+disable_http_trace = true
+
+# Static: multipart/byteranges for multi-range requests (default false)
+# static_multipart_byteranges = false
+
+# Allow HTTP/1.1 CONNECT tunnel on reverse_proxy locations (default false)
+# H2 extended CONNECT (RFC 8441 WebSocket) is unaffected
+allow_http_connect_tunnel = false
+
 # ─── HTTP/2 Settings ──────────────────────────────────────────────────────────
 
 # Max concurrent streams per H2 connection
@@ -446,6 +456,27 @@ cacheable_statuses   = [200, 301, 302]
 cacheable_methods    = ["GET", "HEAD"]
 bypass_headers       = ["Authorization"]
 # ignore_headers     = ["Cache-Control", "Set-Cookie"]
+# HIT 时 If-None-Match / If-Modified-Since → 304（RFC 9111，默认 true）
+revalidate           = true
+# 过期 / must-revalidate / 响应 no-cache 时条件回源（Nginx proxy_cache_revalidate，默认 true）
+origin_revalidate    = true
+# 上游 5xx 时在 stale-if-error 窗口内返回 stale（Nginx proxy_cache_use_stale error，默认 true）
+use_stale_error      = true
+# SWR 窗口内后台条件 GET 刷新（HTTP/1 上游；HIT 不阻塞）
+# background_update  = true
+# 按状态码 TTL（Nginx proxy_cache_valid）
+# status_ttl         = { 404 = 60 }
+# request_no_cache   = "revalidate"   # 或 "bypass"
+# cache_key_headers  = ["Accept-Encoding"]
+# heuristic_freshness = false
+# cache_status_header = true
+# min_uses           = 1
+# cache_lock         = true
+# cache_lock_timeout_secs = 5
+# cache_require_buffering = true
+# use_stale          = ["error", "timeout", "updating"]
+# no_store_response_headers = []
+# cache_key_include_scheme = false
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

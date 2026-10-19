@@ -310,6 +310,14 @@ pub struct SiteRateLimiter {
     limiters: Vec<RateLimiter>,
 }
 
+impl std::fmt::Debug for SiteRateLimiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SiteRateLimiter")
+            .field("rules", &self.limiters.len())
+            .finish()
+    }
+}
+
 impl SiteRateLimiter {
     /// 从规则列表构建（同时预编译所有路径正则）
     pub fn from_rules(rules: Vec<RateLimitRule>) -> Self {

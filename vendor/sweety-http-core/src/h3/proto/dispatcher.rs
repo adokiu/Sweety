@@ -1,4 +1,4 @@
-﻿use core::{
+use core::{
     fmt,
     future::poll_fn,
     marker::PhantomData,
@@ -9,7 +9,7 @@
 
 use ::h3::server::{self, RequestResolver, RequestStream};
 use futures_core::stream::Stream;
-use h3_quinn::RecvStream as QuinnRecvStream;
+use h3_quinn::{RecvStream as QuinnRecvStream, SendStream as QuinnSendStream};
 use std::rc::Rc;
 use std::sync::{
     Arc,
@@ -25,7 +25,12 @@ use crate::{
     date::{DateTime, DateTimeHandle},
     error::HttpServiceError,
     h3::{body::RequestBody, error::Error},
-    http::{Extension, HeaderMap, Method, Request, RequestExt, Response, StatusCode},
+    http::{
+        Extension, HeaderMap, InformationalResponse, InformationalSink, Method, Request,
+        RequestExt, Response, StatusCode, Version,
+        header::{DATE, HeaderValue},
+        proxy_ext::{TrailersAfterBody, take_deferred_trailers, take_staged_trailers},
+    },
 };
 
 /// Http/3 dispatcher
@@ -199,6 +204,49 @@ where
 
 fn is_idempotent_method(method: &Method) -> bool {
     matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE)
+}
+
+async fn send_h3_informational(
+    tx: &mut RequestStream<QuinnSendStream<Bytes>, Bytes>,
+    date: &DateTimeHandle,
+    info: InformationalResponse,
+) -> Result<(), ()> {
+    let mut res = Response::builder()
+        .status(info.status)
+        .version(Version::HTTP_3)
+        .body(())
+        .map_err(|_| ())?;
+    *res.headers_mut() = info.headers;
+    if !res.headers().contains_key(DATE) {
+        if let Ok(v) = date.with_date(HeaderValue::from_bytes) {
+            res.headers_mut().insert(DATE, v);
+        }
+    }
+    crate::http::strip_connection_headers(res.headers_mut());
+    let (parts, _) = res.into_parts();
+    tx.send_response(Response::from_parts(parts, ()))
+        .await
+        .map_err(|_| ())?;
+    Ok(())
+}
+
+async fn finish_h3_stream(
+    tx: &mut RequestStream<QuinnSendStream<Bytes>, Bytes>,
+    staged: Option<HeaderMap>,
+    deferred: Option<TrailersAfterBody>,
+) -> Result<(), ()> {
+    let mut map = staged;
+    if let Some(d) = deferred {
+        if let Some(extra) = take_deferred_trailers(&d).await {
+            map.get_or_insert_with(HeaderMap::new).extend(extra);
+        }
+    }
+    if let Some(t) = map {
+        tx.send_trailers(t).await.map_err(|_| ())?;
+    } else {
+        tx.finish().await.map_err(|_| ())?;
+    }
+    Ok(())
 }
 
 async fn run_resolve_and_handle<S, ReqB, ResB, BE>(
@@ -376,7 +424,7 @@ where
     let method = req.method().clone();
     if pre_handshake.load(Ordering::Acquire) && !is_idempotent_method(&method) {
         debug!(addr = %addr, %method, "H3 0-RTT 重放防护：拒绝非幂等 Early 请求 (425)");
-        let (mut tx, _rx): (_, RequestStream<QuinnRecvStream, Bytes>) = stream.split();
+        let (mut tx, _rx): (RequestStream<QuinnSendStream<Bytes>, Bytes>, _) = stream.split();
         let response = crate::http::Response::builder()
             .status(StatusCode::TOO_EARLY)
             .body(())
@@ -404,18 +452,33 @@ where
             .map(|p| p.as_str().eq_ignore_ascii_case("websocket"))
             .unwrap_or(false);
 
-    let (mut tx, rx): (_, RequestStream<QuinnRecvStream, Bytes>) = stream.split();
+    let (mut tx, rx): (RequestStream<QuinnSendStream<Bytes>, Bytes>, RequestStream<QuinnRecvStream, Bytes>) =
+        stream.split();
     let body = RequestBody::new(rx);
 
+    let (info_tx, mut info_rx) = InformationalSink::pair();
     let http_req = req.map(|_| {
         let ext = if is_h3_ws {
             Extension::new_h2_ws(addr, true)
         } else {
             Extension::new(addr, true)
         };
-        RequestExt::from_parts(ReqB::from(body), ext)
+        let mut req_ext = RequestExt::from_parts(ReqB::from(body), ext);
+        req_ext.set_informational_sink(info_tx);
+        req_ext
     });
-    let resp = service.call(http_req).await.map_err(Error::Service)?;
+    let mut service_fut = pin!(service.call(http_req));
+    let resp = loop {
+        tokio::select! {
+            Some(info) = info_rx.recv() => {
+                let _ = send_h3_informational(&mut tx, &date, info).await;
+            }
+            res = &mut service_fut => {
+                break res.map_err(Error::Service)?;
+            }
+        }
+    };
+    let deferred_trailers = resp.extensions().get::<TrailersAfterBody>().cloned();
     let (mut parts, res_body) = resp.into_parts();
 
     let body_size = response_body_size(&method, parts.status, &res_body);
@@ -438,10 +501,14 @@ where
             return Ok(());
         }
     };
+    let staged_trailers = take_staged_trailers(&mut parts.headers);
 
     tx.send_response(crate::http::Response::from_parts(parts, ())).await?;
+
     if state.skip_body {
-        tx.finish().await?;
+        if finish_h3_stream(&mut tx, staged_trailers, deferred_trailers).await.is_err() {
+            reset_message(&mut tx, "response trailer send failed");
+        }
         return Ok(());
     }
 
@@ -478,8 +545,9 @@ where
                         if !buf.is_empty() {
                             tx.send_data(buf.freeze()).await?;
                         }
-                        // fire-and-forget：不等客户端 ACK FIN（~26ms delayed ACK），立即返回
-                        tokio::task::spawn_local(async move { let _ = tx.finish().await; });
+                        if finish_h3_stream(&mut tx, staged_trailers, deferred_trailers).await.is_err() {
+                            reset_message(&mut tx, "response trailer send failed");
+                        }
                         return Ok(());
                     }
                     Poll::Pending => break,
@@ -511,8 +579,9 @@ where
                 reset_message(&mut tx, reason);
                 return Ok(());
             }
-            // fire-and-forget：不等客户端 ACK FIN
-            tokio::task::spawn_local(async move { let _ = tx.finish().await; });
+            if finish_h3_stream(&mut tx, staged_trailers, deferred_trailers).await.is_err() {
+                reset_message(&mut tx, "response trailer send failed");
+            }
             return Ok(());
         }
     }
@@ -541,8 +610,9 @@ where
         reset_message(&mut tx, reason);
         return Ok(());
     }
-    // fire-and-forget：不等客户端 ACK FIN
-    tokio::task::spawn_local(async move { let _ = tx.finish().await; });
+    if finish_h3_stream(&mut tx, staged_trailers, deferred_trailers).await.is_err() {
+        reset_message(&mut tx, "response trailer send failed");
+    }
     Ok(())
 }
 

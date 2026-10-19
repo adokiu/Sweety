@@ -1,4 +1,4 @@
-﻿//! 反向代理处理器
+//! 反向代理处理器
 //! 支持：HTTP / HTTPS / WS / WSS + gzip / chunked 透传
 //! 子模块职责：
 //!   lb.rs              — 负载均衡、节点状态、健康检查
@@ -18,7 +18,12 @@ pub mod response;
 pub mod retry;
 pub mod tls_client;
 pub mod upstream_h2;
+pub mod upstream_headers;
+pub mod connect_tunnel;
+pub mod cache_background;
 pub mod ws_proxy;
+
+pub use upstream_headers::{prepare_forwarded_request_headers, UpstreamWire};
 
 use tracing::error;
 use sweety_web::{
@@ -55,14 +60,68 @@ pub async fn handle_sweety(
         ),
     };
 
-    // ── 非 WS CONNECT 早期拦截（与 Nginx 行为一致）───────────────────────
-    // Nginx 作为反向代理不支持 HTTP CONNECT 隧道，直接拒绝非 WebSocket 的 CONNECT 请求
-    // is_h2_ws() 由框架 H2 dispatcher 在接收请求时检测 h2::ext::Protocol 写入，可靠
-    {
-        let m = ctx.req().method().as_str();
-        if m.eq_ignore_ascii_case("CONNECT") && !ctx.req().body().is_h2_ws() {
-            // 纯隧道 CONNECT，Nginx 也不支持，返回 400
-            return response::proxy_error(StatusCode::BAD_REQUEST, "CONNECT tunneling not supported", client_version);
+    // ── HTTP/1 CONNECT 隧道（需 global.allow_http_connect_tunnel；H2 extended CONNECT / WS 不受影响）
+    let is_ws_h2_early = ctx.req().body().is_h2_ws();
+    if ctx.req().method().as_str().eq_ignore_ascii_case("CONNECT") && !is_ws_h2_early {
+        if !ctx.state().cfg.load().global.allow_http_connect_tunnel {
+            return response::proxy_error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "CONNECT tunneling disabled (set global.allow_http_connect_tunnel = true to enable)",
+                client_version,
+            );
+        }
+        let client_ip_str = ctx.req().body().socket_addr().ip().to_string();
+        let node = match pool.pick(Some(&client_ip_str)) {
+            Some(n) => n,
+            None => {
+                return response::proxy_error(
+                    StatusCode::BAD_GATEWAY,
+                    "所有上游节点均不可用",
+                    client_version,
+                );
+            }
+        };
+        let scheme_str = if ctx.req().body().is_tls() {
+            "https"
+        } else {
+            ctx.req().uri().scheme_str().unwrap_or("http")
+        };
+        let client_headers = prepare_forwarded_request_headers(
+            ctx.req().headers(),
+            &client_ip_str,
+            scheme_str,
+            client_version,
+            false,
+            UpstreamWire::Http1,
+        );
+        let client_is_tls = ctx.req().body().is_tls();
+        let strip_cookie_secure =
+            location.strip_cookie_secure || (node.tls && !client_is_tls);
+        match connect_tunnel::handle_connect_tunnel(
+            ctx,
+            &node.addr,
+            node.tls,
+            &node.tls_sni,
+            node.tls_insecure,
+            &client_headers,
+            strip_cookie_secure,
+            location.proxy_cookie_domain.as_deref(),
+            location.proxy_redirect_from.as_deref(),
+            location.proxy_redirect_to.as_deref(),
+        )
+        .await
+        {
+            Ok(mut resp) => {
+                response::append_gateway_via(&mut resp, client_version);
+                return resp;
+            }
+            Err(e) => {
+                return response::proxy_error(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("CONNECT 上游失败: {e}"),
+                    client_version,
+                );
+            }
         }
     }
 
@@ -112,55 +171,19 @@ pub async fn handle_sweety(
     let scheme_str = if ctx.req().body().is_tls() { "https" } else {
         ctx.req().uri().scheme_str().unwrap_or("http")
     };
-    // RFC 9110 §7.6.1：Connection 头中列出的字段同样是 hop-by-hop，转发前必须移除
-    let connection_tokens = response::connection_tokens(
-        ctx.req().headers().get_all(sweety_web::http::header::CONNECTION).iter().filter_map(|v| v.to_str().ok()),
-    );
-    // 客户端原有 X-Forwarded-For（多条按出现顺序合并），稍后追加连接 IP（等价 Nginx $proxy_add_x_forwarded_for）
-    let mut forwarded_for = String::new();
-    let mut via = String::new();
-    let header_count = ctx.req().headers().len();
-    let mut client_headers: Vec<(String, String)> = Vec::with_capacity(header_count + 6);
-    for (k, v) in ctx.req().headers().iter() {
-        let name = k.as_str();
-        // WS 请求保留 Upgrade 和 Sec-WebSocket-* 头（不被 hop-by-hop 过滤）
-        let is_ws_header = is_ws && (name == "upgrade" || name.starts_with("sec-websocket-"));
-        if !is_ws_header
-            && (response::is_hop_by_hop(name) || connection_tokens.iter().any(|t| t == name))
-        {
-            continue;
-        }
-        let Ok(val) = v.to_str() else { continue };
-        match name {
-            "x-forwarded-for" => {
-                if !forwarded_for.is_empty() { forwarded_for.push_str(", "); }
-                forwarded_for.push_str(val);
-            }
-            "via" => {
-                if !via.is_empty() { via.push_str(", "); }
-                via.push_str(val);
-            }
-            // 由代理根据连接信息生成，丢弃客户端提供的值防止伪造
-            "x-real-ip" | "x-forwarded-proto" => {}
-            _ => client_headers.push((name.to_string(), val.to_string())),
-        }
-    }
-    if !forwarded_for.is_empty() { forwarded_for.push_str(", "); }
-    forwarded_for.push_str(client_ip_str_ref);
-    client_headers.push(("X-Forwarded-For".to_string(), forwarded_for));
-    client_headers.push(("X-Real-IP".to_string(), client_ip_str.clone()));
-    client_headers.push(("X-Forwarded-Proto".to_string(), scheme_str.to_string()));
-    // RFC 9110 §7.6.3：网关转发请求时必须追加 Via（received-protocol + received-by）
-    let received_protocol = match ctx.req().version() {
-        sweety_web::http::Version::HTTP_10 => "1.0",
-        sweety_web::http::Version::HTTP_2  => "2",
-        sweety_web::http::Version::HTTP_3  => "3",
-        _ => "1.1",
+    let upstream_wire = if is_ws || !node.http2 {
+        UpstreamWire::Http1
+    } else {
+        UpstreamWire::Http2
     };
-    if !via.is_empty() { via.push_str(", "); }
-    via.push_str(received_protocol);
-    via.push_str(" sweety");
-    client_headers.push(("Via".to_string(), via));
+    let mut client_headers = prepare_forwarded_request_headers(
+        ctx.req().headers(),
+        client_ip_str_ref,
+        scheme_str,
+        client_version,
+        is_ws,
+        upstream_wire,
+    );
 
     // 应用 proxy_set_headers：重写指定请求头（支持 $remote_addr/$host/$scheme/$request_uri/$http_upgrade 变量）
     let http_upgrade = ctx.req().headers()
@@ -200,37 +223,85 @@ pub async fn handle_sweety(
     // ── proxy_cache 查询（读缓存，O(1) 内存匹配） ─────────────────────
     // 安全修复：缓存键使用客户端请求的 Host（非 upstream_host），防止多域名共享上游时缓存投毒
     // 攻击场景：evil.com 和 good.com 映射到同一 upstream_host 时，用 upstream_host 做 key 会跨域名命中
-    let cache_key = CacheKey::new(method, client_host, path);
+    let cache_scheme = site
+        .proxy_cache
+        .as_ref()
+        .and_then(|c| c.cache_key_include_scheme.then_some(scheme_str));
+    let cache_key = CacheKey::new_with_scheme(method, client_host, path, cache_scheme);
     let proxy_cache: Option<std::sync::Arc<ProxyCache>> = site.proxy_cache_arc.clone();
 
+    let mut origin_revalidate_entry: Option<crate::middleware::proxy_cache::CacheEntry> = None;
+    let mut cache_fill_leader = false;
     if let Some(ref cache) = proxy_cache {
-        // 直接传 HeaderMap，跳过中间 Vec 堆分配
         if !is_ws && cache.should_lookup(method, ctx.req().headers()) {
-            if let Some(entry) = cache.get(&cache_key) {
-                // 缓存命中，直接构造响应返回
-                use sweety_web::body::ResponseBody;
-                use sweety_web::http::{StatusCode, WebResponse};
-                let mut resp = WebResponse::new(ResponseBody::from(entry.body));
-                *resp.status_mut() = StatusCode::from_u16(entry.status).unwrap_or(StatusCode::OK);
-                use sweety_web::http::header::{HeaderName, HeaderValue};
-                for (k, v) in &entry.headers {
-                    if let (Ok(name), Ok(val)) = (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v)) {
-                        resp.headers_mut().insert(name, val);
+            use crate::middleware::proxy_cache::{
+                inject_revalidation_request_headers, plan_cache, try_stale_updating_serve, CacheFillRole,
+                CachePlan,
+            };
+            'cache_plan: loop {
+                match plan_cache(cache, method, &cache_key, ctx.req().headers()) {
+                    CachePlan::Serve {
+                        mut response,
+                        background,
+                    } => {
+                        if let Some(job) = background {
+                            if !node.http2 {
+                                cache_background::spawn_background_revalidate(
+                                    ctx.state().clone(), // AppState（内含 Arc 字段）
+                                    node.addr.clone(),
+                                    node.tls,
+                                    node.tls_sni.clone(),
+                                    node.tls_insecure,
+                                    upstream_host.to_string(),
+                                    client_ip_str.clone(),
+                                    cache.clone(),
+                                    job,
+                                    pool.read_timeout,
+                                    pool.connect_timeout,
+                                    pool.write_timeout,
+                                    pool.keepalive_requests,
+                                    pool.keepalive_time,
+                                    pool.keepalive_max_idle,
+                                );
+                            }
+                        }
+                        response::append_gateway_via(&mut response, client_version);
+                        return response;
                     }
+                    CachePlan::OriginRevalidate(entry) => {
+                        inject_revalidation_request_headers(&entry, &mut client_headers);
+                        origin_revalidate_entry = Some(entry);
+                        break 'cache_plan;
+                    }
+                    CachePlan::Forward => match cache.coordinate_cache_fill(&cache_key).await {
+                        CacheFillRole::RetryLookup => continue 'cache_plan,
+                        CacheFillRole::StaleUpdating => {
+                            if let Some(mut stale) =
+                                try_stale_updating_serve(cache, method, &cache_key, ctx.req().headers())
+                            {
+                                response::append_gateway_via(&mut stale, client_version);
+                                return stale;
+                            }
+                            cache_fill_leader = true;
+                            cache.bump_fetch_count(&cache_key);
+                            break 'cache_plan;
+                        }
+                        CacheFillRole::Leader => {
+                            cache_fill_leader = true;
+                            cache.bump_fetch_count(&cache_key);
+                            break 'cache_plan;
+                        }
+                    },
                 }
-                // X-Cache / X-Cache-Status 是业界通用缓存状态头（Varnish / Nginx / CDN 均使用）
-                resp.headers_mut().insert(
-                    HeaderName::from_static("x-cache"),
-                    HeaderValue::from_static("HIT"),
-                );
-                resp.headers_mut().insert(
-                    HeaderName::from_static("x-cache-status"),
-                    HeaderValue::from_static("HIT"),
-                );
-                return resp;
             }
         }
     }
+
+    let informational_sink = ctx.req().body().informational_sink().cloned();
+
+    let _cache_fill_guard = proxy_cache.as_ref().map(|cache| {
+        crate::middleware::proxy_cache::CacheFillGuard::new(cache, &cache_key, cache_fill_leader)
+    });
 
     // ── 转发请求 ───────────────────────────────────────────
     node.active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -253,25 +324,70 @@ pub async fn handle_sweety(
             8, // 每节点最多 8 条 H2 连接，每条多路复用 stream
             pool.connect_timeout,
         );
-        match forward_request_h2(
+        match upstream_h2::forward_request(
             h2_pool,
             method, path, upstream_host,
             &client_headers, client_ip_str_ref, scheme_str,
             request_body,
             strip_cookie_secure, proxy_cookie_domain,
             proxy_redirect_from, proxy_redirect_to,
+            informational_sink.as_ref(),
             pool.read_timeout,
         ).await {
-            Ok(r) => { node.record_success(); r }
+            Ok(mut r) => {
+                node.record_success();
+                if let Some(entry) = origin_revalidate_entry {
+                    use crate::middleware::proxy_cache::{
+                        build_cache_hit_response, decorate_cache_hit_response,
+                        origin_revalidate_same_entity, CacheHitAction,
+                    };
+                    if let Some(ref cache) = proxy_cache {
+                        if r.status() == StatusCode::NOT_MODIFIED {
+                            cache.apply_origin_not_modified(&cache_key, &entry, r.headers());
+                            r = decorate_cache_hit_response(
+                                build_cache_hit_response(method, CacheHitAction::NotModified(entry)),
+                                true,
+                                cache,
+                                None,
+                            );
+                        } else if r.status().is_success()
+                            && origin_revalidate_same_entity(&entry, r.headers())
+                        {
+                            cache.apply_origin_not_modified(&cache_key, &entry, r.headers());
+                            r = decorate_cache_hit_response(
+                                build_cache_hit_response(method, CacheHitAction::Respond(entry)),
+                                true,
+                                cache,
+                                None,
+                            );
+                        }
+                    }
+                }
+                r
+            }
             Err(e) => {
                 node.record_failure();
+                if let Some(ref cache) = proxy_cache {
+                    if let Some(mut stale) = crate::middleware::proxy_cache::try_stale_error_serve(
+                        cache,
+                        method,
+                        &cache_key,
+                        ctx.req().headers(),
+                        502,
+                    ) {
+                        response::append_gateway_via(&mut stale, client_version);
+                        return stale;
+                    }
+                }
                 error!("H2 反向代理失败 → {}: {}", node.addr.as_str(), e);
                 response::proxy_error(StatusCode::BAD_GATEWAY, &format!("上游 H2 {} 失败: {}", node.addr.as_str(), e), client_version)
             }
         }
     } else {
         // 将 proxy_cache 引用传入 conn 层，在有完整 body bytes 时导入缓存
-        let cache_ref = proxy_cache.as_ref().map(|c| (c, &cache_key));
+        let cache_ref = proxy_cache
+            .as_ref()
+            .map(|c| (c, &cache_key, ctx.req().headers()));
         // retry 循环：上游级别重试（节点故障），conn::forward_request 内部处理 idle 连接重试
         // body 流只能消耗一次，上游级别重试只在首次（body 尚未消费）时有效
         let flags = pool.next_upstream_flags;
@@ -320,12 +436,59 @@ pub async fn handle_sweety(
                 location.proxy_buffering,
                 current_node.send_proxy_protocol,
                 Some(*ctx.req().body().socket_addr()),
+                informational_sink.as_ref(),
             ).await;
 
             match result {
-                Ok(r) => {
-                    // 检查响应状态码是否匹配重试条件（如 http_502/503/504）
+                Ok(mut r) => {
                     let status = r.status().as_u16();
+                    if let Some(entry) = origin_revalidate_entry.clone() {
+                        use crate::middleware::proxy_cache::{
+                            build_cache_hit_response, decorate_cache_hit_response,
+                            origin_revalidate_same_entity, CacheHitAction,
+                        };
+                        if let Some(ref cache) = proxy_cache {
+                            if r.status() == StatusCode::NOT_MODIFIED {
+                                cache.apply_origin_not_modified(&cache_key, &entry, r.headers());
+                                r = decorate_cache_hit_response(
+                                    build_cache_hit_response(method, CacheHitAction::NotModified(entry)),
+                                    true,
+                                    cache,
+                                    None,
+                                );
+                                current_node.record_success();
+                                resp_opt = Some(r);
+                                break 'retry;
+                            } else if r.status().is_success()
+                                && origin_revalidate_same_entity(&entry, r.headers())
+                            {
+                                cache.apply_origin_not_modified(&cache_key, &entry, r.headers());
+                                r = decorate_cache_hit_response(
+                                    build_cache_hit_response(method, CacheHitAction::Respond(entry)),
+                                    true,
+                                    cache,
+                                    None,
+                                );
+                                current_node.record_success();
+                                resp_opt = Some(r);
+                                break 'retry;
+                            }
+                        }
+                    }
+                    if let Some(ref cache) = proxy_cache {
+                        if let Some(stale) = crate::middleware::proxy_cache::try_stale_error_serve(
+                            cache,
+                            method,
+                            &cache_key,
+                            ctx.req().headers(),
+                            status,
+                        ) {
+                            current_node.record_success();
+                            resp_opt = Some(stale);
+                            break 'retry;
+                        }
+                    }
+                    // 检查响应状态码是否匹配重试条件（如 http_502/503/504）
                     if attempt + 1 < max_attempts && method_allows_retry && flags.matches_status(status) {
                         current_node.record_failure();
                         last_err = format!("HTTP {}", status);
@@ -351,6 +514,17 @@ pub async fn handle_sweety(
         }
 
         resp_opt.unwrap_or_else(|| {
+            if let Some(ref cache) = proxy_cache {
+                if let Some(stale) = crate::middleware::proxy_cache::try_stale_error_serve(
+                    cache,
+                    method,
+                    &cache_key,
+                    ctx.req().headers(),
+                    502,
+                ) {
+                    return stale;
+                }
+            }
             response::proxy_error(StatusCode::BAD_GATEWAY, &format!("上游 {} 响应失败: {}", current_node.addr.as_str(), last_err), client_version)
         })
     };
@@ -359,13 +533,18 @@ pub async fn handle_sweety(
 
     // 缓存写入已在 conn::forward_request 里完成（在 body 完整时导入）
     // 这里只需设置 X-Cache: MISS 头
-    if proxy_cache.is_some() {
+    if let Some(ref cache) = proxy_cache {
         use sweety_web::http::header::{HeaderName, HeaderValue};
-        resp.headers_mut().insert(
-            HeaderName::from_static("x-cache"),
-            HeaderValue::from_static("MISS"),
-        );
+        if !resp.headers().contains_key(HeaderName::from_static("x-cache")) {
+            resp.headers_mut().insert(
+                HeaderName::from_static("x-cache"),
+                HeaderValue::from_static("MISS"),
+            );
+            crate::middleware::proxy_cache::decorate_cache_miss_response(&mut resp, cache);
+        }
     }
+
+    response::promote_grpc_headers_to_trailers(&mut resp);
 
     // proxy_hide_headers：移除上游响应中的指定头（等价 Nginx proxy_hide_header）
     if !location.proxy_hide_headers.is_empty() {
@@ -463,144 +642,3 @@ fn apply_extra_headers(
     }
 }
 
-/// HTTP/2 上游转发
-///
-/// - 全量 collect 请求体（gRPC 通常较小；大文件上传走 H1 路径）
-/// - 响应体流式透传（bounded channel，背压传递给客户端）
-#[allow(clippy::too_many_arguments)]
-async fn forward_request_h2(
-    pool: std::sync::Arc<upstream_h2::H2NodePool>,
-    method: &str,
-    path: &str,
-    host: &str,
-    extra_headers: &[(String, String)],
-    client_ip: &str,
-    scheme: &str,
-    req_body: sweety_web::body::RequestBody,
-    strip_cookie_secure: bool,
-    proxy_cookie_domain: Option<&str>,
-    proxy_redirect_from: Option<&str>,
-    proxy_redirect_to: Option<&str>,
-    read_timeout_secs: u64,
-) -> anyhow::Result<WebResponse> {
-    use bytes::Bytes;
-    use futures_util::StreamExt;
-    use sweety_web::body::ResponseBody;
-    use sweety_web::http::header::{HeaderName, HeaderValue, CONTENT_LENGTH};
-
-    let read_timeout = std::time::Duration::from_secs(if read_timeout_secs > 0 { read_timeout_secs } else { 60 });
-
-    // 构造 HTTP/2 请求
-    use sweety_web::http::{Version, request::Builder as ReqBuilder};
-    let uri_str = format!("https://{}{}", host, path);
-    let uri: sweety_web::http::Uri = uri_str.parse().unwrap_or_else(|_| {
-        format!("https://localhost{}", path).parse().unwrap()
-    });
-
-    let mut builder = ReqBuilder::new()
-        .method(method)
-        .uri(uri)
-        .version(Version::HTTP_2);
-
-    // 透传请求头，跳过 hop-by-hop
-    for (k, v) in extra_headers {
-        if response::is_hop_by_hop(k) { continue; }
-        if k.eq_ignore_ascii_case("content-length") { continue; }
-        if let (Ok(name), Ok(val)) = (
-            HeaderName::from_bytes(k.as_bytes()),
-            HeaderValue::from_str(v),
-        ) {
-            builder = builder.header(name, val);
-        }
-    }
-    // 上层已合并的转发头存在时不再重复追加（同名头只出现一次）
-    let has = |name: &str| extra_headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name));
-    if !has("x-real-ip") { builder = builder.header("x-real-ip", client_ip); }
-    if !has("x-forwarded-for") { builder = builder.header("x-forwarded-for", client_ip); }
-    if !has("x-forwarded-proto") { builder = builder.header("x-forwarded-proto", scheme); }
-
-    // 全量 collect 请求体（H2 stream 层已有流量控制）
-    let body_bytes: Option<Bytes> = {
-        let mut body = req_body;
-        let mut buf = bytes::BytesMut::new();
-        while let Some(chunk) = body.next().await {
-            match chunk {
-                Ok(b) => buf.extend_from_slice(&b),
-                Err(_) => break,
-            }
-        }
-        if buf.is_empty() { None } else { Some(buf.freeze()) }
-    };
-
-    let req = builder.body(()).map_err(|e| anyhow::anyhow!("h2 build request: {e}"))?;
-    let (parts, recv_stream) = pool.send(req, body_bytes).await?;
-
-    let status = StatusCode::from_u16(parts.status.as_u16()).unwrap_or(StatusCode::OK);
-
-    // 收集响应头（透传给客户端）
-    let mut resp_headers: Vec<(String, String)> = Vec::with_capacity(parts.headers.len());
-    for (k, v) in &parts.headers {
-        if let Ok(vs) = v.to_str() {
-            resp_headers.push((k.as_str().to_string(), vs.to_string()));
-        }
-    }
-
-    // HEAD / 304/204/205/1xx 无 body
-    let no_body = method.eq_ignore_ascii_case("HEAD")
-        || status == StatusCode::NOT_MODIFIED
-        || status == StatusCode::NO_CONTENT
-        || status == StatusCode::RESET_CONTENT
-        || status.is_informational();
-
-    if no_body {
-        let mut resp = WebResponse::new(ResponseBody::none());
-        *resp.status_mut() = status;
-        response::apply_response_headers(&mut resp, &resp_headers,
-            strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to);
-        return Ok(resp);
-    }
-
-    // 流式透传响应体（bounded channel，背压）
-    // spawn_local：在同一 worker 线程驱动，避免跨线程调度开销
-    // SSE：不设空闲超时，客户端断开（rx drop）时结束
-    let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(4);
-    tokio::task::spawn_local(async move {
-        let mut stream = recv_stream;
-        loop {
-            let next = tokio::select! {
-                biased;
-                _ = tx.closed() => break,
-                r = tokio::time::timeout(read_timeout, stream.data()) => r,
-            };
-            match next {
-                Ok(Some(Ok(data))) => {
-                    let _ = stream.flow_control().release_capacity(data.len());
-                    if tx.send(Ok(data)).await.is_err() { break; }
-                }
-                Ok(Some(Err(e))) => {
-                    let _ = tx.send(Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, e.to_string()))).await;
-                    break;
-                }
-                Ok(None) => break,
-                Err(_) => {
-                    let _ = tx.send(Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "h2 上游响应体读取超时"))).await;
-                    break;
-                }
-            }
-        }
-    });
-
-    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-    let mut resp = WebResponse::new(ResponseBody::box_stream(stream));
-    *resp.status_mut() = status;
-    response::apply_response_headers(&mut resp, &resp_headers,
-        strip_cookie_secure, proxy_cookie_domain, proxy_redirect_from, proxy_redirect_to);
-
-    // H2 响应无 Transfer-Encoding，保留 Content-Length（若上游提供）
-    resp.headers_mut().remove(sweety_web::http::header::TRANSFER_ENCODING);
-    if let Some(cl) = parts.headers.get(CONTENT_LENGTH) {
-        resp.headers_mut().insert(CONTENT_LENGTH, cl.clone());
-    }
-
-    Ok(resp)
-}
