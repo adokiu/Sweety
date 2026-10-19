@@ -178,7 +178,15 @@ where
             ServerStream::Udp(io, addr) => {
                 // 连接级限流：原子计数器，支持热更新
                 h3_conn_acquire().await;
-                let result = super::h3::Dispatcher::new(io, addr, Arc::clone(&self.service), self.date.get_rc())
+                let result = super::h3::Dispatcher::new(
+                    io,
+                    addr,
+                    Arc::clone(&self.service),
+                    self.date.get_rc(),
+                    self.config.h3_max_pending_per_conn,
+                    self.config.h3_max_requests_per_conn,
+                    self.config.h3_enable_0rtt,
+                )
                     .run()
                     .await
                     .map_err(From::from);

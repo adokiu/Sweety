@@ -11,7 +11,10 @@ use ::h3::server::{self, RequestResolver, RequestStream};
 use futures_core::stream::Stream;
 use h3_quinn::RecvStream as QuinnRecvStream;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use sweety_io_compat::net::QuicStream;
 use sweety_service::Service;
 use tracing::{debug, warn};
@@ -31,6 +34,9 @@ pub(crate) struct Dispatcher<S, ReqB> {
     addr: SocketAddr,
     service: Arc<S>,
     date: Rc<DateTimeHandle>,
+    max_pending: usize,
+    max_requests: usize,
+    enable_0rtt: bool,
     _req_body: PhantomData<ReqB>,
 }
 
@@ -42,13 +48,38 @@ where
     BE: fmt::Debug,
     ReqB: From<RequestBody> + 'static,
 {
-    pub(crate) fn new(io: QuicStream, addr: SocketAddr, service: Arc<S>, date: Rc<DateTimeHandle>) -> Self {
-        Self { io, addr, service, date, _req_body: PhantomData }
+    pub(crate) fn new(
+        io: QuicStream,
+        addr: SocketAddr,
+        service: Arc<S>,
+        date: Rc<DateTimeHandle>,
+        max_pending: usize,
+        max_requests: usize,
+        enable_0rtt: bool,
+    ) -> Self {
+        Self {
+            io,
+            addr,
+            service,
+            date,
+            max_pending,
+            max_requests,
+            enable_0rtt,
+            _req_body: PhantomData,
+        }
     }
 
     pub(crate) async fn run(self) -> Result<(), Error<S::Error, BE>> {
-        let conn = self.io.connecting().await?;
-        let conn = h3_quinn::Connection::new(conn);
+        let h3_quic = self.io.into_h3_server(self.enable_0rtt).await?;
+        let pre_handshake = Arc::new(AtomicBool::new(h3_quic.zero_rtt.is_some()));
+        if let Some(zero_rtt) = h3_quic.zero_rtt {
+            let pre = Arc::clone(&pre_handshake);
+            tokio::task::spawn_local(async move {
+                let _ = zero_rtt.await;
+                pre.store(false, Ordering::Release);
+            });
+        }
+        let conn = h3_quinn::Connection::new(h3_quic.quinn);
         let mut builder = server::builder();
         builder.max_field_section_size(65536);
         let mut conn = builder.build(conn).await?;
@@ -87,6 +118,19 @@ where
                     match accept {
                         Ok(Some(resolver)) => {
                             request_count += 1;
+                            let pending = handlers.len();
+                            if self.max_pending > 0 && pending >= self.max_pending {
+                                match conn.shutdown(pending).await {
+                                    Err(e) => debug!(addr = %self.addr, error = %e, "h3 GOAWAY 发送失败"),
+                                    Ok(()) => debug!(addr = %self.addr, reason = "max_pending_per_conn", pending, "h3 GOAWAY 已发送"),
+                                }
+                            }
+                            if self.max_requests > 0 && request_count as usize >= self.max_requests {
+                                match conn.shutdown(pending).await {
+                                    Err(e) => debug!(addr = %self.addr, error = %e, "h3 GOAWAY 发送失败"),
+                                    Ok(()) => debug!(addr = %self.addr, reason = "max_requests_per_conn", pending, "h3 GOAWAY 已发送"),
+                                }
+                            }
                             // 每 1000 请求输出一次连接级摘要
                             if request_count % 1000 == 0 {
                                 debug!(
@@ -96,13 +140,26 @@ where
                                     "h3 连接摘要"
                                 );
                             }
+                            let pre = Arc::clone(&pre_handshake);
                             // 低并发快路：没有待处理 handler 时直接 inline，减少一次 future 入队/调度
                             if handlers.is_empty() {
-                                if let Err(e) = resolve_and_handle(Arc::clone(&self.service), resolver, self.addr, Rc::clone(&self.date)).await {
+                                if let Err(e) = resolve_and_handle(
+                                    Arc::clone(&self.service),
+                                    resolver,
+                                    self.addr,
+                                    Rc::clone(&self.date),
+                                    pre,
+                                ).await {
                                     HttpServiceError::from(e).log("h3_handler");
                                 }
                             } else {
-                                handlers.push(run_resolve_and_handle(Arc::clone(&self.service), resolver, self.addr, Rc::clone(&self.date)));
+                                handlers.push(run_resolve_and_handle(
+                                    Arc::clone(&self.service),
+                                    resolver,
+                                    self.addr,
+                                    Rc::clone(&self.date),
+                                    pre,
+                                ));
                             }
                         }
                         Ok(None) => {
@@ -129,11 +186,16 @@ where
     }
 }
 
+fn is_idempotent_method(method: &Method) -> bool {
+    matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE)
+}
+
 async fn run_resolve_and_handle<S, ReqB, ResB, BE>(
     service: Arc<S>,
     resolver: RequestResolver<h3_quinn::Connection, Bytes>,
     addr: SocketAddr,
     date: Rc<DateTimeHandle>,
+    pre_handshake: Arc<AtomicBool>,
 )
 where
     S: Service<Request<RequestExt<ReqB>>, Response = Response<ResB>>,
@@ -142,7 +204,7 @@ where
     ResB: Stream<Item = Result<Bytes, BE>>,
     BE: fmt::Debug,
 {
-    if let Err(e) = resolve_and_handle(service, resolver, addr, date).await {
+    if let Err(e) = resolve_and_handle(service, resolver, addr, date, pre_handshake).await {
         HttpServiceError::from(e).log("h3_handler");
     }
 }
@@ -290,6 +352,7 @@ async fn resolve_and_handle<S, ReqB, ResB, BE>(
     resolver: RequestResolver<h3_quinn::Connection, Bytes>,
     addr: SocketAddr,
     date: Rc<DateTimeHandle>,
+    pre_handshake: Arc<AtomicBool>,
 ) -> Result<(), Error<S::Error, BE>>
 where
     S: Service<Request<RequestExt<ReqB>>, Response = Response<ResB>>,
@@ -300,6 +363,28 @@ where
 {
     let (req, stream) = resolver.resolve_request().await?;
     let method = req.method().clone();
+    if pre_handshake.load(Ordering::Acquire) && !is_idempotent_method(&method) {
+        debug!(addr = %addr, %method, "H3 0-RTT 重放防护：拒绝非幂等 Early 请求 (425)");
+        let (mut tx, _rx): (_, RequestStream<QuinnRecvStream, Bytes>) = stream.split();
+        let mut parts = crate::http::response::Parts::default();
+        parts.status = StatusCode::TOO_EARLY;
+        {
+            use crate::http::header::{DATE, HeaderValue};
+            if let Ok(v) = date.with_date(HeaderValue::from_bytes) {
+                parts.headers.insert(DATE, v);
+            }
+        }
+        let mut headers = parts.headers.clone();
+        match prepare_response(&method, parts.status, &mut headers, BodySize::None) {
+            Ok(_state) => {
+                parts.headers = headers;
+                tx.send_response(crate::http::Response::from_parts(parts, ())).await?;
+                tx.finish().await?;
+            }
+            Err(reason) => reset_message(&mut tx, reason),
+        }
+        return Ok(());
+    }
     let (mut tx, rx): (_, RequestStream<QuinnRecvStream, Bytes>) = stream.split();
     let body = RequestBody::new(rx);
 
@@ -435,4 +520,20 @@ where
     // fire-and-forget：不等客户端 ACK FIN
     tokio::task::spawn_local(async move { let _ = tx.finish().await; });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_idempotent_method;
+    use crate::http::Method;
+
+    #[test]
+    fn idempotent_methods_for_0rtt() {
+        for m in [Method::GET, Method::HEAD, Method::OPTIONS, Method::TRACE] {
+            assert!(is_idempotent_method(&m), "{m}");
+        }
+        for m in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE, Method::CONNECT] {
+            assert!(!is_idempotent_method(&m), "{m}");
+        }
+    }
 }

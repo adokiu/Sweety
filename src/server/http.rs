@@ -227,7 +227,15 @@ impl SweetyServer {
         server = server.h2_max_concurrent_reset_streams(cfg.global.h2_max_concurrent_reset_streams);
         server = server.h2_max_frame_size(cfg.global.h2_max_frame_size);
         server = server.h2_max_requests_per_conn(cfg.global.h2_max_requests_per_conn);
-
+        if cfg.global.h3_max_pending_per_conn > 0 {
+            server = server.h3_max_pending_per_conn(cfg.global.h3_max_pending_per_conn);
+        }
+        server = server.h3_max_requests_per_conn(cfg.global.h3_max_requests_per_conn);
+        let h3_enable_0rtt = cfg.sites.iter()
+            .filter_map(|s| s.tls.as_ref())
+            .filter(|tls| tls.protocols.iter().any(|p| p == "h3"))
+            .any(|tls| tls.http3.enable_0rtt);
+        server = server.h3_enable_0rtt(h3_enable_0rtt);
 
         // 绑定各站点监听端口（HTTP 明文）
         let http_ports = collect_http_ports(&cfg);

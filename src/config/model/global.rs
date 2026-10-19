@@ -23,6 +23,7 @@ fn default_h2_max_concurrent_streams() -> u32 { 128 }
 fn default_h2_max_concurrent_reset_streams() -> usize { 200 }
 fn default_h2_max_frame_size() -> u32 { 65535 }
 fn default_h2_max_requests_per_conn() -> usize { 1000 }
+fn default_h3_max_requests_per_conn() -> usize { 1000 }
 fn default_true() -> bool { true }
 
 /// 全局配置项
@@ -137,6 +138,14 @@ pub struct GlobalConfig {
     #[serde(default = "default_h2_max_requests_per_conn")]
     pub h2_max_requests_per_conn: usize,
 
+    /// HTTP/3 单连接最大同时在途 handler 数量（默认 0 = 不限制）
+    #[serde(default)]
+    pub h3_max_pending_per_conn: usize,
+
+    /// HTTP/3 单连接最大请求数（0 = 不限制，默认 1000）
+    #[serde(default = "default_h3_max_requests_per_conn")]
+    pub h3_max_requests_per_conn: usize,
+
 }
 
 impl Default for GlobalConfig {
@@ -169,6 +178,8 @@ impl Default for GlobalConfig {
             h2_max_concurrent_reset_streams: default_h2_max_concurrent_reset_streams(),
             h2_max_frame_size: default_h2_max_frame_size(),
             h2_max_requests_per_conn: default_h2_max_requests_per_conn(),
+            h3_max_pending_per_conn: 0,
+            h3_max_requests_per_conn: default_h3_max_requests_per_conn(),
         }
     }
 }
