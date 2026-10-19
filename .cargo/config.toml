@@ -1,11 +1,6 @@
-# musl 交叉：配合 `cargo zigbuild --target x86_64-unknown-linux-musl`（Zig 作 linker/cc，无 Docker）
-# jemalloc / aws-lc-sys 等 build.rs 由 cargo-zigbuild 注入 zig cc -target x86_64-linux-musl
+# x86_64 musl：CI / musl-tools 使用 musl-gcc；本机可用 scripts/build-linux-amd64-musl.sh（cargo-zigbuild 会覆盖 linker）
 [target.x86_64-unknown-linux-musl]
-linker = "zig"
-rustflags = [
-  "-C", "link-arg=-target",
-  "-C", "link-arg=x86_64-linux-musl",
-]
+linker = "musl-gcc"
 
 # CPU 指令集优化（暂时禁用，本地 native 编译收益有限）
 # 如需本机最大性能，取消下方注释或在编译时传 RUSTFLAGS="-C target-cpu=native"

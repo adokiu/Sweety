@@ -12,6 +12,10 @@ inputs:
     description: Use cross-rs instead of cargo
     required: false
     default: 'false'
+  no-default-features:
+    description: Build with --no-default-features (skip jemalloc on 32-bit musl etc.)
+    required: false
+    default: 'false'
 
 runs:
   using: composite
@@ -59,12 +63,24 @@ runs:
     - name: Build (native)
       if: inputs.cross != 'true'
       shell: bash
-      run: cargo build --release --target "${{ inputs.target }}"
+      run: |
+        set -euo pipefail
+        args=(build --release --target "${{ inputs.target }}")
+        if [[ "${{ inputs.no-default-features }}" == 'true' ]]; then
+          args+=(--no-default-features)
+        fi
+        cargo "${args[@]}"
 
     - name: Build (cross)
       if: inputs.cross == 'true'
       shell: bash
-      run: cross build --release --target "${{ inputs.target }}"
+      run: |
+        set -euo pipefail
+        args=(build --release --target "${{ inputs.target }}")
+        if [[ "${{ inputs.no-default-features }}" == 'true' ]]; then
+          args+=(--no-default-features)
+        fi
+        cross "${args[@]}"
 
     - name: Stage binary (Unix)
       if: runner.os != 'Windows'

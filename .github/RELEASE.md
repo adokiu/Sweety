@@ -31,7 +31,6 @@ sweety-{os}-{arch}[-{libc}][.exe]
 | `sweety-linux-*-gnu` | Linux glibc |
 | `sweety-macos-aarch64` / `sweety-macos-amd64` | macOS |
 | `sweety-freebsd-*` | FreeBSD |
-| `sweety-netbsd-amd64` | NetBSD（secondary，可能缺失） |
 | `sweety-windows-*.exe` | Windows MSVC |
 
 `arch`：`amd64`、`aarch64`、`armv7`、`i686`、`riscv64`、`ppc64le`、`s390x`、`loong64`。
@@ -39,9 +38,13 @@ sweety-{os}-{arch}[-{libc}][.exe]
 ## 构建矩阵
 
 - **build-primary**：发版必需；全部成功才会创建 Release。
-- **build-secondary**：`ppc64le`、`s390x`、`netbsd`；`continue-on-error`，失败不阻断发版。
+- **build-secondary**：`ppc64le`、`s390x`；`continue-on-error`，失败不阻断发版。
 
-未纳入 CI 的平台（需自备工具链或 cross 镜像）：`loongarch64`、`freebsd-aarch64` 等。
+- **32 位 musl**（`i686` / `armv7`）：`--no-default-features`（jemalloc 在 32 位 musl 上链接会缺 `__ffsdi2`）。
+
+未纳入 CI：`loongarch64`、`freebsd-aarch64`、`netbsd` 等（cross / 链接库不完整）。
+
+CI 上 `x86_64-unknown-linux-musl` 使用 `musl-gcc`（见 `.cargo/config.toml`）；本机 Zig 静态编译仍用 `scripts/build-linux-amd64-musl.sh`。
 
 本地与 CI 共用 [.github/actions/build-release](actions/build-release/action.yml)。
 
