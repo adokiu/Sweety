@@ -234,7 +234,7 @@ fn set_tcp_cork(fd: i32, on: bool) {
     // SAFETY: fd 来自已建立的 TLS 连接，生命周期由调用方保证有效
     // ManuallyDrop 确保函数返回时不会 close fd（不拥有所有权）
     let owned = std::mem::ManuallyDrop::new(unsafe { std::net::TcpStream::from_raw_fd(fd) });
-    let _ = socket2::SockRef::from(&*owned).set_cork(on);
+    let _ = socket2::SockRef::from(&*owned).set_tcp_cork(on);
 }
 
 #[cfg(not(target_os = "linux"))]

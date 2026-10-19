@@ -100,6 +100,15 @@ fn validate_config(cfg: &AppConfig) -> Result<()> {
         if site.server_name.is_empty() {
             bail!("站点 '{}' 的 server_name 列表不能为空", site.name);
         }
+        for sn in &site.server_name {
+            if sn.starts_with("*.") {
+                if crate::dispatcher::host::normalize_host_key(&sn[2..]).is_none() {
+                    bail!("站点 '{}' 的通配符 server_name '{}' 无效", site.name, sn);
+                }
+            } else if crate::dispatcher::host::normalize_host_key(sn).is_none() {
+                bail!("站点 '{}' 的 server_name '{}' 无效", site.name, sn);
+            }
+        }
         // 校验上游引用合法性
         for loc in &site.locations {
             if loc.handler == crate::config::model::HandlerType::ReverseProxy {
@@ -119,6 +128,14 @@ fn validate_config(cfg: &AppConfig) -> Result<()> {
                     }
                 }
             }
+        }
+        if !site.listen_tls.is_empty() && site.tls.is_none() {
+            tracing::warn!(
+                target: "sweety::config",
+                site = %site.name,
+                listen_tls = ?site.listen_tls,
+                "listen_tls 已配置但未设置 [sites.tls] 或 acme_email：不会监听 HTTPS，也不会从 HTTP 强制跳转"
+            );
         }
         // 校验 TLS：手动证书模式下必须有 cert/key 或 certs 列表
         if let Some(tls) = &site.tls {

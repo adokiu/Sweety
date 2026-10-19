@@ -377,8 +377,11 @@ where
     if pre_handshake.load(Ordering::Acquire) && !is_idempotent_method(&method) {
         debug!(addr = %addr, %method, "H3 0-RTT 重放防护：拒绝非幂等 Early 请求 (425)");
         let (mut tx, _rx): (_, RequestStream<QuinnRecvStream, Bytes>) = stream.split();
-        let mut parts = crate::http::response::Parts::default();
-        parts.status = StatusCode::TOO_EARLY;
+        let response = crate::http::Response::builder()
+            .status(StatusCode::TOO_EARLY)
+            .body(())
+            .expect("425 Too Early is a valid response status");
+        let (mut parts, _) = response.into_parts();
         {
             use crate::http::header::{DATE, HeaderValue};
             if let Ok(v) = date.with_date(HeaderValue::from_bytes) {

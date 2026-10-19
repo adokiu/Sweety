@@ -78,8 +78,8 @@ pub(super) fn access_count_check(key: &Arc<str>) -> bool {
     count + 1 >= MIN_USES_THRESHOLD
 }
 
-/// 定期清理过期访问计数器（防内存泄漏，与 fd_cache 清理一同调用）
-pub fn cleanup_access_counter() {
+/// 访问计数器膨胀时淘汰一部分条目（与 fd_cache 批量淘汰一同触发）
+fn cleanup_access_counter() {
     let counter = access_counter();
     if counter.len() > 500_000 {
         // 简单随机淘汰 1/4（低开销，无需精确 LRU）
@@ -98,6 +98,8 @@ pub fn cleanup_access_counter() {
 /// 文件内存缓存条目（预缓存所有响应头 HeaderValue，缓存命中时零分配）
 #[derive(Clone)]
 pub(super) struct FileCacheEntry {
+    /// 磁盘上的 canonical 路径；用于 mtime 校验与 notify 失效（同一文件可能有多条 lookup key）
+    pub(super) source_path:   Arc<str>,
     pub(super) data:          Bytes,
     pub(super) gz:            Option<Bytes>,
     pub(super) br:            Option<Bytes>,
@@ -156,6 +158,40 @@ pub(super) fn make_cache_key_from_path(path: &Path) -> Arc<str> {
 
 /// 零分配缓存查询（栈缓冲拼接 key，不分配堆内存）
 #[inline]
+/// 按磁盘 mtime 剔除过期条目（含 `/` 与 `/index.html` 等别名 key）
+pub(super) fn purge_file_cache_for_source(source: &str) {
+    let cache = file_cache();
+    let to_remove: Vec<Arc<str>> = cache
+        .iter()
+        .filter(|e| e.value().source_path.as_ref() == source)
+        .map(|e| e.key().clone())
+        .collect();
+    for k in &to_remove {
+        cache.remove(k.as_ref());
+    }
+    if !to_remove.is_empty() {
+        tracing::debug!("文件缓存已淡化: {} ({} 个 key)", source, to_remove.len());
+    }
+    fd_cache().remove(source);
+}
+
+/// 热路径查缓存；命中后 stat 校验 mtime，避免 notify 只删掉 canonical key 时别名 key 仍返回旧内容
+pub(super) async fn cache_get_validated(
+    root: &Path,
+    relative: &str,
+) -> Option<FileCacheEntry> {
+    let entry = cache_get_fast(root, relative)?;
+    let path = Path::new(entry.source_path.as_ref());
+    let meta = tokio::fs::metadata(path).await.ok()?;
+    let modified = meta.modified().ok()?;
+    let secs = crate::middleware::cache::to_unix_secs(modified);
+    if secs != entry.modified_secs {
+        purge_file_cache_for_source(entry.source_path.as_ref());
+        return None;
+    }
+    Some(entry)
+}
+
 pub(super) fn cache_get_fast(root: &Path, relative: &str) -> Option<FileCacheEntry> {
     let root_str = root.to_str().unwrap_or("");
     let mut buf = [0u8; 512];
@@ -194,7 +230,10 @@ pub(super) async fn fd_cache_get_or_open_arc(
 ) -> Option<Arc<std::fs::File>> {
     let key: Arc<str> = Arc::from(path.to_str().unwrap_or(""));
     if let Some(entry) = fd_cache_get(&key) {
-        return Some(entry.fd);
+        if entry.modified_secs == modified_secs {
+            return Some(entry.fd);
+        }
+        fd_cache().remove(key.as_ref());
     }
     match std::fs::File::open(path) {
         Ok(f) => {
@@ -216,6 +255,7 @@ pub(super) fn fd_cache_insert_arc(
     let cache = fd_cache();
     let max = limits().fd_cache_max_entries;
     if cache.len() >= max {
+        cleanup_access_counter();
         let to_remove: Vec<_> = cache.iter()
             .take(max / 4)
             .map(|e| e.key().clone())
@@ -262,12 +302,9 @@ pub fn start_file_cache_watcher(roots: Vec<PathBuf>) -> Option<RecommendedWatche
             EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
         ) { return; }
 
-        let cache = file_cache();
         for path in &event.paths {
             if let Some(key) = path.to_str() {
-                if cache.remove(key).is_some() {
-                    tracing::debug!("文件缓存已淡化: {}", path.display());
-                }
+                purge_file_cache_for_source(key);
             }
         }
     });
@@ -286,5 +323,43 @@ pub fn start_file_cache_watcher(roots: Vec<PathBuf>) -> Option<RecommendedWatche
             tracing::warn!("文件缓存 notify 初始化失败: {}，回退到定期检查模式", e);
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use sweety_web::http::header::HeaderValue;
+
+    fn dummy_entry(source: &str, mtime: u64) -> FileCacheEntry {
+        FileCacheEntry {
+            source_path: Arc::from(source),
+            data: Bytes::from_static(b"old"),
+            gz: None,
+            br: None,
+            zst: None,
+            modified_secs: mtime,
+            hv_content_type: HeaderValue::from_static("text/html"),
+            hv_content_length: HeaderValue::from_static("3"),
+            hv_etag: HeaderValue::from_static("\"old\""),
+            hv_last_modified: HeaderValue::from_static("Thu, 01 Jan 1970 00:00:00 GMT"),
+            hv_cache_control: HeaderValue::from_static("no-cache"),
+        }
+    }
+
+    #[test]
+    fn purge_file_cache_removes_all_alias_keys() {
+        let src = "/tmp/site/index.html";
+        let alias = "/tmp/site/";
+        cache_insert(Arc::from(src), dummy_entry(src, 1));
+        cache_insert(Arc::from(alias), dummy_entry(src, 1));
+        assert!(file_cache().get(src).is_some());
+        assert!(file_cache().get(alias).is_some());
+
+        purge_file_cache_for_source(src);
+
+        assert!(file_cache().get(src).is_none());
+        assert!(file_cache().get(alias).is_none());
     }
 }

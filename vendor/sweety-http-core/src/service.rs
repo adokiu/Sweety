@@ -353,6 +353,16 @@ async fn parse_proxy_protocol_header(
 
     let mut buf = [0u8; 232];
     let n = io.peek(&mut buf).await?;
+    if n == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "PROXY protocol: 连接在读取头之前关闭",
+        ));
+    }
+    // PROXY v2 以 0x0D 开头，v1 以 "PROXY " 开头；其余（GET/POST/HEAD…）视为直连 HTTP，不消费字节
+    if buf[0] != 0x0D && buf[0] != b'P' {
+        return Ok(None);
+    }
     if n < 8 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -447,6 +457,7 @@ async fn parse_proxy_protocol_header(
         })?;
         Ok(Some(SocketAddr::new(src_ip, src_port)))
     } else {
+        // 以 P/0x0D 开头但格式不对：可能是损坏的 PP 或罕见前缀，关闭连接
         Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "PROXY protocol: 既非 v1 也非 v2 格式",

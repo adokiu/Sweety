@@ -59,7 +59,7 @@ pub mod h1;
 pub mod h2;
 #[cfg(feature = "http3")]
 pub mod h3;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod sendfile_ext;
 
 /// re-export bytes crate as module.

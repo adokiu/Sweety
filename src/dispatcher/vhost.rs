@@ -2,7 +2,6 @@
 //! 负责：根据请求的 Host header 找到对应的站点配置
 //! 支持精确匹配、通配符匹配（*.example.com）
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -136,7 +135,8 @@ impl SiteInfo {
             gzip: cfg.gzip,
             gzip_comp_level: cfg.gzip_comp_level,
             compress: cfg.compress.clone(),
-            force_https: cfg.force_https && !cfg.listen_tls.is_empty(),
+            // 仅当 TLS 配置存在且会尝试绑定 listen_tls 时才强制跳转（避免仅有 listen_tls 无证书时 301 到死 HTTPS）
+            force_https: cfg.force_https && cfg.tls.is_some() && !cfg.listen_tls.is_empty(),
             listen_tls: cfg.listen_tls.clone(),
             error_pages: cfg.error_pages.clone(),
             proxy_cache: cfg.proxy_cache.clone(),
@@ -199,10 +199,27 @@ impl VHostRegistry {
         wildcard.retain(|_, v| v.name != site_cfg.name);
         for server_name in &site_cfg.server_name {
             if server_name.starts_with("*.") {
-                let suffix = server_name[2..].to_lowercase();
+                let Some(suffix) = super::host::normalize_host_key(&server_name[2..]) else {
+                    tracing::warn!(
+                        target: "sweety::vhost",
+                        site = %site_cfg.name,
+                        server_name = %server_name,
+                        "通配符 server_name 后缀无法规范化，已跳过"
+                    );
+                    continue;
+                };
                 wildcard.insert(suffix, Arc::clone(&site_info));
             } else {
-                exact.insert(server_name.to_lowercase(), Arc::clone(&site_info));
+                let Some(key) = super::host::normalize_host_key(server_name) else {
+                    tracing::warn!(
+                        target: "sweety::vhost",
+                        site = %site_cfg.name,
+                        server_name = %server_name,
+                        "server_name 无法规范化，已跳过"
+                    );
+                    continue;
+                };
+                exact.insert(key, Arc::clone(&site_info));
             }
         }
         if site_cfg.fallback {
@@ -271,17 +288,12 @@ impl VHostRegistry {
     }
 
     /// 根据 Host 字符串查找站点（HTTP：不匹配时返回显式指定的 fallback 站点）
-    ///
-    /// 完全无锁：load() 只做一次原子读。
-    /// Cow 优化：Host 头概率已是 ASCII 小写，直接借用，避免堆分配。
     pub fn lookup(&self, host: &str) -> Option<Arc<SiteInfo>> {
-        let host = strip_port(host);
         self.lookup_inner(host)
     }
 
     /// 严格匹配：HTTPS 请求防跨站用
     pub fn lookup_strict(&self, host: &str) -> Option<Arc<SiteInfo>> {
-        let host = strip_port(host);
         self.lookup_inner(host)
     }
 
@@ -297,25 +309,20 @@ impl VHostRegistry {
         self.lookup_inner(host)
     }
 
-    /// 内部查找实现，host 必须已去掉端口
+    /// 内部查找实现：端口剥离 + IDNA / IPv6 / FQDN 规范化后与注册表匹配
     #[inline(always)]
     fn lookup_inner(&self, host: &str) -> Option<Arc<SiteInfo>> {
-        let host_lower: Cow<str> = if host.bytes().all(|b| !b.is_ascii_uppercase()) {
-            Cow::Borrowed(host)
-        } else {
-            Cow::Owned(host.to_ascii_lowercase())
-        };
+        let key = super::host::normalize_host_key(host)?;
         let inner = self.inner.load();
-        if let Some(site) = inner.exact.get(host_lower.as_ref()) {
+        if let Some(site) = inner.exact.get(&key) {
             return Some(Arc::clone(site));
         }
-        if let Some(dot_pos) = host_lower.find('.') {
-            let suffix = &host_lower[dot_pos + 1..];
+        if let Some(dot_pos) = key.find('.') {
+            let suffix = &key[dot_pos + 1..];
             if let Some(site) = inner.wildcard.get(suffix) {
                 return Some(Arc::clone(site));
             }
         }
-        // fallback 站点接受所有未匹配请求（HTTP 和 HTTPS 均可）
         inner.fallback.as_ref().map(Arc::clone)
     }
 
@@ -335,22 +342,6 @@ impl VHostRegistry {
             .filter(|s| seen.insert(Arc::as_ptr(*s) as usize))
             .map(Arc::clone)
             .collect()
-    }
-}
-
-/// 去掉 Host 中的端口部分（处理 IPv6 `[::1]:8080` 格式）
-fn strip_port(host: &str) -> &str {
-    if host.starts_with('[') {
-        // IPv6 格式
-        if let Some(end) = host.find(']') {
-            return &host[..=end];
-        }
-    }
-    // 普通 host:port 或纯 host
-    if let Some(pos) = host.rfind(':') {
-        &host[..pos]
-    } else {
-        host
     }
 }
 
@@ -432,6 +423,17 @@ mod tests {
         let reg = VHostRegistry::from_config(&sites);
         let r = reg.lookup("example.com");
         assert_eq!(r.as_ref().map(|s| s.name.as_str()), Some("demo"));
+        assert_eq!(reg.lookup("Example.COM:8080").as_ref().map(|s| s.name.as_str()), Some("demo"));
+    }
+
+    #[test]
+    fn test_idna_host_match() {
+        let unicode = "例子.测试";
+        let puny = idna::domain_to_ascii(unicode).unwrap();
+        let sites = vec![make_site("idn", &[unicode])];
+        let reg = VHostRegistry::from_config(&sites);
+        assert_eq!(reg.lookup(unicode).as_ref().map(|s| s.name.as_str()), Some("idn"));
+        assert_eq!(reg.lookup(&puny).as_ref().map(|s| s.name.as_str()), Some("idn"));
     }
 
     #[test]
@@ -442,13 +444,6 @@ mod tests {
         assert_eq!(r.as_ref().map(|s| s.name.as_str()), Some("demo"));
         // 无 fallback 站点时不匹配返回 None
         assert!(reg.lookup("example.com").is_none());
-    }
-
-    #[test]
-    fn test_strip_port() {
-        assert_eq!(strip_port("example.com:8080"), "example.com");
-        assert_eq!(strip_port("example.com"), "example.com");
-        assert_eq!(strip_port("[::1]:8080"), "[::1]");
     }
 
     #[test]

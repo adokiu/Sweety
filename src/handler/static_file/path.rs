@@ -2,6 +2,43 @@
 
 use std::path::{Path, PathBuf};
 
+use percent_encoding::percent_decode_str;
+
+/// 按 `/` 分段 percent-decode（RFC 9110 / Nginx `$uri` 语义，`%2F` 不扩成路径分隔符）
+pub fn decode_uri_path(path: &str) -> Option<String> {
+    if path.is_empty() {
+        return Some("/".to_string());
+    }
+    let mut out = String::new();
+    let mut at_start = true;
+    for segment in path.split('/') {
+        if at_start {
+            at_start = false;
+            if segment.is_empty() {
+                out.push('/');
+                continue;
+            }
+        } else {
+            out.push('/');
+        }
+        if segment.is_empty() {
+            continue;
+        }
+        let dec = percent_decode_str(segment).decode_utf8().ok()?.into_owned();
+        if dec == ".." || dec.contains('/') || dec.contains('\\') || dec.contains('\0') {
+            return None;
+        }
+        out.push_str(&dec);
+    }
+    if path.ends_with('/') && path != "/" {
+        out.push('/');
+    }
+    if out.is_empty() {
+        out.push('/');
+    }
+    Some(out)
+}
+
 // ─────────────────────────────────────────────
 // try_files
 // ─────────────────────────────────────────────
@@ -119,8 +156,9 @@ fn resolve_safe_path_with_canon(
     canonical_root: Option<&Path>,
 ) -> Option<PathBuf> {
     let path_only = request_path.split('?').next().unwrap_or(request_path);
+    let path_only = decode_uri_path(path_only)?;
 
-    // 安全修复：同时按 '/' 和 '\\' 分割检查 '..' 段（Windows 兼容）
+    // 安全修复：同时按 '/' 和 '\\' 分割检查 '..' 段（Windows 兼容，含 decode 后的段）
     for segment in path_only.split(&['/', '\\'][..]) {
         if segment == ".." { return None; }
     }

@@ -33,7 +33,7 @@ mod service {
     use http_encoding::{Coder, error::EncodingError};
 
     use crate::{
-        body::BodyStream,
+        body::{BodyStream, StreamAsBody},
         context::WebContext,
         error::Error,
         error::error_from_service,
@@ -43,12 +43,14 @@ mod service {
 
     use super::*;
 
+    pub type DecompressedBody<B> = Coder<StreamAsBody<B>>;
+
     pub struct DecompressService<S>(pub(super) S);
 
     impl<'r, S, C, B, Res, Err> Service<WebContext<'r, C, B>> for DecompressService<S>
     where
         B: BodyStream + Default,
-        S: for<'rs> Service<WebContext<'rs, C, Coder<B>>, Response = Res, Error = Err>,
+        S: for<'rs> Service<WebContext<'rs, C, DecompressedBody<B>>, Response = Res, Error = Err>,
         Err: Into<Error>,
     {
         type Response = Res;
@@ -60,7 +62,7 @@ mod service {
             let (ext, body) = ext.replace_body(());
             let req = Request::from_parts(parts, ());
 
-            let decoder = http_encoding::try_decoder(req.headers(), body)?;
+            let decoder = http_encoding::try_decoder(req.headers(), StreamAsBody::new(body))?;
             let mut body = RefCell::new(decoder);
             let mut req = req.map(|_| ext);
 
@@ -69,7 +71,7 @@ mod service {
                 .await
                 .map_err(|e| {
                     // restore original body as error path of other services may have use of it.
-                    let body = body.into_inner().into_inner();
+                    let body = body.into_inner().into_inner().into_inner();
                     *ctx.body_borrow_mut() = body;
                     e.into()
                 })
@@ -105,12 +107,13 @@ mod service {
 
 #[cfg(test)]
 mod test {
-    use http_encoding::{ContentEncoding, encoder};
+    use http_body_alt::util::StreamDataBody;
+    use http_encoding::ContentEncoding;
     use sweety_collection::futures::NowOrPanic;
 
     use crate::{
         App,
-        body::ResponseBody,
+        body::{ResponseBody, StreamAsBody},
         handler::handler_service,
         http::header::CONTENT_ENCODING,
         http::{WebRequest, WebResponse},
@@ -190,9 +193,11 @@ mod test {
 
         let encoding = encoding();
 
-        let (mut parts, body) = encoder(res, encoding).into_parts();
+        let (mut parts, body) = encoding
+            .try_encode(res.map(|b| StreamAsBody::new(b)))
+            .into_parts();
 
-        let body = collect_body(body).now_or_panic().unwrap();
+        let body = collect_body(StreamDataBody::new(body)).now_or_panic().unwrap();
 
         let mut req = WebRequest::default().map(|ext| ext.map_body(|_: ()| body.into()));
 

@@ -5,7 +5,7 @@ use sweety_web::{
     body::ResponseBody,
     http::{
         StatusCode, Version, WebResponse,
-        header::{CONTENT_TYPE, HeaderName, HeaderValue, VIA},
+        header::{CONTENT_TYPE, HeaderValue, VIA},
     },
 };
 

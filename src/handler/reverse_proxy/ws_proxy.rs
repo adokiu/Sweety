@@ -238,7 +238,7 @@ pub async fn handle_ws_proxy(
 /// - Sec-WebSocket-Key 必须是 base64 编码的 16 字节随机值（否则 400）
 fn validate_client_handshake(
     method: &sweety_web::http::Method,
-    version: sweety_web::http::Version,
+    _version: sweety_web::http::Version,
     headers: &sweety_web::http::header::HeaderMap,
 ) -> std::result::Result<(), WebResponse> {
     use base64::Engine as _;
@@ -283,7 +283,6 @@ fn validate_client_handshake(
 /// 生成 Sec-WebSocket-Key：16 字节密码学随机数的 base64（RFC 6455 §4.1）
 fn random_ws_key() -> String {
     use base64::Engine as _;
-    use rustls::crypto::SecureRandom as _;
     let mut key = [0u8; 16];
     if rustls::crypto::aws_lc_rs::default_provider().secure_random.fill(&mut key).is_err() {
         // 系统随机源不可用时退化为时间 + 地址熵（仅用于防缓存重放，不承担安全性）

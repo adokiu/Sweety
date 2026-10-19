@@ -34,10 +34,10 @@ mod path;
 mod range;
 
 pub use cache::{start_file_cache_watcher, init_cache_limits};
-pub use path::{TryFilesResult, try_files_resolve, resolve_safe_path, resolve_safe_path_fast};
+pub use path::{TryFilesResult, decode_uri_path, try_files_resolve, resolve_safe_path, resolve_safe_path_fast};
 
 use cache::{
-    FileCacheEntry, cache_get_fast, cache_insert, make_cache_key,
+    FileCacheEntry, cache_get_validated, cache_insert, make_cache_key,
     fd_cache_get_or_open_arc, make_cache_key_from_path,
     GZIP_MAX_INLINE, FILE_CACHE_MAX_BYTES,
 };
@@ -76,8 +76,10 @@ pub async fn handle_sweety(
     site: &SiteInfo,
     location: &LocationConfig,
 ) -> WebResponse {
-    // 直接导用 URI 中的路径，避免 to_string() 堆分配
-    let path = ctx.req().uri().path();
+    let path = match decode_uri_path(ctx.req().uri().path()) {
+        Some(p) => p,
+        None => return make_error(StatusCode::NOT_FOUND, "Not Found"),
+    };
     let method = ctx.req().method().as_str();
     let req_headers = ctx.req().headers();
 
@@ -113,13 +115,13 @@ pub async fn handle_sweety(
     // Range 请求也走此热路径：小文件数据在内存中，直接 slice，零 syscall
     if !is_head {
         // 快速 `..` 检查（不做 syscall）
-        let path_only = path.split('?').next().unwrap_or(path);
+        let path_only = path.as_str();
         let has_traversal = path_only.split('/').any(|s| s == "..");
         if has_traversal {
             return make_error(StatusCode::FORBIDDEN, "Forbidden");
         }
         let relative = path_only.trim_start_matches('/');
-        if let Some(entry) = cache_get_fast(root, relative) {
+        if let Some(entry) = cache_get_validated(root, relative).await {
             let modified_secs = entry.modified_secs;
             let etag_str = entry.hv_etag.to_str().unwrap_or("");
 
@@ -189,7 +191,7 @@ pub async fn handle_sweety(
         }
         // 缓存未命中：做完整安全检查，然后读文件并缓存
         let canonical_root_ref = site.canonical_root.as_deref();
-        let file_path = match resolve_safe_path_fast(root, path, canonical_root_ref) {
+        let file_path = match resolve_safe_path_fast(root, &path, canonical_root_ref) {
             Some(p) => p,
             None => return make_error(StatusCode::FORBIDDEN, "Forbidden"),
         };
@@ -299,7 +301,9 @@ pub async fn handle_sweety(
             let http_date = httpdate::fmt_http_date(modified_time);
             let cc = location.cache_control.as_deref().unwrap_or_else(|| default_cache_control(ext));
             let mut cl_buf = itoa::Buffer::new();
+            let source_path = make_cache_key_from_path(&file_path);
             let entry = FileCacheEntry {
+                source_path:        source_path.clone(),
                 data:               bytes.clone(),
                 gz:                 gz_bytes,
                 br:                 br_bytes,
@@ -426,7 +430,7 @@ pub async fn handle_sweety(
 
     // ── HEAD / Range 路径：必须读 metadata ────────────────────────────────────
     let canonical_root_ref = site.canonical_root.as_deref();
-    let file_path = match resolve_safe_path_fast(root, path, canonical_root_ref) {
+    let file_path = match resolve_safe_path_fast(root, &path, canonical_root_ref) {
         Some(p) => p,
         None => return make_error(StatusCode::FORBIDDEN, "Forbidden"),
     };
@@ -751,6 +755,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(resolve_safe_path(dir.path(), "/../etc/passwd").is_none());
         assert!(resolve_safe_path(dir.path(), "/foo/../../../etc/passwd").is_none());
+        assert!(resolve_safe_path(dir.path(), "/%2e%2e/etc/passwd").is_none());
+    }
+
+    #[test]
+    fn test_resolve_safe_path_percent_encoded_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "树荫下的奶蛙.avif";
+        std::fs::create_dir_all(dir.path().join("classic")).unwrap();
+        std::fs::write(dir.path().join("classic").join(name), b"avif").unwrap();
+        let encoded = "/classic/%E6%A0%91%E8%8D%AB%E4%B8%8B%E7%9A%84%E5%A5%B6%E8%9B%99.avif";
+        let resolved = resolve_safe_path(dir.path(), encoded).expect("decoded path must resolve");
+        assert!(resolved.is_file());
+        assert_eq!(resolved.file_name().and_then(|s| s.to_str()), Some(name));
     }
 
     #[test]
