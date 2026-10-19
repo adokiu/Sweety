@@ -181,6 +181,37 @@ tls   = false   # h2c (plaintext HTTP/2)
 
 ---
 
+## Proxy response cache (proxy_cache)
+
+Site-level; shares RFC 9111 logic with FastCGI cache. See [Cache](/en-us/configuration/cache).
+
+```toml
+[[sites]]
+name        = "cached-api"
+server_name = ["cdn-api.example.com"]
+listen_tls  = [443]
+
+[[sites.upstreams]]
+name  = "origin"
+nodes = [{ addr = "127.0.0.1:8080" }]
+
+[sites.proxy_cache]
+path              = "/var/cache/sweety/api"
+max_entries       = 5000
+ttl               = 120
+bypass_headers    = ["Authorization", "Cookie"]
+origin_revalidate = true
+use_stale_error   = true
+cache_lock        = true
+
+[[sites.locations]]
+path     = "/"
+handler  = "reverse_proxy"
+upstream = "origin"
+```
+
+---
+
 ## Subrequest Auth (auth_request)
 
 ```toml

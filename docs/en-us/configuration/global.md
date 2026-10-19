@@ -176,9 +176,9 @@ After configuring `admin_listen`, the REST API (`/api/v1/*`) becomes available:
 - `GET /api/v1/doc` — API documentation (JSON)
 - Bearer Token authentication
 
-**Planned for v0.5:**
-- Site management, upstream node control, API hot reload
-- WebSocket real-time stats push
-- Prometheus `/metrics` endpoint
+**Also available** (see [Admin API](/en-us/configuration/admin-api)): config tree CRUD, `/config/reload`, upstream/cert/cache management, `GET /metrics` (Prometheus).
+
+**Planned:**
+- WebSocket real-time stats push (`/api/v1/stats/stream`)
 
 Security recommendation: Only listen on `127.0.0.1`, **never expose to the public internet**.

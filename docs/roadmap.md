@@ -27,14 +27,16 @@
 - `min_uses` 缓存污染防护：访问 ≥2 次才写入内容缓存，防止爬虫一次性污染（对标 Nginx `open_file_cache_min_uses`）
 - pread 流式传输：大文件异步分块读取 + H2 流控背压，替代 mmap
 - PHP/FastCGI：Unix Socket / TCP 连接池，fastcgi_cache，正确处理 HTTP/2 Cookie 合并（RFC 7540 §8.1.2.5）(`2fa052d`)
-- 反向代理：轮询 / 加权 / 最少连接 / IP 哈希 + 连接池 + 断路器 + 主动健康检查 + proxy_cache (`71d885c`)
+- 反向代理：轮询 / 加权 / 最少连接 / IP 哈希 + 连接池 + 断路器 + 主动健康检查 + proxy_cache（RFC 9111 语义，见下）(`71d885c`)
 - HTTP/2 上游支持（h2c + h2 over TLS）(`8c95acc`)
 - gRPC 代理：application/grpc + gRPC-Web + Trailer 透传
 - auth_request 子请求鉴权
 - Brotli + zstd + gzip 三算法压缩（优先级 br > zstd > gzip），预压缩内存缓存 (`1a3d305`, `97b338f`)
 - sub_filter 响应体内容替换 (`d830ba7`)
 - cache `ignore_headers` 绕过 Cache-Control/Set-Cookie (`98d8238`)
-- Expect: 100-continue 正确处理（RFC 7231 §5.1.1）(`79a2f12`)
+- **共享缓存 RFC 9110/9111/5861/9211**：proxy_cache 与 fastcgi_cache 共用 `shared_cache`；`origin_revalidate`、条件回源 304、Age、Warning 110、only-if-cached→504、`request_no_cache`、`use_stale[]` / stale-if-error、`cache_lock`、`min_uses`、`status_ttl`、`cache_key_headers`、`Cache-Status`、HEAD HIT Content-Length（`62035a5`）
+- **SWR 后台刷新**：`background_update` + HTTP/1 条件 GET（`cache_background.rs`）；H2 上游待接
+- Expect: 100-continue 正确处理（RFC 9110）(`79a2f12`)
 - chunked 请求体流式透传（零内存拷贝）(`79a2f12`)
 - proxy_read_timeout 逐包语义（两包间隔超时，等价 Nginx 行为）
 
@@ -52,7 +54,7 @@
 - 断路器：三状态机（Closed → Open → Half-Open）(`71d885c`)
 - 五维度令牌桶限流：IP / 路径 / IP+路径 / Header / User-Agent (`7e63b78`)
 - HSTS + force_https (`d1d30c7`)
-- 304 响应体强制为空（RFC 7230 §3.3）
+- 304 响应体强制为空（RFC 9110）；405 响应带 `Allow`；错误页注入 `Date`
 - H2 RST 洪水防护（CVE-2023-44487）：`h2_max_concurrent_reset_streams` (`4dd4062`)
 - CRLF 注入防护：反代头部、WebSocket 握手头自动过滤 (`dd0d1ba`, `31b1a66`)
 - chunked body OOM 防护：16MB/chunk、256MB 总量硬上限 (`31b1a66`)
@@ -95,6 +97,10 @@
 - handler/static_file 拆分为 cache.rs / compress.rs / range.rs / path.rs
 - handler/fastcgi 拆分为 proto.rs / response.rs
 - ACME 逻辑提取为独立 acme.rs (`f89da0b`)
+- middleware 缓存：`cache_types.rs` / `shared_cache.rs` / `proxy_cache` RFC 重构；反代 `upstream_headers.rs`、`connect_tunnel.rs`、`cache_background.rs`
+
+### 文档
+- [RFC / 缓存合规差距分析](/rfc-compliance-gap-analysis)（配置字段与剩余边界）
 
 ---
 
@@ -153,6 +159,7 @@
 | 反向代理连接池 | ✅ | ✅ | ✅ | ✅ |
 | 静态文件内存缓存 | ✅ | ✅ OS page cache | ❌ | ✅ mod_cache |
 | FastCGI 响应缓存 | ✅ | ✅ | ❌ | ✅ mod_cache_disk |
+| 共享缓存 RFC 9111 语义 | ✅ proxy + FastCGI | ✅ | ⚠️ 需 cache-handler | ⚠️ mod_cache |
 | H2 多核扩展 | ✅ SO_REUSEPORT | ✅ | ✅ | ✅ |
 | QUIC 0-RTT | ✅ | ❌ | ✅ | ❌ |
 | 配置易用性 | ✅ 预设 + 语法糖 | ❌ 纯手写 | ✅ Caddyfile | ⚠️ 冗长 |
@@ -166,4 +173,4 @@
 
 ---
 
-*最后更新：2026-05-28*
+*最后更新：2026-10-19*

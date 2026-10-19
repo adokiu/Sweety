@@ -27,14 +27,16 @@ Sweety covers the core Nginx reverse proxy + static file feature set while provi
 - `min_uses` cache pollution prevention: files cached only after ≥2 accesses (equivalent to Nginx `open_file_cache_min_uses`)
 - pread streaming: async chunked read for large files + H2 flow-control backpressure, replaces mmap
 - PHP/FastCGI: Unix socket / TCP connection pool, fastcgi_cache, correct HTTP/2 Cookie merging (RFC 7540 §8.1.2.5) (`2fa052d`)
-- Reverse proxy: round-robin / weighted / least-conn / IP hash + connection pool + circuit breaker + active health checks + proxy_cache (`71d885c`)
+- Reverse proxy: round-robin / weighted / least-conn / IP hash + connection pool + circuit breaker + active health checks + proxy_cache (RFC 9111 semantics, see below) (`71d885c`)
 - HTTP/2 upstream support (h2c + h2 over TLS) (`8c95acc`)
 - gRPC proxy: application/grpc + gRPC-Web + Trailer passthrough
 - auth_request subrequest authentication
 - Brotli + zstd + gzip triple compression (priority: br > zstd > gzip), pre-compressed memory cache (`1a3d305`, `97b338f`)
 - sub_filter response body content replacement (`d830ba7`)
 - Cache `ignore_headers` to bypass Cache-Control/Set-Cookie (`98d8238`)
-- Expect: 100-continue correct handling (RFC 7231 §5.1.1) (`79a2f12`)
+- **Shared cache RFC 9110/9111/5861/9211**: proxy_cache + fastcgi_cache via `shared_cache`; `origin_revalidate`, conditional 304, Age, Warning 110, only-if-cached→504, `use_stale[]`, `cache_lock`, `Cache-Status`, HEAD HIT Content-Length (`62035a5`)
+- **SWR background refresh**: `background_update` + HTTP/1 conditional GET; H2 upstream pending
+- Expect: 100-continue (RFC 9110) (`79a2f12`)
 - Chunked request body streaming passthrough (zero-copy) (`79a2f12`)
 - proxy_read_timeout per-packet semantics (inter-packet timeout, equivalent to Nginx behavior)
 
@@ -52,7 +54,7 @@ Sweety covers the core Nginx reverse proxy + static file feature set while provi
 - Circuit breaker: 3-state FSM (Closed → Open → Half-Open) (`71d885c`)
 - 5-dimension token bucket rate limiting: IP / path / IP+path / header / User-Agent (`7e63b78`)
 - HSTS + force_https (`d1d30c7`)
-- 304 response body forced empty (RFC 7230 §3.3)
+- 304 empty body (RFC 9110); 405 with `Allow`; `Date` on error responses
 - H2 RST flood protection (CVE-2023-44487): `h2_max_concurrent_reset_streams` (`4dd4062`)
 - CRLF injection protection: auto-filtering in proxy headers and WebSocket handshake (`dd0d1ba`, `31b1a66`)
 - Chunked body OOM protection: 16MB/chunk, 256MB total hard limit (`31b1a66`)
@@ -95,6 +97,10 @@ Sweety covers the core Nginx reverse proxy + static file feature set while provi
 - handler/static_file split into cache.rs / compress.rs / range.rs / path.rs
 - handler/fastcgi split into proto.rs / response.rs
 - ACME logic extracted into dedicated acme.rs (`f89da0b`)
+- Cache middleware: `cache_types.rs` / `shared_cache.rs`; reverse proxy `cache_background.rs`, `upstream_headers.rs`, `connect_tunnel.rs`
+
+### Documentation
+- [RFC / cache compliance gap analysis](/en-us/rfc-compliance-gap-analysis)
 
 ---
 
@@ -153,6 +159,7 @@ Sweety covers the core Nginx reverse proxy + static file feature set while provi
 | Reverse Proxy Pool | ✅ | ✅ | ✅ | ✅ |
 | Static File Memory Cache | ✅ | ✅ OS page cache | ❌ | ✅ mod_cache |
 | FastCGI Response Cache | ✅ | ✅ | ❌ | ✅ mod_cache_disk |
+| Shared cache RFC 9111 | ✅ proxy + FastCGI | ✅ | ⚠️ cache-handler | ⚠️ mod_cache |
 | H2 Multi-Core Scaling | ✅ SO_REUSEPORT | ✅ | ✅ | ✅ |
 | QUIC 0-RTT | ✅ | ❌ | ✅ | ❌ |
 | Config Simplicity | ✅ Presets + sugar | ❌ Manual | ✅ Caddyfile | ⚠️ Verbose |
@@ -166,4 +173,4 @@ Sweety covers the core Nginx reverse proxy + static file feature set while provi
 
 ---
 
-*Last updated: 2026-05-28*
+*Last updated: 2026-10-19*

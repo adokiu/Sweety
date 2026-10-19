@@ -177,9 +177,9 @@ curl -H "Authorization: Bearer your-secret-token" http://127.0.0.1:9099/api/v1/s
 | `POST` | `/api/v1/upstreams/:name/nodes/:addr/enable` | 是 | 🚧 计划 | 启用节点（v0.5） |
 | `POST` | `/api/v1/upstreams/:name/nodes/:addr/disable` | 是 | 🚧 计划 | 禁用节点（v0.5） |
 | — | WebSocket `/api/v1/stats/stream` | — | 🚧 计划 | 实时统计推送（v0.5） |
-| `GET` | `/metrics` | — | 🚧 计划 | Prometheus 指标端点（v0.5） |
+| `GET` | `/metrics` | 否 | ✅ | Prometheus 指标（text/plain） |
 
-> ⚠️ `sweety reload` 当前通过系统信号实现热重载，不依赖 Admin API。`POST /api/v1/reload` 尚未实现。
+> 完整 Admin API（配置树、`/config/reload`、上游/证书/缓存等）见 [管理 API](/configuration/admin-api)。CLI `sweety reload` 仍可通过系统信号热重载，与 Admin 端点并存。
 
 ---
 

@@ -21,8 +21,8 @@ Sweety 是用 Rust 编写的高性能多站点 Web 服务器，目标是兼顾 *
 | 功能 | 说明 |
 |------|------|
 | 静态文件 | 内存缓存（≤ 64KB 预压缩 gz/br/zst）、fd 缓存、Range、sendfile(2) 零拷贝、inotify 实时淘汰 |
-| FastCGI/PHP | 连接池、Unix socket/TCP、响应缓存 |
-| 反向代理 | HTTP/1.1 + HTTP/2 upstream、连接池、熔断器、负载均衡 |
+| FastCGI/PHP | 连接池、Unix socket/TCP、fastcgi_cache（与 proxy 共用 RFC 缓存逻辑） |
+| 反向代理 | HTTP/1.1 + HTTP/2 upstream、连接池、熔断器、负载均衡、`proxy_cache`（RFC 9111 + Nginx 运维项） |
 | gRPC 代理 | 透明转发 gRPC/gRPC-Web |
 | WebSocket | 正向代理 WS/WSS |
 | auth_request | 子请求鉴权（等价 Nginx auth_request） |
@@ -40,8 +40,8 @@ Sweety 是用 Rust 编写的高性能多站点 Web 服务器，目标是兼顾 *
 - **热重载**：`sweety reload` 不断开连接重载配置
 - **Daemon 模式**：`sweety start/stop/restart`
 - **配置校验**：`sweety validate`（等价 `nginx -t`）
-- **Prometheus 指标**：`/metrics` 端点（v0.5 计划）
-- **Admin REST API**：health / stats / plugins 已可用（`/api/v1/*`），站点管理和节点控制 v0.5 计划
+- **Prometheus 指标**：`/metrics` 端点（text/plain）
+- **Admin REST API**：配置树 CRUD、证书/缓存/上游管理、热重载等（详见 [管理 API](/configuration/admin-api)）
 
 ## 与同类产品对比
 
@@ -57,3 +57,4 @@ Sweety 是用 Rust 编写的高性能多站点 Web 服务器，目标是兼顾 *
 | 内存安全 | ✅ | ❌ | ✅ |
 | 静态文件内存缓存 | ✅ | ✅ | ❌ |
 | FastCGI 响应缓存 | ✅ | ✅ | ❌ |
+| 共享缓存 RFC 9111 | ✅ | ✅ | ⚠️ 需 cache-handler |

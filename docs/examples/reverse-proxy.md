@@ -181,6 +181,40 @@ tls   = false   # h2c（明文 HTTP/2）
 
 ---
 
+## 反代响应缓存（proxy_cache）
+
+站点级配置，与 FastCGI 缓存共用 RFC 9111 逻辑。详见 [缓存文档](/configuration/cache)。
+
+```toml
+[[sites]]
+name        = "cached-api"
+server_name = ["cdn-api.example.com"]
+listen      = [443]
+listen_tls  = [443]
+
+[[sites.upstreams]]
+name  = "origin"
+nodes = [{ addr = "127.0.0.1:8080" }]
+
+[sites.proxy_cache]
+path               = "/var/cache/sweety/api"
+max_entries        = 5000
+ttl                = 120
+cacheable_methods  = ["GET", "HEAD"]
+bypass_headers     = ["Authorization", "Cookie"]
+origin_revalidate  = true
+use_stale_error    = true
+cache_lock         = true
+# background_update  = true   # SWR 窗口内后台条件 GET（HTTP/1 上游）
+
+[[sites.locations]]
+path     = "/"
+handler  = "reverse_proxy"
+upstream = "origin"
+```
+
+---
+
 ## 子请求鉴权（auth_request）
 
 ```toml

@@ -430,12 +430,18 @@ fail_timeout = 30
 
 ## Proxy Cache (proxy_cache)
 
+Site-level HTTP upstream response cache (RFC 9111 + Nginx-style knobs: `cache_lock`, `use_stale`, `origin_revalidate`, `background_update`, etc.).
+
+See **[Cache](cache.md)** for the full field reference and behavior.
+
 ```toml
 [sites.proxy_cache]
-max_entries        = 1000
-ttl                = 60
-cacheable_statuses = [200]
-cacheable_methods  = ["GET", "HEAD"]
-bypass_headers     = ["Authorization", "Cookie"]
-ignore_headers     = []
+max_entries          = 1000
+ttl                  = 60
+cacheable_statuses   = [200, 301, 302]
+cacheable_methods    = ["GET", "HEAD"]
+bypass_headers       = ["Authorization"]
+origin_revalidate    = true
+use_stale_error      = true
+revalidate           = true
 ```

@@ -430,14 +430,22 @@ fail_timeout = 30
 
 ## 反代缓存（proxy_cache）
 
+站点级启用 HTTP 上游响应缓存，语义对齐 RFC 9111 与 Nginx `proxy_cache`（`cache_lock`、`use_stale`、`origin_revalidate`、`background_update` 等）。
+
+完整字段、RFC 行为说明与 FastCGI 共用项见 **[缓存文档](cache.md)**。
+
 ```toml
 [sites.proxy_cache]
-max_entries        = 1000
-ttl                = 60
-cacheable_statuses = [200]
-cacheable_methods  = ["GET", "HEAD"]
-bypass_headers     = ["Authorization", "Cookie"]
-ignore_headers     = []
+max_entries          = 1000
+ttl                  = 60
+cacheable_statuses   = [200, 301, 302]
+cacheable_methods    = ["GET", "HEAD"]
+bypass_headers       = ["Authorization"]
+origin_revalidate    = true
+use_stale_error      = true
+revalidate           = true
+# cache_lock         = true
+# background_update  = true
 ```
 
 ## 压缩

@@ -12,7 +12,7 @@
 
 The underlying HTTP stack is forked from [xitca-web](https://github.com/HFQR/xitca-web) and independently maintained under `vendor/`, with numerous production-oriented performance fixes and optimizations.
 
-📚 **[Documentation](https://sweety.2o.nz)** | ⚙️ **[Config Example](config/sweety.config.example)** | � **[Benchmarks](https://sweety.2o.nz/benchmark/)** | �️ **[Roadmap](https://sweety.2o.nz/roadmap/)**
+📚 **[Documentation](https://sweety.2o.nz)** | ⚙️ **[Config Example](config/sweety.config.example)** | 📊 **[Benchmarks](https://sweety.2o.nz/benchmark/)** | 🗺️ **[Roadmap](https://sweety.2o.nz/roadmap/)**
 
 ---
 
@@ -29,7 +29,7 @@ The underlying HTTP stack is forked from [xitca-web](https://github.com/HFQR/xit
 
 - 📁 **Static Files** — in-memory cache (configurable `open_file_cache max=200000`) + fd cache + Range + ETag/Last-Modified + `try_files` + sendfile(2) zero-copy (Linux/macOS) + pread streaming
 - 🐘 **PHP / FastCGI** — Unix socket / TCP connection pool + `fastcgi_cache`; correct HTTP/2 Cookie merging (RFC 7540 §8.1.2.5), compatible with WordPress / Laravel
-- 🔄 **Reverse Proxy** — round-robin / weighted / least-conn / IP hash + connection pool + active health checks + `proxy_cache`
+- 🔄 **Reverse Proxy** — round-robin / weighted / least-conn / IP hash + connection pool + active health checks + `proxy_cache` (RFC 9111: revalidation, stale-if-error, `cache_lock`, `Cache-Status`)
 - 📡 **gRPC Proxy** — automatic `application/grpc` + Trailer handling
 - 🔑 **auth_request** — subrequest-based authentication
 
@@ -58,9 +58,9 @@ The underlying HTTP stack is forked from [xitca-web](https://github.com/HFQR/xit
 
 ### Operations
 
-- 🖥️ **Admin REST API** — health / version / stats / plugins (`/api/v1/*`); site management, node control, WebSocket push planned for v0.5
+- 🖥️ **Admin REST API** — config CRUD, sites/upstreams/certs/cache, hot reload ([docs](https://sweety.2o.nz/configuration/admin-api))
 - 📝 **Access Logs** — combined / JSON / custom template, async writer
-- 📊 **Prometheus Metrics** — `/metrics` endpoint (planned for v0.5)
+- 📊 **Prometheus Metrics** — `/metrics` endpoint (text/plain)
 
 ---
 
@@ -134,9 +134,10 @@ For a complete configuration reference with all options, see [config/sweety.conf
 | WebSocket H2 (RFC 8441) | ✅ | ✅ | ✅ | ✅ |
 | gRPC Proxy | ✅ | ✅ (full in Plus) | ✅ | ⚠️ Limited |
 | FastCGI Response Cache | ✅ | ✅ | ❌ | ✅ |
+| Shared cache RFC 9111 | ✅ proxy + FastCGI | ✅ | ⚠️ cache-handler | ⚠️ mod_cache |
 | Static File Memory Cache | ✅ | ✅ OS page cache | ❌ | ✅ |
 | Config Simplicity | ✅ Presets + sugar | ❌ Manual | ✅ Caddyfile | ⚠️ Verbose |
-| Admin REST API | ⚠️ Partial (v0.5) | ❌ | ✅ | ❌ |
+| Admin REST API | ✅ | ❌ | ✅ | ❌ |
 | Single Binary, No Deps | ✅ | ❌ | ✅ | ❌ |
 | Memory Safety | ✅ Rust | ❌ C | ✅ Go | ❌ C |
 | `if` / `map` Conditionals | ❌ | ✅ | ⚠️ Limited | ✅ mod_rewrite |

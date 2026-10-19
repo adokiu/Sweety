@@ -47,6 +47,11 @@ bypass_headers = []
 # 忽略响应头对缓存决策的影响
 # WordPress 需要配置此项，否则 Cache-Control: no-store 会阻止缓存
 ignore_headers = ["Cache-Control", "Set-Cookie"]
+
+# 与 proxy_cache 相同：origin_revalidate、use_stale、cache_lock、background_update 等
+# 详见 [缓存文档](cache.md)
+# origin_revalidate = true
+# use_stale_error   = true
 ```
 
 ## FastCGI Location 配置

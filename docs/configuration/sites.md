@@ -58,10 +58,12 @@ max_age            = 31536000   # 秒（默认 1 年）
 include_subdomains = true
 preload            = false
 
-# ─── 反代缓存 ────────────────────────────────────────────────────
+# ─── 反代缓存（详见 [缓存](cache.md)）────────────────────────────
 [sites.proxy_cache]
-max_entries = 1000
-ttl         = 60
+max_entries       = 1000
+ttl               = 60
+origin_revalidate = true
+use_stale_error   = true
 
 # ─── 速率限制 ────────────────────────────────────────────────────
 [sites.rate_limit]

@@ -1,3 +1,8 @@
+---
+title: RFC / 缓存合规
+description: RFC 9110/9111 与 Nginx proxy_cache 语义对照、配置字段与剩余边界
+---
+
 # Sweety RFC / Nginx 语义合规差距分析
 
 > 基准：RFC 9110 / 9111 / 5861 / 9211。  
