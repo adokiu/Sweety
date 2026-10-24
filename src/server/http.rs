@@ -224,6 +224,9 @@ impl SweetyServer {
             cfg.global.worker_threads
         };
         server = server.worker_threads(workers);
+        // 性能：默认每个 worker 512 个 blocking 线程在高并发下会造成大量线程 churn
+        // （实测 200 连接可涨到 1200+ 线程）。按配置收紧，配合静态文件校验 TTL。
+        server = server.worker_max_blocking_threads(cfg.global.worker_max_blocking_threads.max(1));
 
         // Keep-Alive 超时：连接空闲超时后强制关闭，释放 File 句柄和读缓冲
         // 等价于 Nginx keepalive_timeout，防止下载器断开后资源残留
@@ -335,6 +338,7 @@ impl SweetyServer {
             cfg.global.open_file_cache_max,
             cfg.global.open_file_cache_total_mb,
         );
+        crate::handler::static_file::init_cache_valid_secs(cfg.global.open_file_cache_valid);
 
         // 启动文件缓存 notify 监听：文件修改时自动淘汰内存缓存，无需每请求 stat
         {
