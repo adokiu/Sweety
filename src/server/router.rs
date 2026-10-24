@@ -60,6 +60,18 @@ pub(super) async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebRes
         return make_method_not_allowed();
     }
 
+    // RFC 9110 §7.4 / §9.3.7：asterisk-form 仅用于 OPTIONS（服务器级能力查询）
+    if *method == Method::OPTIONS && ctx.req().uri().path() == "*" {
+        let mut resp = WebResponse::new(ResponseBody::none());
+        *resp.status_mut() = StatusCode::NO_CONTENT;
+        resp.headers_mut().insert(
+            sweety_web::http::header::ALLOW,
+            HeaderValue::from_static(crate::handler::reverse_proxy::response::STANDARD_HTTP_ALLOW),
+        );
+        state.metrics.record_status(204);
+        return resp;
+    }
+
     // ACME HTTP-01 challenge 响应（优先于所有站点匹配）
     {
         let path = ctx.req().uri().path();
@@ -159,8 +171,19 @@ pub(super) async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebRes
     if site.force_https && tls_configured && !is_https && acme_cert_ready {
         let tls_port = if site.listen_tls.contains(&443) { 443 }
                        else { site.listen_tls.first().copied().unwrap_or(443) };
-        let host_for_redirect = if tls_port == 443 { host.to_string() }
-                                else { format!("{}:{}", host, tls_port) };
+        // 防开放重定向：Host 必须属于本站点的 server_name（含 `*.` 通配符）。
+        // fallback / 通配符站点会接受任意 Host，直接把 Host 拼回 Location 会被
+        // 用来构造 https://evil.com 的跳转，因此不匹配时改用配置的首个域名。
+        let redirect_host = if host_matches_site(host, &site.server_names) {
+            host.to_string()
+        } else {
+            site.server_names
+                .first()
+                .map(|n| n.trim_start_matches("*.").to_string())
+                .unwrap_or_else(|| host.to_string())
+        };
+        let host_for_redirect = if tls_port == 443 { redirect_host }
+                                else { format!("{}:{}", redirect_host, tls_port) };
         let redirect_url = format!("https://{}{}",
             host_for_redirect,
             ctx.req().uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/"));
@@ -537,6 +560,27 @@ fn parse_return_directive(ret: &str, request_uri: &str) -> (u16, String) {
 ///
 /// 安全修复：验证重定向目标不是外部 URL，防止开放重定向攻击。
 /// 仅允许以 '/' 开头的相对路径或同域 URL。
+/// Host 是否匹配站点的 server_name（精确或 `*.` 单层通配符）
+fn host_matches_site(host: &str, server_names: &[String]) -> bool {
+    let Some(key) = crate::dispatcher::host::normalize_host_key(host) else {
+        return false;
+    };
+    server_names.iter().any(|name| {
+        if let Some(suffix) = name.strip_prefix("*.") {
+            // 与 VHostRegistry 一致：`*.example.org` 只匹配单层标签
+            if key.len() > suffix.len() + 1
+                && key.ends_with(suffix)
+                && key.as_bytes()[key.len() - suffix.len() - 1] == b'.'
+            {
+                return !key[..key.len() - suffix.len() - 1].contains('.');
+            }
+            false
+        } else {
+            key == *name
+        }
+    })
+}
+
 fn make_redirect_resp(location: &str, status: StatusCode) -> WebResponse {
     let mut resp = WebResponse::new(ResponseBody::empty());
     *resp.status_mut() = status;
@@ -583,4 +627,22 @@ fn is_safe_redirect_target(target: &str) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod host_validation_tests {
+
+    use super::host_matches_site;
+
+    #[test]
+    fn exact_and_wildcard_host_match() {
+        let names = vec!["example.com".to_string(), "*.example.org".to_string()];
+        assert!(host_matches_site("example.com", &names));
+        assert!(host_matches_site("EXAMPLE.com:443", &names));
+        assert!(host_matches_site("a.example.org", &names));
+        // 单层通配符：不匹配多级、不匹配后缀拼接
+        assert!(!host_matches_site("a.b.example.org", &names));
+        assert!(!host_matches_site("evilexample.org", &names));
+        assert!(!host_matches_site("evil.com", &names));
+    }
 }

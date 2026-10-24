@@ -40,6 +40,8 @@ pub struct SiteInfo {
     pub root: Option<std::path::PathBuf>,
     /// canonicalize 后的根目录（启动时预计算，请求时直接用）
     pub canonical_root: Option<std::path::PathBuf>,
+    /// 规范化后的 server_name 列表（通配符保留 `*.` 前缀，用于 Host 合法性校验）
+    pub server_names: Vec<String>,
     /// 默认文档列表
     pub index: Vec<String>,
     /// Rewrite 规则列表（正则已预编译；大多数静态站点为空）
@@ -100,6 +102,19 @@ impl SiteInfo {
             .collect();
         locations.sort_by_key(|cl| location_priority(&cl.config.path));
 
+        // 规范化的 server_name（通配符保留 `*.` 前缀），供 Host 校验 / 跳转使用
+        let server_names: Vec<String> = cfg
+            .server_name
+            .iter()
+            .filter_map(|sn| {
+                if let Some(suffix) = sn.strip_prefix("*.") {
+                    crate::dispatcher::host::normalize_host_key(suffix).map(|s| format!("*.{s}"))
+                } else {
+                    crate::dispatcher::host::normalize_host_key(sn)
+                }
+            })
+            .collect();
+
         let rewrites: Vec<CompiledRewrite> = cfg.rewrites.iter()
             .filter_map(|r| CompiledRewrite::new(r.clone()))
             .collect();
@@ -124,6 +139,7 @@ impl SiteInfo {
             root: cfg.root.clone(),
             canonical_root,
             index: cfg.index.clone(),
+            server_names,
             locations,
             rewrites,
             upstreams: cfg.upstreams.clone(),
