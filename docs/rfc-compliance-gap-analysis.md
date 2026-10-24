@@ -71,3 +71,28 @@ description: RFC 9110/9111 与 Nginx proxy_cache 语义对照、配置字段与�
 ## 免责声明
 
 Nginx/Caddy 行为以官方文档为准。RFC MUST 以 [rfc-editor.org](https://www.rfc-editor.org) 为准。
+
+---
+
+## 2026-10-25 审计修复
+
+外部回归测试（独立进程 + 真实网络）复验，覆盖以下此前不合规项：
+
+| RFC | 项 | 修复 |
+|-----|----|------|
+| 9111 §3.5 / §5.2.1.5 | 共享缓存写入未拦截 `Authorization` / `Cookie` / 请求 `no-store` | `ProxyCache::storable`：写入前做请求侧门禁（proxy + FastCGI 两处 store 点） |
+| 9110 §9.3.2 | HEAD 缺少 `Content-Encoding`，与 GET 不一致 | HEAD 与 GET 共用编码选择；压缩时省略 CL（长度未知），未压缩时补真实 CL |
+| 9110 §12.5.3 | 客户端显式拒绝 identity 时仍返回 200 | 无法提供可接受编码时返回 406 |
+| 9110 §10.1.1 | 不支持的 `Expect` 返回 400 | 新增 `ProtoError::ExpectationFailed` → 417 |
+| 9110 §15.4.2 | force_https 一律 301（POST 被降级） | GET/HEAD 用 301，其余 308 |
+| 6455 §8.1 / §5.2 / §7.1.7 | 非法 UTF-8 文本帧 panic；协议错误不关闭连接、空转 | 分别以 1007 / 1002 / 1009 关闭 |
+| 6455 §5.2 / §5.5 / §7.4 | RSV 位未校验、控制帧可分片、关闭码无范围校验 | `vendor/http-ws` fork 修复（`ReservedBits`、控制帧 FIN、关闭码白名单、严格 UTF-8） |
+| 6455 §4.2.1 / §10.2 | 接受 HTTP/1.0、无 Origin 校验 | 版本 + Host 校验；新增 `allowed_origins` 白名单 |
+| 9110 §7.8 / 6455 §4.1 | 任意上游 101 都被当作握手成功 | 校验 `Upgrade`/`Connection`/`Sec-WebSocket-Accept`（由发给上游的 key 推导） |
+
+另修复 `a433d4d` 引入的路由回归：`decode_uri_path` 曾把 `/api/x` 规范化为 `//api/x`，
+导致所有非 `/` 前缀 location 无法命中（静态 `/` 兜底掩盖了该问题）。
+
+**已知未修**：上游重启后，连接池中已失效的 keep-alive 连接会让首批请求返回 502
+（`keepalive_requests`/`keepalive_time` 默认不限，且未对复用连接做幂等重试）。
+属健壮性问题，不影响 RFC 一致性。

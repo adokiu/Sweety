@@ -4,6 +4,23 @@
 
 发布流程：更新本文件对应版本节 → 修改 `Cargo.toml` 的 `version` → 推送 `main` → 打 tag（`pre-x.y.z` 或 `v x.y.z`）触发 [Release 工作流](.github/workflows/release.yml)，Release 说明会自动嵌入本节内容。
 
+## [Unreleased]
+
+### Fixed
+
+- **缓存写入门禁**：带 `Authorization` / `Cookie` 或请求 `Cache-Control: no-store` 的响应不再写入共享缓存（RFC 9111 §3.5、§5.2.1.5 的 MUST；原实现只在读取侧 bypass，写入侧仍会入库）。
+- **WebSocket 运行时**：非法 UTF-8 文本帧改为 1007 关闭（原 `unwrap` panic，可被远程触发）；协议错误改为发送 1002/1009 关闭（原实现继续轮询未推进的缓冲导致空转）。
+- **WebSocket 代理**：校验上游 101 的 `Upgrade` / `Connection` 与 `Sec-WebSocket-Accept`（不再信任任意 101）；新增 `allowed_origins` Origin 白名单（RFC 6455 §10.2）；拒绝 HTTP/1.0 握手与缺失 `Host`。
+- **vendored `http-ws`**：修复 RSV 位未校验、控制帧可被分片、关闭码范围未校验、关闭原因 lossy UTF-8（RFC 6455 §5.2/§5.5/§5.5.1/§7.4）。
+- **静态文件**：HEAD 与 GET 的 `Content-Encoding` / `Content-Length` 保持一致（RFC 9110 §9.3.2）；`identity` 被显式拒绝且无可用编码时返回 406（RFC 9110 §12.5.3）。
+- **HTTP/1.1**：不支持的 `Expect` 期望值返回 417（RFC 9110 §10.1.1，原为 400）。
+- **force_https**：非 GET/HEAD 用 308 保留请求方法（RFC 9110 §15.4.2）。
+- **路由回归**：修复 `decode_uri_path` 把 `/x` 规范化为 `//x`（`a433d4d` 引入），该问题导致所有非 `/` 前缀的 location 规则无法命中。
+
+### Added
+
+- `sites.locations[].allowed_origins`：WebSocket Origin 白名单（空数组 = 不校验，保持向后兼容）。
+
 ## [0.2.8] - 2026-10-19
 
 ### Added
