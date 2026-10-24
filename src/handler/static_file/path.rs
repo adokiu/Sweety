@@ -9,28 +9,28 @@ pub fn decode_uri_path(path: &str) -> Option<String> {
     if path.is_empty() {
         return Some("/".to_string());
     }
-    let mut out = String::new();
-    let mut at_start = true;
+    // 规范化：保留单个前导 '/'，折叠重复 '/'，逐段 percent-decode 并拒绝穿越
+    let mut out = String::with_capacity(path.len());
+    if path.starts_with('/') {
+        out.push('/');
+    }
+    let mut first_segment = true;
     for segment in path.split('/') {
-        if at_start {
-            at_start = false;
-            if segment.is_empty() {
-                out.push('/');
-                continue;
-            }
-        } else {
-            out.push('/');
-        }
         if segment.is_empty() {
             continue;
         }
+        if !first_segment && !out.ends_with('/') {
+            out.push('/');
+        }
+        first_segment = false;
         let dec = percent_decode_str(segment).decode_utf8().ok()?.into_owned();
+        // 解码后再出现 '/'、'\\'、'..' 或 NUL 一律拒绝（%2e%2e / %2f 绕过防护）
         if dec == ".." || dec.contains('/') || dec.contains('\\') || dec.contains('\0') {
             return None;
         }
         out.push_str(&dec);
     }
-    if path.ends_with('/') && path != "/" {
+    if path.ends_with('/') && !out.ends_with('/') {
         out.push('/');
     }
     if out.is_empty() {
@@ -193,5 +193,42 @@ fn resolve_safe_path_with_canon(
         }
         // root 也无法 canonicalize（极罕见：root 配置错误）：安全拒绝
         (_, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod decode_tests {
+    use super::*;
+
+    /// 回归：a433d4d 曾把 "/x" 解码成 "//x"，导致所有非 "/" 前缀 location 永远匹配不到
+    #[test]
+    fn keeps_single_leading_slash() {
+        assert_eq!(decode_uri_path("/small.txt").as_deref(), Some("/small.txt"));
+        assert_eq!(decode_uri_path("/api/echo").as_deref(), Some("/api/echo"));
+        assert_eq!(decode_uri_path("/a/b/c").as_deref(), Some("/a/b/c"));
+    }
+
+    #[test]
+    fn normalizes_root_and_trailing_slash() {
+        assert_eq!(decode_uri_path("/").as_deref(), Some("/"));
+        assert_eq!(decode_uri_path("/dir/").as_deref(), Some("/dir/"));
+        assert_eq!(decode_uri_path("//a//b").as_deref(), Some("/a/b"));
+        assert_eq!(decode_uri_path("").as_deref(), Some("/"));
+    }
+
+    #[test]
+    fn decodes_and_blocks_traversal() {
+        assert_eq!(decode_uri_path("/a%20b").as_deref(), Some("/a b"));
+        assert_eq!(decode_uri_path("/%2e%2e/etc/passwd"), None);
+        assert_eq!(decode_uri_path("/a%2Fb"), None);
+        assert_eq!(decode_uri_path("/a%5Cb"), None);
+        assert_eq!(decode_uri_path("/a%00b"), None);
+    }
+
+    /// 与 location 匹配联动：/api 前缀必须命中
+    #[test]
+    fn location_prefix_matching_after_decode() {
+        let path = decode_uri_path("/api/echo").unwrap();
+        assert!(path.starts_with("/api"));
     }
 }
