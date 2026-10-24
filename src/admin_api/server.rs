@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use std::time::Duration;
+
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tracing::{error, info};
@@ -99,8 +101,11 @@ pub async fn start(ctx: AdminContext) -> anyhow::Result<()> {
                     }));
                     match result {
                         Ok(fut) => {
-                            if let Err(e) = fut.await {
-                                error!("管理 API [{}]: {}", peer, e);
+                            // 单连接总超时：防止 slowloris 长期占用连接
+                            match tokio::time::timeout(Duration::from_secs(30), fut).await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => error!("管理 API [{}]: {}", peer, e),
+                                Err(_) => error!("管理 API [{}]: 连接超时", peer),
                             }
                         }
                         Err(_) => error!("管理 API [{}] panic，已恢复", peer),
@@ -135,6 +140,44 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     unsafe { std::ptr::read_volatile(&diff) == 0 }
 }
 
+/// 管理 API 单行上限（请求行 / 每个 header 行）
+const ADMIN_MAX_LINE: usize = 8192;
+/// 单次读取超时（防 slowloris）
+const ADMIN_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 有界读取一行：返回 (行内容, 是否超长)
+///
+/// 原实现先 `read_line` 再判断长度，攻击者可以发送无换行的无限长行把内存打满
+/// （检查发生在分配之后）。这里边读边计数，超过上限立即停止。
+async fn read_limited_line<R>(reader: &mut R, max: usize) -> anyhow::Result<(Option<String>, bool)>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut bytes: Vec<u8> = Vec::with_capacity(256);
+    loop {
+        let chunk = tokio::time::timeout(ADMIN_READ_TIMEOUT, reader.fill_buf())
+            .await
+            .map_err(|_| anyhow::anyhow!("读取超时"))??;
+        if chunk.is_empty() {
+            if bytes.is_empty() {
+                return Ok((None, false));
+            }
+            break;
+        }
+        let newline = chunk.iter().position(|&b| b == b'\n');
+        let take = newline.map_or(chunk.len(), |pos| pos + 1);
+        bytes.extend_from_slice(&chunk[..take]);
+        reader.consume(take);
+        if bytes.len() > max {
+            return Ok((None, true));
+        }
+        if newline.is_some() {
+            break;
+        }
+    }
+    Ok((Some(String::from_utf8_lossy(&bytes).into_owned()), false))
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // HTTP/1.1 请求处理
 // ═══════════════════════════════════════════════════════════════════════
@@ -146,10 +189,14 @@ async fn handle_request(
     let (reader, mut writer) = tokio::io::split(stream);
     let mut buf_reader = BufReader::new(reader);
 
-    // 请求行（限制 8KB 防止 DoS）
-    let mut request_line = String::new();
-    buf_reader.read_line(&mut request_line).await?;
-    if request_line.len() > 8192 { return Ok(()); }
+    // 请求行（有界读取，防无换行长行打满内存）
+    let request_line = match read_limited_line(&mut buf_reader, ADMIN_MAX_LINE).await? {
+        (Some(line), false) => line,
+        _ => {
+            writer.write_all(json_response(414, &err_json("Request line too long")).as_bytes()).await?;
+            return Ok(());
+        }
+    };
     let parts: Vec<&str> = request_line.trim().splitn(3, ' ').collect();
     if parts.len() < 3 { return Ok(()); }
     let method = parts[0].to_string();
@@ -168,19 +215,20 @@ async fn handle_request(
     let mut header_count = 0usize;
     let mut has_content_length = false;
     loop {
-        let mut line = String::new();
-        buf_reader.read_line(&mut line).await?;
+        let line = match read_limited_line(&mut buf_reader, ADMIN_MAX_LINE).await? {
+            (Some(line), false) => line,
+            (_, true) => {
+                let resp = json_response(431, &err_json("Header line too long"));
+                writer.write_all(resp.as_bytes()).await?;
+                return Ok(());
+            }
+            (None, false) => break,
+        };
         if line.trim().is_empty() { break; }
         header_count += 1;
         // 防止 header 泛洪 DoS：最多 128 个 header
         if header_count > 128 {
             let resp = json_response(431, &err_json("Too many headers"));
-            writer.write_all(resp.as_bytes()).await?;
-            return Ok(());
-        }
-        // 防止超长 header 行：最大 8KB
-        if line.len() > 8192 {
-            let resp = json_response(431, &err_json("Header line too long"));
             writer.write_all(resp.as_bytes()).await?;
             return Ok(());
         }
@@ -227,8 +275,17 @@ async fn handle_request(
 
     let req = ParsedRequest { method, path, query, headers, body };
 
-    // 鉴权（部分路径免鉴权）
-    let no_auth_paths = ["/api/health", "/health", "/api/version", "/api/doc", "/metrics"];
+    // 鉴权：健康检查永远免鉴权；/metrics、版本、/api/doc 仅在绑定回环时免鉴权
+    // （绑定 0.0.0.0 且配置了 token 时，指标/版本信息同样需要凭证，避免信息泄露）
+    let loopback_bind = ctx
+        .listen_addr
+        .parse::<std::net::SocketAddr>()
+        .map(|addr| addr.ip().is_loopback())
+        .unwrap_or(false);
+    let mut no_auth_paths = vec!["/api/health", "/health"];
+    if loopback_bind {
+        no_auth_paths.extend(["/api/version", "/api/doc", "/metrics"]);
+    }
     if !no_auth_paths.contains(&req.path.as_str()) {
         if ctx.token.is_empty() {
             // token 未配置时，拒绝所有非健康检查请求，防止未授权访问
@@ -251,4 +308,29 @@ async fn handle_request(
     let resp = build_response(rr.status, &rr.body, rr.content_type);
     writer.write_all(resp.as_bytes()).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod read_tests {
+    use super::read_limited_line;
+
+    #[tokio::test]
+    async fn reads_lines_and_detects_overflow() {
+        let data: &[u8] = b"hello\r\nworld";
+        let mut reader = tokio::io::BufReader::new(data);
+        assert_eq!(
+            read_limited_line(&mut reader, 64).await.unwrap(),
+            (Some("hello\r\n".to_string()), false)
+        );
+        assert_eq!(
+            read_limited_line(&mut reader, 64).await.unwrap(),
+            (Some("world".to_string()), false)
+        );
+        assert_eq!(read_limited_line(&mut reader, 64).await.unwrap(), (None, false));
+
+        // 无换行超长输入：必须在上限处停止而不是无限分配
+        let long = vec![b'a'; 200_000];
+        let mut reader = tokio::io::BufReader::new(long.as_slice());
+        assert_eq!(read_limited_line(&mut reader, 1024).await.unwrap(), (None, true));
+    }
 }
