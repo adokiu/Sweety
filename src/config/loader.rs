@@ -111,6 +111,16 @@ fn validate_config(cfg: &AppConfig) -> Result<()> {
         }
         // 校验上游引用合法性
         for loc in &site.locations {
+            // 安全：无效的 allow/deny 规则必须让配置加载失败。
+            // 原实现在 compile_rules 里静默跳过，`deny 10.0.0.0/33` 这类笔误会变成 fail-open。
+            for rule in &loc.access_rules {
+                if crate::middleware::access_control::IpMatcher::parse(&rule.source).is_none() {
+                    bail!(
+                        "站点 '{}' 的 location '{}' 含无效的访问控制规则 '{}'（应为 IP / CIDR / all）",
+                        site.name, loc.path, rule.source
+                    );
+                }
+            }
             if loc.handler == crate::config::model::HandlerType::ReverseProxy {
                 if loc.upstream.is_none() {
                     bail!(
@@ -266,5 +276,43 @@ mod tests {
         "#;
         let f = write_temp(toml, "toml");
         assert!(load_config(f.path()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod validate_tests {
+    use super::*;
+
+    fn cfg_with_acl(source: &str) -> Result<()> {
+        let text = format!(
+            r#"
+[global]
+log_level = "warn"
+
+[[sites]]
+name = "s"
+server_name = ["s.test"]
+listen = [8080]
+
+[[sites.locations]]
+path = "/"
+handler = "static"
+[[sites.locations.access_rules]]
+action = "deny"
+source = "{source}"
+"#
+        );
+        let cfg: AppConfig = toml::from_str(&text).expect("toml parse");
+        validate_config_pub(&cfg)
+    }
+
+    /// 安全：无效的 allow/deny 规则必须让配置加载失败，不能静默跳过（fail-open）
+    #[test]
+    fn invalid_acl_rule_is_rejected() {
+        assert!(cfg_with_acl("10.0.0.0/33").is_err());
+        assert!(cfg_with_acl("not-an-ip").is_err());
+        assert!(cfg_with_acl("10.0.0.0/8").is_ok());
+        assert!(cfg_with_acl("all").is_ok());
+        assert!(cfg_with_acl("::1").is_ok());
     }
 }
