@@ -126,6 +126,13 @@ pub struct LocationConfig {
     /// gRPC 是否允许 HTTP/1.1 上游（默认 false；RFC 9113 生产环境应使用 HTTP/2 上游）
     #[serde(default)]
     pub grpc_allow_http1_upstream: bool,
+
+    /// WebSocket Origin 白名单（RFC 6455 §10.2 防护 CSRF/跨站劫持）
+    ///
+    /// 空数组 = 不校验（保持旧行为）；条目可写 `https://example.com` 或 `example.com:443`。
+    /// 浏览器不把同源策略应用于 WebSocket，未校验时任意站点可携带用户 Cookie 建立 WS 连接。
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
 }
 
 impl Default for LocationConfig {
@@ -158,6 +165,7 @@ impl Default for LocationConfig {
             auth_failure_status: 401,
             auth_request_headers: vec![],
             grpc_allow_http1_upstream: false,
+            allowed_origins: vec![],
         }
     }
 }

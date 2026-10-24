@@ -207,12 +207,23 @@ pub async fn handle_ws_proxy(
     proxy_redirect_from: Option<&str>,
     proxy_redirect_to: Option<&str>,
     is_h2_ws: bool,
+    allowed_origins: &[String],
 ) -> WebResponse {
     // H1：先校验客户端握手再连接上游（RFC 6455 §4.2.1），失败返回 4xx 而非 502
     if !is_h2_ws {
         if let Err(resp) = validate_client_handshake(ctx.req().method(), ctx.req().version(), ctx.req().headers()) {
             return resp;
         }
+    }
+    // RFC 6455 §10.2：跨站 WebSocket 劫持防护（白名单为空时不校验，保持向后兼容）
+    if !origin_allowed(
+        ctx.req().headers().get("origin").and_then(|v| v.to_str().ok()),
+        allowed_origins,
+    ) {
+        warn!("WS Origin 不在白名单内，拒绝升级");
+        let mut resp = WebResponse::new(ResponseBody::empty());
+        *resp.status_mut() = StatusCode::FORBIDDEN;
+        return resp;
     }
     match do_ws_proxy(
         ctx, upstream_addr, use_tls, tls_sni, tls_insecure,
@@ -238,12 +249,12 @@ pub async fn handle_ws_proxy(
 /// - Sec-WebSocket-Key 必须是 base64 编码的 16 字节随机值（否则 400）
 fn validate_client_handshake(
     method: &sweety_web::http::Method,
-    _version: sweety_web::http::Version,
+    version: sweety_web::http::Version,
     headers: &sweety_web::http::header::HeaderMap,
 ) -> std::result::Result<(), WebResponse> {
     use base64::Engine as _;
     use sweety_web::http::header::{
-        ALLOW, CONNECTION, HeaderValue, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION, UPGRADE,
+        ALLOW, CONNECTION, HOST, HeaderValue, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION, UPGRADE,
     };
 
     let reject = |status: StatusCode| {
@@ -262,6 +273,13 @@ fn validate_client_handshake(
         let mut resp = reject(StatusCode::METHOD_NOT_ALLOWED);
         resp.headers_mut().insert(ALLOW, HeaderValue::from_static("GET"));
         return Err(resp);
+    }
+    // RFC 6455 §4.2.1：握手必须是 HTTP/1.1 或更高版本，且带 Host
+    if version < sweety_web::http::Version::HTTP_11 {
+        return Err(reject(StatusCode::BAD_REQUEST));
+    }
+    if headers.get(HOST).map_or(true, |v| v.as_bytes().is_empty()) {
+        return Err(reject(StatusCode::BAD_REQUEST));
     }
     if !has_token(&UPGRADE, "websocket") || !has_token(&CONNECTION, "upgrade") {
         return Err(reject(StatusCode::BAD_REQUEST));
@@ -293,6 +311,104 @@ fn random_ws_key() -> String {
         key.copy_from_slice(&seed.to_le_bytes());
     }
     base64::engine::general_purpose::STANDARD.encode(key)
+}
+
+/// Origin 白名单校验（RFC 6455 §10.2）
+///
+/// 列表为空 => 不校验（保持旧行为）。条目可为 `https://example.com` 或 `example.com:443`。
+fn origin_allowed(origin: Option<&str>, allowed: &[String]) -> bool {
+    if allowed.is_empty() {
+        return true;
+    }
+    let Some(origin) = origin else { return false };
+    let origin = origin.trim();
+    if origin.is_empty() {
+        return false;
+    }
+    let (origin_host, origin_full) = split_origin(origin);
+    allowed.iter().any(|entry| {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return false;
+        }
+        let (entry_host, entry_full) = split_origin(entry);
+        !origin_host.is_empty()
+            && (entry_full.eq_ignore_ascii_case(origin_full)
+                || entry_host.eq_ignore_ascii_case(origin_host))
+    })
+}
+
+/// 拆出 `host[:port]` 与去掉尾斜杠的完整串
+fn split_origin(value: &str) -> (&str, &str) {
+    let full = value.trim_end_matches('/');
+    let host = full.split("://").nth(1).unwrap_or(full);
+    let host = host.split('/').next().unwrap_or(host);
+    (host, full)
+}
+
+/// 从代理发出的 Upgrade 请求中取出 Sec-WebSocket-Key
+/// （H1 透传客户端的 key；H2/H3 extended CONNECT 使用代理生成的 key）
+fn extract_ws_key(upgrade_req: &str) -> Option<&str> {
+    // HeaderMap 迭代产出的头名是小写，转发时按原样写入，故必须大小写不敏感
+    upgrade_req
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("sec-websocket-key")
+                .then(|| value.trim())
+        })
+        .filter(|key| !key.is_empty())
+}
+
+/// RFC 6455 §4.2.2：base64(SHA-1(key + GUID))
+fn ws_accept_for_key(key: &str) -> String {
+    use base64::Engine as _;
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(key.as_bytes());
+    hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    base64::engine::general_purpose::STANDARD.encode(&hasher.finalize()[..])
+}
+
+/// 响应头是否含指定 token（逗号分隔、大小写不敏感）
+fn header_has_token(headers: &[(String, String)], name: &str, token: &str) -> bool {
+    headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+        .flat_map(|(_, v)| v.split(','))
+        .any(|t| t.trim().eq_ignore_ascii_case(token))
+}
+
+/// 校验上游 101 响应头；不合规返回 502
+fn validate_upstream_101(
+    response_headers: &[(String, String)],
+    upgrade_req: &str,
+) -> Option<WebResponse> {
+    let reject = || {
+        warn!("WS 上游 101 缺少合法的 Upgrade/Connection/Sec-WebSocket-Accept，拒绝升级");
+        let mut resp = WebResponse::new(ResponseBody::empty());
+        *resp.status_mut() = StatusCode::BAD_GATEWAY;
+        Some(resp)
+    };
+    if !header_has_token(response_headers, "upgrade", "websocket")
+        || !header_has_token(response_headers, "connection", "upgrade")
+    {
+        return reject();
+    }
+    // 取不到 key 说明请求构造异常，同样拒绝而不是放行
+    let Some(key) = extract_ws_key(upgrade_req) else {
+        return reject();
+    };
+    let expected = ws_accept_for_key(key);
+    let actual = response_headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("sec-websocket-accept"))
+        .map(|(_, v)| v.trim());
+    // base64 大小写敏感，必须精确比较
+    if actual != Some(expected.as_str()) {
+        return reject();
+    }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -447,6 +563,12 @@ where
         return Ok(resp);
     }
 
+    // RFC 9110 §7.8 / RFC 6455 §4.1：101 必须自证是 WebSocket 升级，且 Accept 必须由
+    // 代理发给上游的那个 key 推导；否则非 WS 上游回 101 也会被当成"握手成功"
+    if let Some(resp) = validate_upstream_101(&response_headers, &upgrade_req) {
+        return Ok(resp);
+    }
+
     debug!("WS 上游握手成功（101），建立双向管道");
 
     // take_body_ref：取走 owned RequestBody（H1/H2 均适用）
@@ -573,3 +695,42 @@ where IO: AsyncReadExt + Unpin {
     Ok((status_code, headers, prefetched_upstream))
 }
 
+
+#[cfg(test)]
+mod handshake_tests {
+    use super::*;
+
+    /// RFC 6455 §1.3 官方示例
+    #[test]
+    fn accept_matches_rfc_example() {
+        assert_eq!(
+            ws_accept_for_key("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
+    }
+
+    #[test]
+    fn origin_allow_list() {
+        let empty: Vec<String> = vec![];
+        assert!(origin_allowed(None, &empty));
+        assert!(origin_allowed(Some("https://a.com"), &empty));
+
+        let list = vec!["https://ok.com".to_string(), "bare.com:8443".to_string()];
+        assert!(origin_allowed(Some("https://ok.com"), &list));
+        assert!(origin_allowed(Some("https://ok.com/"), &list));
+        assert!(origin_allowed(Some("https://bare.com:8443"), &list));
+        assert!(!origin_allowed(Some("https://evil.com"), &list));
+        assert!(!origin_allowed(Some("null"), &list));
+        assert!(!origin_allowed(None, &list));
+    }
+
+    #[test]
+    fn upstream_key_extraction() {
+        let req = "GET /ws HTTP/1.1\r\nHost: a\r\nSec-WebSocket-Key: abc==\r\n\r\n";
+        assert_eq!(extract_ws_key(req), Some("abc=="));
+        // HeaderMap 产出小写头名
+        let lower = "GET /ws HTTP/1.1\r\nsec-websocket-key: def==\r\n\r\n";
+        assert_eq!(extract_ws_key(lower), Some("def=="));
+        assert_eq!(extract_ws_key("GET / HTTP/1.1\r\n\r\n"), None);
+    }
+}

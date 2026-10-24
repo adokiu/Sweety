@@ -316,6 +316,7 @@ pub async fn handle_sweety(
             strip_cookie_secure, proxy_cookie_domain,
             proxy_redirect_from, proxy_redirect_to,
             is_ws_h2,
+            &location.allowed_origins,
         ).await
     } else if node.http2 {
         // ── HTTP/2 上游路径（h2c 或 h2 over TLS）────────────────────────────

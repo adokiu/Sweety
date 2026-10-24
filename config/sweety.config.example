@@ -602,6 +602,9 @@ path            = "/ws"
 handler         = "websocket"
 upstream        = "ws-backend"
 max_connections = 10000
+# Origin allow-list (RFC 6455 §10.2 cross-site hijacking protection).
+# Empty = no check (legacy). Entries accept "https://example.com" or "example.com:443".
+# allowed_origins = ["https://app.example.com", "https://admin.example.com"]
 
 # ─── Auth Request (subrequest authentication) ────────────────────────────────
 # [[sites.locations]]
