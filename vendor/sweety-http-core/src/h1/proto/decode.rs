@@ -196,8 +196,9 @@ impl<D, const MAX_HEADERS: usize> Context<'_, D, MAX_HEADERS> {
             }
             CONNECTION => self.try_set_close_from_header(&value)?,
             EXPECT => {
+                // RFC 9110 §10.1.1：不支持的期望值应回 417（旧实现回 400）
                 if !value.as_bytes().eq_ignore_ascii_case(b"100-continue") {
-                    return Err(ProtoError::HeaderValue);
+                    return Err(ProtoError::ExpectationFailed);
                 }
                 self.set_expect_header()
             }

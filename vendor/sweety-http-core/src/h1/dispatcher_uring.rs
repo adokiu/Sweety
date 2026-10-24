@@ -147,6 +147,9 @@ where
                 Err(Error::Proto(ProtoError::UnsupportedTransferCoding)) => {
                     self.request_error(|| status_only(StatusCode::NOT_IMPLEMENTED))
                 }
+                Err(Error::Proto(ProtoError::ExpectationFailed)) => {
+                    self.request_error(|| status_only(StatusCode::EXPECTATION_FAILED))
+                }
                 Err(Error::Proto(_)) => self.request_error(|| status_only(StatusCode::BAD_REQUEST)),
                 Err(e) => return Err(e),
             }

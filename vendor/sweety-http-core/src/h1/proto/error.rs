@@ -6,6 +6,8 @@ pub enum ProtoError {
     HeaderValue,
     HeaderTooLarge,
     UnsupportedTransferCoding,
+    /// RFC 9110 §10.1.1：无法满足的 Expect 期望值 → 417
+    ExpectationFailed,
     // request-target exceeds read buffer limit (RFC 9110 §15.5.15 → 414).
     UriTooLong,
     Method,
