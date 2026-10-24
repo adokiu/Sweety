@@ -1271,8 +1271,6 @@ dependencies = [
 [[package]]
 name = "http-ws"
 version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed8a25d883f193284e11e1990aec0f54d308c02dbe214c1178dbe17a04447b0f"
 dependencies = [
  "bytes",
  "futures-core",
@@ -2819,7 +2817,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "sweety"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "arc-swap",

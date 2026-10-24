@@ -12,6 +12,7 @@ exclude = [
     "vendor/sweety-server",
     "vendor/sweety-http-core",
     "vendor/sweety-web",
+    "vendor/http-ws",
 ]
 resolver = "2"
 
@@ -161,6 +162,8 @@ tikv-jemallocator = { version = "0.7", optional = true }
 # hyperium/h3：crates.io 0.0.8 尚无 RFC 9220 `:protocol=websocket`，跟踪 upstream 至发布新版本
 [patch.crates-io]
 h3 = { git = "https://github.com/hyperium/h3", rev = "43745ad87e95b0c035ac9c547aad467303213425" }
+# http-ws 0.4.1 未校验 RSV 位 / 控制帧分片 / 关闭码范围（RFC 6455 §5.2/§5.5/§7.4），本地 fork 修复
+http-ws = { path = "vendor/http-ws" }
 
 # ─────────────────────────────────────────────
 # Features
