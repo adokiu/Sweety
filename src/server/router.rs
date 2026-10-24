@@ -164,8 +164,13 @@ pub(super) async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebRes
         let redirect_url = format!("https://{}{}",
             host_for_redirect,
             ctx.req().uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/"));
-        state.metrics.record_status(301);
-        return make_redirect_resp(&redirect_url, StatusCode::MOVED_PERMANENTLY);
+        // RFC 9110 §15.4.2：301/302 可能把 POST 降级为 GET；非幂等方法用 308 保持方法
+        let (status, code) = match *method {
+            Method::GET | Method::HEAD => (StatusCode::MOVED_PERMANENTLY, 301),
+            _ => (StatusCode::PERMANENT_REDIRECT, 308),
+        };
+        state.metrics.record_status(code);
+        return make_redirect_resp(&redirect_url, status);
     }
 
     // 安全检查：拦截敏感路径
