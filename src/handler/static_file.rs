@@ -70,6 +70,29 @@ fn pick_encoding<'a>(
 }
 
 
+/// 流式静态文件是否可压缩（扩展名 / MIME / 最小长度），HEAD 与 GET 共用同一判定，
+/// 避免 HEAD 与 GET 的 Content-Encoding 不一致（RFC 9110 §9.3.2）。
+fn stream_compressible(file_path: &Path, file_size: u64, min_length_kb: u64) -> bool {
+    let min_bytes = min_length_kb * 1024;
+    let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let already_compressed = matches!(ext,
+        "gz" | "br" | "zst" | "zip" | "png" | "jpg" | "jpeg"
+        | "gif" | "webp" | "avif" | "mp4" | "webm" | "woff" | "woff2"
+        | "bin" | "dat" | "raw" | "iso" | "exe" | "dll" | "so"
+    );
+    let mime = crate::middleware::cache::mime_type_for(ext);
+    let compressible_mime = mime.starts_with("text/")
+        || mime == "application/json"
+        || mime == "application/javascript"
+        || mime == "application/x-javascript"
+        || mime == "application/xml"
+        || mime == "application/xhtml+xml"
+        || mime == "application/rss+xml"
+        || mime == "application/atom+xml"
+        || mime == "image/svg+xml";
+    !already_compressed && compressible_mime && file_size >= min_bytes
+}
+
 /// 处理静态文件请求（sweety-web WebContext 版本）
 pub async fn handle_sweety(
     ctx: &WebContext<'_, AppState>,
@@ -164,6 +187,10 @@ pub async fn handle_sweety(
 
             // 选择最优编码（br > zstd > gzip > 原始），严格 q= 解析，复用缓存中预压缩结果
             let (body_bytes, enc) = pick_encoding(req_headers, &entry);
+            // RFC 9110 §12.5.3：identity 被拒绝且无编码变体 → 406
+            if enc.is_none() && !crate::handler::compress::identity_acceptable(req_headers) {
+                return make_error(StatusCode::NOT_ACCEPTABLE, "");
+            }
             let body_bytes = body_bytes.clone();
 
             if is_head {
@@ -172,7 +199,18 @@ pub async fn handle_sweety(
                 h.insert(CONTENT_TYPE, entry.hv_content_type.clone());
                 h.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
                 h.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-                h.insert(CONTENT_LENGTH, entry.hv_content_length.clone());
+                // RFC 9110 §9.3.2：HEAD 与 GET 的表示头必须一致（含 Content-Encoding）
+                if let Some(e) = enc {
+                    if let Ok(v) = HeaderValue::from_str(e) { h.insert(CONTENT_ENCODING, v); }
+                    if let Ok(v) = HeaderValue::from_str(itoa::Buffer::new().format(body_bytes.len())) {
+                        h.insert(CONTENT_LENGTH, v);
+                    }
+                } else {
+                    if !crate::handler::compress::identity_acceptable(req_headers) {
+                        return make_error(StatusCode::NOT_ACCEPTABLE, "");
+                    }
+                    h.insert(CONTENT_LENGTH, entry.hv_content_length.clone());
+                }
                 h.insert(ETAG, entry.hv_etag.clone());
                 h.insert(LAST_MODIFIED, entry.hv_last_modified.clone());
                 h.insert(CACHE_CONTROL, entry.hv_cache_control.clone());
@@ -330,6 +368,10 @@ pub async fn handle_sweety(
             };
             // 选择最优编码写缓存并直接返回（严格 q= 解析）
             let (resp_bytes_ref, enc_name) = pick_encoding(req_headers, &entry);
+            // RFC 9110 §12.5.3：identity 与所有编码均被拒绝 → 406
+            if enc_name.is_none() && !crate::handler::compress::identity_acceptable(req_headers) {
+                return make_error(StatusCode::NOT_ACCEPTABLE, "");
+            }
             let resp_bytes = resp_bytes_ref.clone();
             let enc_hv = enc_name.map(|n| HeaderValue::from_static(n));
             let hv_ct = entry.hv_content_type.clone();
@@ -407,24 +449,7 @@ pub async fn handle_sweety(
                           else { site.gzip_comp_level.unwrap_or(eff.gzip_level) };
         let br_enabled  = eff.brotli;
         let zst_enabled = eff.zstd;
-        let min_bytes   = (eff.min_length as u64) * 1024;
-        let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let already_compressed = matches!(ext,
-            "gz" | "br" | "zst" | "zip" | "png" | "jpg" | "jpeg"
-            | "gif" | "webp" | "avif" | "mp4" | "webm" | "woff" | "woff2"
-            | "bin" | "dat" | "raw" | "iso" | "exe" | "dll" | "so"
-        );
-        let mime = crate::middleware::cache::mime_type_for(ext);
-        let compressible_mime = mime.starts_with("text/")
-            || mime == "application/json"
-            || mime == "application/javascript"
-            || mime == "application/x-javascript"
-            || mime == "application/xml"
-            || mime == "application/xhtml+xml"
-            || mime == "application/rss+xml"
-            || mime == "application/atom+xml"
-            || mime == "image/svg+xml";
-        let can_compress = !already_compressed && compressible_mime && file_size >= min_bytes;
+        let can_compress = stream_compressible(&file_path, file_size, eff.min_length as u64);
         let stream_enc = if can_compress {
             // 严格解析 Accept-Encoding + 自适应算法选择（传入实际文件大小）
             crate::handler::compress::pick_best_encoding_sized(
@@ -438,6 +463,10 @@ pub async fn handle_sweety(
         } else {
             None
         };
+        // RFC 9110 §12.5.3：客户端显式拒绝 identity 且无可用编码 → 406
+        if stream_enc.is_none() && !crate::handler::compress::identity_acceptable(req_headers) {
+            return make_error(StatusCode::NOT_ACCEPTABLE, "");
+        }
         return stream_file_response_compressed(arc_fd, &file_path, file_size, &etag_val, modified_secs, location, stream_enc);
     }
 
@@ -488,10 +517,35 @@ pub async fn handle_sweety(
         return resp;
     }
 
-    // HEAD 请求只返回头信息
+    // HEAD 请求只返回头信息（RFC 9110 §9.3.2：表示头必须与 GET 一致）
     if is_head {
         let mut resp = WebResponse::new(ResponseBody::none());
-        set_file_headers(resp.headers_mut(), &file_path, file_size, &etag_val, modified_secs, location);
+        let h = resp.headers_mut();
+        set_file_headers(h, &file_path, file_size, &etag_val, modified_secs, location);
+        let global = &ctx.state().cfg.load().global;
+        let eff = site.compress.resolve(&global.compress);
+        let gz_enabled = eff.gzip || site.gzip.unwrap_or(global.gzip);
+        let encoding = if stream_compressible(&file_path, file_size, eff.min_length as u64) {
+            crate::handler::compress::pick_best_encoding_sized(
+                req_headers, gz_enabled, eff.brotli, eff.zstd, Some(file_size),
+            )
+        } else {
+            None
+        };
+        match encoding {
+            // 压缩后的长度未知：HEAD 不撒谎（不发 Content-Length），只声明编码
+            Some(name) => {
+                if let Ok(v) = HeaderValue::from_str(name) { h.insert(CONTENT_ENCODING, v); }
+            }
+            None => {
+                if !crate::handler::compress::identity_acceptable(req_headers) {
+                    return make_error(StatusCode::NOT_ACCEPTABLE, "");
+                }
+                if let Ok(v) = HeaderValue::from_str(itoa::Buffer::new().format(file_size)) {
+                    h.insert(CONTENT_LENGTH, v);
+                }
+            }
+        }
         return resp;
     }
 

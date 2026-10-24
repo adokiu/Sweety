@@ -30,6 +30,45 @@ struct AcceptEncoding {
     zstd:   f32,
 }
 
+/// 客户端是否接受 identity（不压缩）表示（RFC 9110 §12.5.3）
+///
+/// - 无 Accept-Encoding：接受
+/// - 显式 `identity;q=0`：拒绝
+/// - `*;q=0` 且未显式列出 identity：拒绝
+pub fn identity_acceptable(headers: &sweety_web::http::header::HeaderMap) -> bool {
+    let Some(raw) = headers.get(ACCEPT_ENCODING).and_then(|v| v.to_str().ok()) else {
+        return true;
+    };
+    if raw.trim().is_empty() {
+        return true;
+    }
+    let mut identity: Option<f32> = None;
+    let mut wildcard: Option<f32> = None;
+    for part in raw.split(',') {
+        let mut pieces = part.split(';');
+        let name = pieces.next().unwrap_or("").trim();
+        if name.is_empty() {
+            continue;
+        }
+        let mut q = 1.0f32;
+        for param in pieces {
+            let param = param.trim();
+            if let Some(v) = param.strip_prefix("q=") {
+                q = v.trim().parse::<f32>().unwrap_or(0.0);
+            }
+        }
+        if name.eq_ignore_ascii_case("identity") {
+            identity = Some(q);
+        } else if name == "*" {
+            wildcard = Some(q);
+        }
+    }
+    match identity {
+        Some(q) => q > 0.0,
+        None => wildcard.map_or(true, |q| q > 0.0),
+    }
+}
+
 /// 严格解析 Accept-Encoding 头（RFC 7231 §5.3.4）
 ///
 /// 支持：
@@ -273,4 +312,31 @@ pub fn compress_response(
     resp.headers_mut().insert(VARY, HeaderValue::from_static("Accept-Encoding"));
     *resp.body_mut() = new_body;
     resp
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use sweety_web::http::header::{HeaderMap, HeaderValue};
+
+    fn headers(ae: Option<&str>) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        if let Some(v) = ae {
+            map.insert(ACCEPT_ENCODING, HeaderValue::from_str(v).unwrap());
+        }
+        map
+    }
+
+    /// RFC 9110 §12.5.3
+    #[test]
+    fn identity_acceptability() {
+        assert!(identity_acceptable(&headers(None)));
+        assert!(identity_acceptable(&headers(Some("gzip, br"))));
+        assert!(identity_acceptable(&headers(Some("gzip;q=0, identity"))));
+        assert!(!identity_acceptable(&headers(Some("gzip;q=0, identity;q=0"))));
+        assert!(!identity_acceptable(&headers(Some("*;q=0"))));
+        assert!(identity_acceptable(&headers(Some("*;q=0.5"))));
+        assert!(identity_acceptable(&headers(Some("identity;q=0.001"))));
+        assert!(!identity_acceptable(&headers(Some("identity;q=0"))));
+    }
 }
