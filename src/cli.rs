@@ -18,6 +18,9 @@ use std::path::PathBuf;
     version,
     about   = "High-performance multi-site web server",
     long_about = None,
+    // 全局 -v/--ver 使用 ArgAction::Version，必须把 version 传播给子命令，
+    // 否则 clap 的 debug_asserts 会在 debug 构建下 panic（release 不触发，故长期被掩盖）
+    propagate_version = true,
 )]
 pub struct Cli {
     #[command(subcommand)]
