@@ -33,8 +33,8 @@ mod compress;
 mod path;
 mod range;
 
-pub use cache::{start_file_cache_watcher, init_cache_limits};
-pub use path::{TryFilesResult, decode_uri_path, try_files_resolve, resolve_safe_path, resolve_safe_path_fast};
+pub use cache::{start_file_cache_watcher, init_cache_limits, init_cache_valid_secs};
+pub use path::{TryFilesResult, decode_uri_path, decode_uri_path_cow, try_files_resolve, resolve_safe_path, resolve_safe_path_fast};
 
 use cache::{
     FileCacheEntry, cache_get_validated, cache_insert, make_cache_key,
@@ -195,6 +195,7 @@ pub async fn handle_sweety(
 
             if is_head {
                 let mut resp = WebResponse::new(ResponseBody::none());
+                resp.headers_mut().reserve(8);
                 let h = resp.headers_mut();
                 h.insert(CONTENT_TYPE, entry.hv_content_type.clone());
                 h.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
@@ -217,8 +218,9 @@ pub async fn handle_sweety(
                 return resp;
             }
 
-            // 直接插入预构建的头，零 from_str 分配
+            // 直接插入预构建的头，零 from_str 分配；预留容量避免 HeaderMap 扩容
             let mut resp = WebResponse::new(ResponseBody::from(body_bytes.clone()));
+            resp.headers_mut().reserve(8);
             let h = resp.headers_mut();
             h.insert(CONTENT_TYPE,   entry.hv_content_type.clone());
             h.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
@@ -365,6 +367,9 @@ pub async fn handle_sweety(
                 hv_etag:            HeaderValue::from_str(&etag_val).unwrap_or_else(|_| HeaderValue::from_static("\"\"") ),
                 hv_last_modified:   HeaderValue::from_str(&http_date).unwrap_or_else(|_| HeaderValue::from_static("Thu, 01 Jan 1970 00:00:00 GMT")),
                 hv_cache_control:   HeaderValue::from_str(cc).unwrap_or_else(|_| HeaderValue::from_static("public, max-age=3600")),
+                validated_at:       std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                    crate::middleware::cache::to_unix_secs(std::time::SystemTime::now()),
+                )),
             };
             // 选择最优编码写缓存并直接返回（严格 q= 解析）
             let (resp_bytes_ref, enc_name) = pick_encoding(req_headers, &entry);

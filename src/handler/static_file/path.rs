@@ -6,8 +6,29 @@ use percent_encoding::percent_decode_str;
 
 /// 按 `/` 分段 percent-decode（RFC 9110 / Nginx `$uri` 语义，`%2F` 不扩成路径分隔符）
 pub fn decode_uri_path(path: &str) -> Option<String> {
+    decode_uri_path_cow(path).map(|c| c.into_owned())
+}
+
+/// 与 [decode_uri_path] 等价，但无需改写时直接借用原字符串。
+///
+/// 热路径：每个请求都要解析 URI。绝大多数请求既没有百分号编码、也没有重复斜杠
+/// 或点段，原实现会为此分配一个 String。
+pub fn decode_uri_path_cow(path: &str) -> Option<std::borrow::Cow<'_, str>> {
+    use std::borrow::Cow;
     if path.is_empty() {
-        return Some("/".to_string());
+        return Some(Cow::Borrowed("/"));
+    }
+    // 快路径：无需 decode / 折叠 / 点段检查，直接借用
+    let needs_work = path.as_bytes().contains(&b'%')
+        || path.as_bytes().contains(&b'\\')
+        || path.as_bytes().contains(&0)
+        || path.contains("//")
+        || path.contains("/./")
+        || path.contains("..")
+        || path.ends_with("/.")
+        || !path.starts_with('/');
+    if !needs_work {
+        return Some(Cow::Borrowed(path));
     }
     // 规范化：保留单个前导 '/'，折叠重复 '/'，逐段 percent-decode 并拒绝穿越
     let mut out = String::with_capacity(path.len());
@@ -36,7 +57,7 @@ pub fn decode_uri_path(path: &str) -> Option<String> {
     if out.is_empty() {
         out.push('/');
     }
-    Some(out)
+    Some(Cow::Owned(out))
 }
 
 // ─────────────────────────────────────────────
