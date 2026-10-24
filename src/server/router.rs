@@ -49,15 +49,22 @@ pub(super) async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebRes
     state.metrics.inc_requests();
     let _req_guard = RequestGuard(state.metrics.clone());
 
-    let global = state.cfg.load().global.clone();
+    // 性能：原实现每请求 `cfg.load().global.clone()`（GlobalConfig 含 35 个字段、多个
+    // String/Vec → 每请求多次堆分配），这里只取这两个 bool，避免整结构体克隆。
     let method = ctx.req().method();
-    if *method == Method::TRACE && global.disable_http_trace {
-        state.metrics.record_status(405);
-        return make_method_not_allowed();
-    }
-    if *method == Method::CONNECT && !ctx.req().body().is_h2_ws() && !global.allow_http_connect_tunnel {
-        state.metrics.record_status(405);
-        return make_method_not_allowed();
+    if *method == Method::TRACE || *method == Method::CONNECT {
+        let cfg_arc = state.cfg.load();
+        if *method == Method::TRACE && cfg_arc.global.disable_http_trace {
+            state.metrics.record_status(405);
+            return make_method_not_allowed();
+        }
+        if *method == Method::CONNECT
+            && !ctx.req().body().is_h2_ws()
+            && !cfg_arc.global.allow_http_connect_tunnel
+        {
+            state.metrics.record_status(405);
+            return make_method_not_allowed();
+        }
     }
 
     // RFC 9110 §7.4 / §9.3.7：asterisk-form 仅用于 OPTIONS（服务器级能力查询）
@@ -102,7 +109,7 @@ pub(super) async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebRes
     let (host, host_port) = crate::dispatcher::host::split_host_port(host_raw);
 
     let path_raw = ctx.req().uri().path();
-    let path_decoded = crate::handler::static_file::decode_uri_path(path_raw);
+    let path_decoded = crate::handler::static_file::decode_uri_path_cow(path_raw);
     let path = path_decoded.as_deref().unwrap_or(path_raw);
     let request_uri = ctx.req().uri().path_and_query()
         .map(|pq| pq.as_str())
