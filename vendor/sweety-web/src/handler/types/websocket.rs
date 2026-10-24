@@ -8,7 +8,7 @@ use core::{
 
 use futures_core::stream::Stream;
 use http_ws::{
-    CloseReason, HandshakeError, Item, Message as WsMessage, ProtocolError, WsOutput,
+    CloseCode, CloseReason, HandshakeError, Item, Message as WsMessage, ProtocolError, WsOutput,
     stream::{RequestStream, WsError},
 };
 use tokio::time::{Instant, sleep};
@@ -226,7 +226,15 @@ async fn spawn_task<B>(
             match poll_fn(|cx| decode.as_mut().poll_next(cx)).select(sleep.as_mut()).await {
                 SelectOutput::A(Some(Ok(msg))) => {
                     let msg = match msg {
-                        WsMessage::Text(txt) => Message::Text(BytesStr::try_from(txt).unwrap()),
+                        // RFC 6455 §8.1：文本帧必须是合法 UTF-8，否则 fail the connection（1007）。
+                        // 旧实现 unwrap 会在非法 UTF-8 时 panic（远程 DoS），且从不发送 Close。
+                        WsMessage::Text(txt) => match BytesStr::try_from(txt) {
+                            Ok(text) => Message::Text(text),
+                            Err(_) => {
+                                let _ = tx.close(Some(CloseCode::Invalid)).await;
+                                return Ok(());
+                            }
+                        },
                         WsMessage::Binary(bin) => Message::Binary(bin),
                         WsMessage::Continuation(item) => Message::Continuation(item),
                         WsMessage::Nop => continue,
@@ -250,7 +258,21 @@ async fn spawn_task<B>(
 
                     on_msg(&mut tx, msg).await
                 }
-                SelectOutput::A(Some(Err(e))) => on_err(e).await,
+                // RFC 6455 §5.2 / §7.1.7：协议错误必须 fail the connection 而不是继续轮询
+                // 未推进的解析缓冲（旧实现会让任务空转烧 CPU，且永不发送 Close）。
+                SelectOutput::A(Some(Err(e))) => {
+                    let is_protocol = matches!(&e, WsError::Protocol(_));
+                    let code = match &e {
+                        WsError::Protocol(ProtocolError::InvalidLength(_))
+                        | WsError::Protocol(ProtocolError::Overflow) => CloseCode::Size,
+                        _ => CloseCode::Protocol,
+                    };
+                    on_err(e).await;
+                    if is_protocol {
+                        let _ = tx.close(Some(code)).await;
+                    }
+                    return Ok(());
+                }
                 SelectOutput::A(None) => return Ok(()),
                 SelectOutput::B(_) => match un_answered_ping.cmp(&max_unanswered_ping) {
                     Ordering::Less => {
