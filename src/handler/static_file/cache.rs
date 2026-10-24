@@ -44,6 +44,14 @@ fn limits() -> &'static CacheLimits {
 /// - `open_file_cache max=200000 inactive=60s;`
 /// - `open_file_cache_min_uses 2;`
 /// - fd 条目数 = max / 8（Nginx 内部近似比例）
+/// 静态文件缓存校验间隔（秒），等价 Nginx `open_file_cache_valid`
+static CACHE_VALID_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(60);
+
+/// 设置校验间隔（启动时调用一次）
+pub fn init_cache_valid_secs(secs: u64) {
+    CACHE_VALID_SECS.store(secs, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn init_cache_limits(max_entries: usize, total_mb: usize) {
     let _ = CACHE_LIMITS.set(CacheLimits {
         file_cache_total_bytes: total_mb.max(16) * 1024 * 1024,
@@ -110,6 +118,8 @@ pub(super) struct FileCacheEntry {
     pub(super) hv_etag:           HeaderValue,
     pub(super) hv_last_modified:  HeaderValue,
     pub(super) hv_cache_control:  HeaderValue,
+    /// 上次 stat 校验时刻（unix 秒）。命中路径按 open_file_cache_valid 间隔才真正 stat
+    pub(super) validated_at:      Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// 大文件 fd 缓存条目：缓存 fd + stat，避免重复 open syscall
@@ -126,10 +136,10 @@ pub(super) struct FdCacheEntry {
 // 全局缓存
 // ─────────────────────────────────────────────
 
-static FILE_CACHE: OnceLock<DashMap<Arc<str>, FileCacheEntry>> = OnceLock::new();
+static FILE_CACHE: OnceLock<DashMap<Arc<str>, Arc<FileCacheEntry>>> = OnceLock::new();
 static FD_CACHE:   OnceLock<DashMap<Arc<str>, FdCacheEntry>>   = OnceLock::new();
 
-pub(super) fn file_cache() -> &'static DashMap<Arc<str>, FileCacheEntry> {
+pub(super) fn file_cache() -> &'static DashMap<Arc<str>, Arc<FileCacheEntry>> {
     FILE_CACHE.get_or_init(|| DashMap::with_capacity(limits().file_cache_max_entries.min(4096)))
 }
 
@@ -179,8 +189,16 @@ pub(super) fn purge_file_cache_for_source(source: &str) {
 pub(super) async fn cache_get_validated(
     root: &Path,
     relative: &str,
-) -> Option<FileCacheEntry> {
+) -> Option<Arc<FileCacheEntry>> {
+    use std::sync::atomic::Ordering;
     let entry = cache_get_fast(root, relative)?;
+    // 性能：命中路径原实现每请求都 tokio::fs::metadata（一次 syscall + 一次 blocking
+    // 线程调度）。改为按 open_file_cache_valid 间隔校验，与 Nginx open_file_cache_valid 一致。
+    let now = crate::middleware::cache::to_unix_secs(std::time::SystemTime::now());
+    let valid = CACHE_VALID_SECS.load(Ordering::Relaxed);
+    if valid > 0 && now.saturating_sub(entry.validated_at.load(Ordering::Relaxed)) < valid {
+        return Some(entry);
+    }
     let path = Path::new(entry.source_path.as_ref());
     let meta = tokio::fs::metadata(path).await.ok()?;
     let modified = meta.modified().ok()?;
@@ -189,10 +207,11 @@ pub(super) async fn cache_get_validated(
         purge_file_cache_for_source(entry.source_path.as_ref());
         return None;
     }
+    entry.validated_at.store(now, Ordering::Relaxed);
     Some(entry)
 }
 
-pub(super) fn cache_get_fast(root: &Path, relative: &str) -> Option<FileCacheEntry> {
+pub(super) fn cache_get_fast(root: &Path, relative: &str) -> Option<Arc<FileCacheEntry>> {
     let root_str = root.to_str().unwrap_or("");
     let mut buf = [0u8; 512];
     let root_bytes = root_str.as_bytes();
@@ -203,7 +222,7 @@ pub(super) fn cache_get_fast(root: &Path, relative: &str) -> Option<FileCacheEnt
         buf[root_bytes.len()] = b'/';
         buf[root_bytes.len() + 1..total].copy_from_slice(rel_bytes);
         if let Ok(key) = std::str::from_utf8(&buf[..total]) {
-            file_cache().get(key).map(|e| e.clone())
+            file_cache().get(key).map(|e| Arc::clone(e.value()))
         } else {
             None
         }
@@ -270,6 +289,7 @@ pub(super) fn fd_cache_insert_arc(
 // ─────────────────────────────────────────────
 
 pub(super) fn cache_insert(key: Arc<str>, entry: FileCacheEntry) {
+    let entry = Arc::new(entry);
     let cache = file_cache();
     let lim = limits();
     let total: usize = cache.iter().map(|e| {
@@ -345,6 +365,7 @@ mod tests {
             hv_etag: HeaderValue::from_static("\"old\""),
             hv_last_modified: HeaderValue::from_static("Thu, 01 Jan 1970 00:00:00 GMT"),
             hv_cache_control: HeaderValue::from_static("no-cache"),
+            validated_at: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 

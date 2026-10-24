@@ -12,6 +12,8 @@ fn default_fastcgi_read_timeout() -> u64 { 60 }
 fn default_client_max_body_size() -> usize { 50 }
 fn default_client_header_buffer_size() -> usize { 32 }
 fn default_client_body_buffer_size() -> usize { 512 }
+fn default_open_file_cache_valid() -> u64 { 60 }
+fn default_worker_max_blocking_threads() -> usize { 16 }
 fn default_gzip_min_length() -> usize { 1 }
 fn default_gzip_comp_level() -> u32 { 5 }
 fn default_prometheus_path() -> String { "/metrics".into() }
@@ -120,6 +122,15 @@ pub struct GlobalConfig {
     #[serde(default = "default_open_file_cache_total_mb")]
     pub open_file_cache_total_mb: usize,
 
+    /// 静态文件缓存校验间隔（秒，等价 Nginx open_file_cache_valid，默认 60）
+    /// 0 = 每次请求都 stat（最精确但最慢）
+    #[serde(default = "default_open_file_cache_valid")]
+    pub open_file_cache_valid: u64,
+
+    /// 每个 worker 的阻塞线程池上限（默认 16，等价 Nginx 每 worker 无额外阻塞线程的模型）
+    #[serde(default = "default_worker_max_blocking_threads")]
+    pub worker_max_blocking_threads: usize,
+
     /// HTTP/2 单连接最大并发流数（等价 Nginx http2_max_concurrent_streams，默认 128）
     #[serde(default = "default_h2_max_concurrent_streams")]
     pub h2_max_concurrent_streams: u32,
@@ -182,6 +193,8 @@ impl Default for GlobalConfig {
             client_max_body_size: default_client_max_body_size(),
             client_header_buffer_size: default_client_header_buffer_size(),
             client_body_buffer_size: default_client_body_buffer_size(),
+            open_file_cache_valid: default_open_file_cache_valid(),
+            worker_max_blocking_threads: default_worker_max_blocking_threads(),
             gzip: false,
             gzip_min_length: default_gzip_min_length(),
             gzip_comp_level: default_gzip_comp_level(),
