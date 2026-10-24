@@ -6,7 +6,18 @@
 
 ## [Unreleased]
 
+### Security
+
+- **管理 API DoS 加固**：请求行/头部行改为有界读取（原实现先 `read_line` 再判断长度，无换行的超长行可撑爆内存），并加单次读取 10s、单连接 30s 超时（防 slowloris）。
+- **管理 API 信息泄露**：`/metrics`、`/api/version`、`/api/doc` 在绑定非回环地址时同样要求 token（仅 `/health` 保持免鉴权供探活）。
+- **访问控制 fail-closed**：无效的 `allow`/`deny` 规则（如 `10.0.0.0/33`）现在让配置加载失败；原实现静默跳过该规则，等于把策略变成放行。
+- **force_https 开放重定向**：重定向目标 Host 必须匹配站点 `server_name`（含单层通配符），否则改用配置的首个域名，避免 fallback/通配符站点把任意 Host 拼回 `Location`。
+- **sub_filter**：跳过带 `Content-Encoding` 的响应，避免把压缩字节按文本改写。
+
 ### Fixed
+
+- **OPTIONS \***（RFC 9110 §7.4 / §9.3.7）：新增 asterisk-form 路由与 204 + `Allow` 响应，原实现落到通配路由返回空 404。
+- **debug 构建 CLI panic**：`sweety validate` 等子命令在 debug 构建下会因 clap `ArgAction::Version` 未传播而 panic（release 不触发），已加 `propagate_version`。
 
 - **缓存写入门禁**：带 `Authorization` / `Cookie` 或请求 `Cache-Control: no-store` 的响应不再写入共享缓存（RFC 9111 §3.5、§5.2.1.5 的 MUST；原实现只在读取侧 bypass，写入侧仍会入库）。
 - **WebSocket 运行时**：非法 UTF-8 文本帧改为 1007 关闭（原 `unwrap` panic，可被远程触发）；协议错误改为发送 1002/1009 关闭（原实现继续轮询未推进的缓冲导致空转）。
