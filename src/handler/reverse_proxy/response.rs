@@ -86,6 +86,11 @@ pub fn apply_sub_filter(
 ) -> Vec<u8> {
     if filters.is_empty() { return body; }
 
+    // 已压缩/已编码的响应不能按文本改写（否则会把 gzip 字节破坏成乱码）
+    if headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-encoding")) {
+        return body;
+    }
+
     // 只处理文本类响应
     let is_text = headers.iter().any(|(k, v)| {
         k.eq_ignore_ascii_case("content-type") && (
@@ -309,4 +314,33 @@ pub fn proxy_error(status: StatusCode, _msg: &str, client_version: Version) -> W
     attach_http_date(&mut resp);
     append_gateway_via(&mut resp, client_version);
     resp
+}
+
+#[cfg(test)]
+mod sub_filter_tests {
+    use super::apply_sub_filter;
+    use crate::config::model::SubFilter;
+
+    fn filter() -> SubFilter {
+        SubFilter { pattern: "foo".into(), replacement: "bar".into() }
+    }
+
+    #[test]
+    fn rewrites_plain_text() {
+        let headers = vec![("content-type".to_string(), "text/html".to_string())];
+        let out = apply_sub_filter(b"foo".to_vec(), &headers, &[filter()]);
+        assert_eq!(out, b"bar");
+    }
+
+    /// 已压缩响应不能被按文本改写（否则破坏 gzip 字节）
+    #[test]
+    fn skips_encoded_response() {
+        let headers = vec![
+            ("content-type".to_string(), "text/html".to_string()),
+            ("content-encoding".to_string(), "gzip".to_string()),
+        ];
+        let body = b"foo".to_vec();
+        let out = apply_sub_filter(body.clone(), &headers, &[filter()]);
+        assert_eq!(out, body);
+    }
 }
