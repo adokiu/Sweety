@@ -206,6 +206,8 @@ impl SweetyServer {
         let app = App::new()
             .with_state(state.clone())
             .at("/*path", all_methods)
+            // RFC 9110 §7.4：asterisk-form（OPTIONS *）的目标不是普通路径，通配路由匹配不到
+            .at("*", get(h()).post(h()).put(h()).delete(h()).patch(h()).head(h()).options(h()).trace(h()).connect(h()))
             .at("/", get(h()).post(h()).put(h()).delete(h()).patch(h()).head(h()).options(h()).trace(h()).connect(h()));
 
         let mut server = sweety_web::HttpServer::serve(app.finish());
