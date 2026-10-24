@@ -30,6 +30,46 @@ pub fn split_host_port(raw: &str) -> (&str, Option<u16>) {
 
 /// 虚拟主机查找键：小写 ASCII、IDNA Punycode、IPv6 无括号、去掉 FQDN 尾点
 pub fn normalize_host_key(raw: &str) -> Option<String> {
+    normalize_host_key_cow(raw).map(|c| c.into_owned())
+}
+
+/// 与 [normalize_host_key] 相同，但纯 ASCII 小写主机名直接借用，避免每请求一次
+/// String 分配 + IDNA 处理（热路径：每个请求的虚拟主机查找）。
+pub fn normalize_host_key_cow(raw: &str) -> Option<std::borrow::Cow<'_, str>> {
+    use std::borrow::Cow;
+    let (host, _) = split_host_port(raw.trim());
+    let mut host = host.trim();
+    if host.is_empty() {
+        return None;
+    }
+    if host.ends_with('.') {
+        host = host.trim_end_matches('.');
+        if host.is_empty() {
+            return None;
+        }
+    }
+    let host = if host.starts_with('[') && host.ends_with(']') && host.len() > 2 {
+        &host[1..host.len() - 1]
+    } else {
+        host
+    };
+    // 快路径：已是小写 ASCII 且不是 IPv6 字面量 → 无需 IDNA/小写化
+    if host.is_ascii() && !host.bytes().any(|b| b.is_ascii_uppercase()) {
+        return Some(Cow::Borrowed(host));
+    }
+    if host.parse::<IpAddr>().is_ok() {
+        return Some(Cow::Owned(host.to_ascii_lowercase()));
+    }
+    let ascii = idna::domain_to_ascii(host).ok()?;
+    if ascii.is_ascii() && !ascii.bytes().any(|b| b.is_ascii_uppercase()) {
+        Some(Cow::Owned(ascii))
+    } else {
+        Some(Cow::Owned(ascii.to_ascii_lowercase()))
+    }
+}
+
+#[allow(dead_code)]
+fn normalize_host_key_owned_unused(raw: &str) -> Option<String> {
     let (host, _) = split_host_port(raw.trim());
     let mut host = host.trim();
     if host.is_empty() {

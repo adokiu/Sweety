@@ -334,9 +334,10 @@ impl VHostRegistry {
     /// 内部查找实现：端口剥离 + IDNA / IPv6 / FQDN 规范化后与注册表匹配
     #[inline(always)]
     fn lookup_inner(&self, host: &str) -> Option<Arc<SiteInfo>> {
-        let key = super::host::normalize_host_key(host)?;
+        let key = super::host::normalize_host_key_cow(host)?;
+        let key = key.as_ref();
         let inner = self.inner.load();
-        if let Some(site) = inner.exact.get(&key) {
+        if let Some(site) = inner.exact.get(key) {
             return Some(Arc::clone(site));
         }
         if let Some(dot_pos) = key.find('.') {
