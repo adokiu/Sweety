@@ -313,7 +313,8 @@ fn write_fcgi_cache(
     vary_req_headers: &sweety_web::http::HeaderMap,
 ) {
     if let (Some(cache), Some(key)) = (cache, key) {
-        if cache.is_cacheable(status, headers) {
+        // RFC 9111 §3.5 / §5.2.1.5：请求侧门禁（Authorization / Cookie / no-store）同样约束写入
+        if cache.storable(vary_req_headers, status, headers) {
             cache.set(
                 key.clone(),
                 status,

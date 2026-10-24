@@ -1,4 +1,4 @@
-﻿//! 反向代理 / FastCGI 响应缓存（RFC 9111 共享缓存子集 + Nginx proxy_cache 语义）
+//! 反向代理 / FastCGI 响应缓存（RFC 9111 共享缓存子集 + Nginx proxy_cache 语义）
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -468,6 +468,45 @@ impl ProxyCache {
             return false;
         }
         entry.requires_origin_revalidation || request_requires_origin_revalidation(req_headers)
+    }
+
+    /// 请求侧是否允许把响应写入共享缓存（RFC 9111 §3.5、§5.2.1.5）
+    ///
+    /// 读取侧 `should_lookup` 已按 `bypass_headers` 跳过查询，但写侧独立判定：
+    /// 带 `Authorization` / `Cookie` 的请求若不拦截写入，其响应会进入共享缓存，
+    /// 随后被匿名请求命中 —— RFC 9111 §3.5 明确共享缓存 MUST NOT 存储这类响应。
+    /// 同样，请求带 `Cache-Control: no-store` / `Pragma: no-store` 时也不得存储。
+    pub fn request_allows_store(&self, req_headers: &HeaderMap) -> bool {
+        for bypass in &self.bypass_headers {
+            if let Some(val) = req_headers.get(bypass.as_str()) {
+                if !val.is_empty() {
+                    return false;
+                }
+            }
+        }
+        if let Some(cc) = req_headers.get("cache-control").and_then(|v| v.to_str().ok()) {
+            if cc.to_ascii_lowercase().contains("no-store") {
+                return false;
+            }
+        }
+        if req_headers
+            .get("pragma")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|p| p.to_ascii_lowercase().contains("no-store"))
+        {
+            return false;
+        }
+        true
+    }
+
+    /// 完整写缓存判定：请求侧门禁 + 响应对状态码/头部的可缓存性
+    pub fn storable(
+        &self,
+        req_headers: &HeaderMap,
+        status: u16,
+        resp_headers: &[(String, String)],
+    ) -> bool {
+        self.request_allows_store(req_headers) && self.is_cacheable(status, resp_headers)
     }
 
     pub fn should_lookup(&self, method: &str, req_headers: &HeaderMap) -> bool {
@@ -1368,4 +1407,55 @@ fn base64_decode(s: &str) -> anyhow::Result<Vec<u8>> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod request_gate_tests {
+    use super::*;
+    use sweety_web::http::header::{HeaderMap, HeaderValue};
+
+    fn cache() -> Arc<ProxyCache> {
+        // 用 serde 默认值构造，保证与真实配置默认（bypass_headers 等）一致
+        let cfg: crate::config::model::ProxyCacheConfig = toml::from_str("").unwrap();
+        ProxyCache::from_config(&cfg)
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (k, v) in pairs {
+            map.insert(
+                sweety_web::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        map
+    }
+
+    /// RFC 9111 §3.5：带 Authorization 的请求，其响应不得写入共享缓存
+    #[test]
+    fn authorization_blocks_store_even_when_response_is_cacheable() {
+        let pc = cache();
+        let resp = vec![("cache-control".to_string(), "max-age=60".to_string())];
+        assert!(pc.storable(&headers(&[]), 200, &resp));
+        assert!(!pc.storable(&headers(&[("authorization", "Bearer x")]), 200, &resp));
+        assert!(!pc.storable(&headers(&[("cookie", "sid=1")]), 200, &resp));
+    }
+
+    /// RFC 9111 §5.2.1.5：请求 no-store 时不得存储
+    #[test]
+    fn request_no_store_blocks_store() {
+        let pc = cache();
+        let resp = vec![("cache-control".to_string(), "max-age=60".to_string())];
+        assert!(!pc.storable(&headers(&[("cache-control", "no-store")]), 200, &resp));
+        assert!(!pc.storable(&headers(&[("pragma", "no-store")]), 200, &resp));
+    }
+
+    /// 响应侧规则仍然生效（private / Set-Cookie）
+    #[test]
+    fn response_side_rules_still_apply() {
+        let pc = cache();
+        assert!(!pc.storable(&headers(&[]), 200, &[("cache-control".into(), "private".into())]));
+        assert!(!pc.storable(&headers(&[]), 200, &[("set-cookie".into(), "a=b".into())]));
+        assert!(!pc.storable(&headers(&[]), 404, &[]));
+    }
 }

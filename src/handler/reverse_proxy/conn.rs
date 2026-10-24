@@ -786,7 +786,8 @@ async fn send_recv_pooled(
 
     // ── proxy_cache 写入（在 body 完整且未被消耗之前）────────────
     if let Some((cache, cache_key, vary_req)) = proxy_cache {
-        if cache.is_cacheable(status_code, &response_headers) {
+        // RFC 9111 §3.5 / §5.2.1.5：请求侧门禁（Authorization / Cookie / no-store）同样约束写入
+        if cache.storable(vary_req, status_code, &response_headers) {
             let body_clone = bytes::Bytes::from(final_body.clone());
             let headers_clone = response_headers.clone();
             let cache_clone = cache.clone();
