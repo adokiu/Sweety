@@ -46,12 +46,12 @@ pub async fn sendfile_to_io<St: sweety_io_compat::io::AsyncIo>(
 
         #[cfg(target_os = "linux")]
         let n = unsafe {
-            libc::sendfile(sock_fd, file_fd, &mut off, rem.min(1 << 22))
+            libc::sendfile(sock_fd, file_fd, &mut off, rem.min(1 << 24))
         };
 
         #[cfg(target_os = "macos")]
         let n = {
-            let mut sent_len = rem.min(1 << 22) as libc::off_t;
+            let mut sent_len = rem.min(1 << 24) as libc::off_t;
             let ret = unsafe {
                 libc::sendfile(file_fd, sock_fd, off, &mut sent_len, std::ptr::null_mut(), 0)
             };

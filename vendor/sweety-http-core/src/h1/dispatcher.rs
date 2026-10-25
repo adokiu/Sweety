@@ -314,9 +314,16 @@ where
                         _ => None,
                     }
                 };
+            // 只有中小响应才值得 cork（把头和首段数据合成一个报文）；
+            // 大文件内核本来就会发满 MSS，多两次 setsockopt 纯属浪费（nginx 默认 tcp_nopush off）
+            const CORK_MAX_LEN: u64 = 64 * 1024 * 1024;
             #[cfg(target_os = "linux")]
-            if let Some((_, fd)) = &sf_fast {
-                crate::sendfile_ext::set_cork(*fd, true);
+            let need_cork = matches!(&sf_fast, Some((sf, _)) if sf.len <= CORK_MAX_LEN);
+            #[cfg(target_os = "linux")]
+            if need_cork {
+                if let Some((_, fd)) = &sf_fast {
+                    crate::sendfile_ext::set_cork(*fd, true);
+                }
             }
 
             // 出错时也必须解 cork，否则内核会一直攒着不发
@@ -337,7 +344,9 @@ where
                     self.io.io, sock_fd, &sf.fd, sf.offset, sf.len,
                 ).await;
                 #[cfg(target_os = "linux")]
-                crate::sendfile_ext::set_cork(sock_fd, false);
+                if need_cork {
+                    crate::sendfile_ext::set_cork(sock_fd, false);
+                }
                 r?;
                 true
             };
