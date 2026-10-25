@@ -66,6 +66,14 @@ pub trait AsyncIoDyn: io::Read + io::Write + Unpin {
     fn is_vectored_write(&self) -> bool;
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
+
+    /// 底层 socket fd（0 = 不可用）
+    #[inline]
+    fn raw_fd(&self) -> i32 { 0 }
+
+    /// sendfile(2) 用的 socket fd（None = 不可用，例如 TLS 封装）
+    #[inline]
+    fn sendfile_fd(&self) -> Option<i32> { None }
 }
 
 impl<Io> AsyncIoDyn for Io
@@ -89,6 +97,16 @@ where
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         AsyncIo::poll_shutdown(self, cx)
     }
+
+    #[inline]
+    fn raw_fd(&self) -> i32 {
+        AsyncIo::raw_fd(self)
+    }
+
+    #[inline]
+    fn sendfile_fd(&self) -> Option<i32> {
+        AsyncIo::sendfile_fd(self)
+    }
 }
 
 impl<IoDyn> AsyncIo for Box<IoDyn>
@@ -111,6 +129,17 @@ where
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         AsyncIoDyn::poll_shutdown(Pin::new(&mut **self.get_mut()), cx)
+    }
+
+    // 关键：dyn 化之后必须继续转发 fd，否则 sendfile(2) 永远返回 None
+    #[inline]
+    fn raw_fd(&self) -> i32 {
+        AsyncIoDyn::raw_fd(&**self)
+    }
+
+    #[inline]
+    fn sendfile_fd(&self) -> Option<i32> {
+        AsyncIoDyn::sendfile_fd(&**self)
     }
 }
 
@@ -230,6 +259,16 @@ where
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+    }
+
+    #[inline(always)]
+    fn raw_fd(&self) -> i32 {
+        self.0.raw_fd()
+    }
+
+    #[inline(always)]
+    fn sendfile_fd(&self) -> Option<i32> {
+        self.0.sendfile_fd()
     }
 }
 

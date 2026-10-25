@@ -304,6 +304,21 @@ where
             //
             // 判定提前到 drain_write 之前：这样可以在写响应头之前打 TCP_CORK，
             // 让「响应头 + 文件数据」连续发出（等价 Nginx tcp_nopush on）。
+            // 诊断开关：SWEETY_DEBUG_SENDFILE=1 时把 sendfile 决策打到 stderr
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                static DBG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *DBG.get_or_init(|| std::env::var_os("SWEETY_DEBUG_SENDFILE").is_some()) {
+                    eprintln!(
+                        "[sf] has_info={} sock_fd={:?} no_body={} tunnel={}",
+                        send_file_info.is_some(),
+                        self.io.io.sendfile_fd(),
+                        no_body,
+                        is_tunnel
+                    );
+                }
+            }
+
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             let sf_fast: Option<(crate::sendfile_ext::SendFileInfo, i32)> =
                 if no_body || is_tunnel {
