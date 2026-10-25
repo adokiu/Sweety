@@ -15,7 +15,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[cfg(all(not(windows), feature = "jemalloc"))]
 #[allow(non_upper_case_globals)]
-#[export_name = "_rjem_malloc_conf"]
+#[unsafe(export_name = "_rjem_malloc_conf")]
 pub static malloc_conf: &[u8] =
     b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
 
