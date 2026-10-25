@@ -332,7 +332,7 @@ where
             // 只有中小响应才值得 cork（把头和首段数据合成一个报文）；
             // 大文件内核本来就会发满 MSS，多两次 setsockopt 纯属浪费（nginx 默认 tcp_nopush off）
             const CORK_MAX_LEN: u64 = 64 * 1024 * 1024;
-            #[cfg(target_os = "linux")]
+            // 非 Linux 平台没有 TCP_CORK，但 sendfile 仍可用，need_cork 仅控制 setsockopt
             let need_cork = matches!(&sf_fast, Some((sf, _)) if sf.len <= CORK_MAX_LEN);
             #[cfg(target_os = "linux")]
             if need_cork {

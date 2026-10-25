@@ -56,6 +56,21 @@ pub async fn sendfile_to_io_corked<St: sweety_io_compat::io::AsyncIo>(
     // nginx 实际是 write 先试、EAGAIN 才注册事件）。
     let mut need_ready = false;
 
+    // 诊断/调优：SWEETY_SENDFILE_SNDBUF=<字节> 时显式设置发送缓冲区
+    #[cfg(target_os = "linux")]
+    {
+        static SNDBUF: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let want = *SNDBUF.get_or_init(|| {
+            std::env::var("SWEETY_SENDFILE_SNDBUF")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0)
+        });
+        if want > 0 {
+            set_sndbuf(sock_fd, want);
+        }
+    }
+
     while rem > 0 {
         if need_ready {
             io.ready(Interest::WRITABLE).await?;
@@ -105,6 +120,27 @@ pub async fn sendfile_to_io_corked<St: sweety_io_compat::io::AsyncIo>(
         eprintln!("[sf] sent len={} calls={} avg={}", len, calls, if calls > 0 { len / calls as u64 } else { 0 });
     }
     Ok(())
+}
+
+/// 实验用：按环境变量设置 SO_SNDBUF（字节），用于验证发送缓冲区是否是
+/// "每次 sendfile 只推 24KB" 的根因。设置失败（超过 net.core.wmem_max）会被
+/// 内核静默截断，因此调用方应回读确认。
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+pub fn set_sndbuf(sock_fd: i32, bytes: usize) {
+    if sock_fd <= 0 || bytes == 0 {
+        return;
+    }
+    let v: libc::c_int = bytes as libc::c_int;
+    unsafe {
+        libc::setsockopt(
+            sock_fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &v as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
 }
 
 /// Linux `TCP_CORK`（等价 Nginx `tcp_nopush`）。

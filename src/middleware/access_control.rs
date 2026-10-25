@@ -76,28 +76,47 @@ impl IpMatcher {
     /// 判断给定 IP 是否匹配
     #[inline]
     pub fn matches(&self, ip: &IpAddr) -> bool {
+        // 双栈监听时客户端可能是 ::ffff:a.b.c.d，必须先归一化成 IPv4，
+        // 否则 IPv4 白名单会被绕过（deny 规则失效 = 安全漏洞）
+        let ip = canonical_ip(ip);
         match self {
             Self::All => true,
-            Self::Exact(addr) => addr == ip,
-            Self::Cidr { network, prefix_len } => cidr_contains(network, *prefix_len, ip),
+            Self::Exact(addr) => canonical_ip(addr) == ip,
+            Self::Cidr { network, prefix_len } => cidr_contains(network, *prefix_len, &ip),
         }
+    }
+}
+
+/// IPv4-mapped IPv6 归一化为 IPv4
+#[inline]
+fn canonical_ip(ip: &IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => *ip,
+        },
+        _ => *ip,
     }
 }
 
 /// CIDR 包含检查
 #[inline]
 fn cidr_contains(network: &IpAddr, prefix_len: u8, ip: &IpAddr) -> bool {
-    match (network, ip) {
+    let network = canonical_ip(network);
+    match (&network, ip) {
         (IpAddr::V4(net), IpAddr::V4(addr)) => {
             if prefix_len == 0 { return true; }
-            let mask = u32::MAX.checked_shl(32 - prefix_len as u32).unwrap_or(0);
+            // /33 这类非法前缀会让 32 - prefix_len 下溢，掩码退化为 0 → 全部放行
+            if prefix_len >= 32 { return net == addr; }
+            let mask = u32::MAX << (32 - prefix_len as u32);
             (u32::from(*net) & mask) == (u32::from(*addr) & mask)
         }
         (IpAddr::V6(net), IpAddr::V6(addr)) => {
             if prefix_len == 0 { return true; }
+            if prefix_len >= 128 { return net == addr; }
             let net_bits = u128::from(*net);
             let addr_bits = u128::from(*addr);
-            let mask = u128::MAX.checked_shl(128 - prefix_len as u32).unwrap_or(0);
+            let mask = u128::MAX << (128 - prefix_len as u32);
             (net_bits & mask) == (addr_bits & mask)
         }
         // IPv4 vs IPv6 不匹配
@@ -245,5 +264,38 @@ mod tests {
         let external: IpAddr = "8.8.8.8".parse().unwrap();
         assert_eq!(check_access(&rules, &internal), AccessAction::Allow);
         assert_eq!(check_access(&rules, &external), AccessAction::Deny);
+    }
+}
+
+#[cfg(test)]
+mod mapped_tests {
+    use super::*;
+
+    fn rule(action: AccessAction, src: &str) -> CompiledAccessRule {
+        CompiledAccessRule { action, matcher: IpMatcher::parse(src).unwrap() }
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_matches_ipv4_rule() {
+        let rule = rule(AccessAction::Allow, "192.168.1.0/24");
+        let mapped: IpAddr = "::ffff:192.168.1.7".parse().unwrap();
+        assert!(rule.matcher.matches(&mapped), "IPv4-mapped 地址必须匹配 IPv4 网段");
+        assert_eq!(check_access(&[rule], &mapped), AccessAction::Allow);
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_deny_rule_not_bypassed() {
+        // deny 192.168.1.0/24 必须对 ::ffff:192.168.1.7 同样生效
+        let deny = rule(AccessAction::Deny, "192.168.1.0/24");
+        let allow_all = rule(AccessAction::Allow, "all");
+        let mapped: IpAddr = "::ffff:192.168.1.7".parse().unwrap();
+        // 规则按顺序首条命中生效：deny 必须在前面
+        assert_eq!(check_access(&[deny, allow_all], &mapped), AccessAction::Deny);
+    }
+
+    #[test]
+    fn prefix_over_32_is_rejected() {
+        assert!(IpMatcher::parse("10.0.0.0/33").is_none());
+        assert!(IpMatcher::parse("2001:db8::/129").is_none());
     }
 }

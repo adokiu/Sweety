@@ -43,6 +43,18 @@ pub struct CompiledRealIp {
     recursive: bool,
 }
 
+/// IPv4-mapped IPv6 归一化为 IPv4（双栈监听下的地址比较必须先做这一步）
+#[inline]
+fn canonical_ip(ip: &IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => *ip,
+        },
+        _ => *ip,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CidrEntry {
     network: IpAddr,
@@ -55,6 +67,13 @@ impl CidrEntry {
         if let Some(pos) = s.find('/') {
             let ip: IpAddr = s[..pos].parse().ok()?;
             let prefix_len: u8 = s[pos + 1..].parse().ok()?;
+            // 前缀长度必须落在合法范围：/33（IPv4）或 /129（IPv6）会让
+            // `32 - prefix_len` 下溢，掩码退化成 0，等于"信任所有来源"
+            let max = if ip.is_ipv4() { 32 } else { 128 };
+            if prefix_len > max {
+                tracing::warn!("real_ip: 非法前缀长度 {}/{}，已忽略", s, prefix_len);
+                return None;
+            }
             Some(Self { network: ip, prefix_len })
         } else {
             // 单个 IP → /32 或 /128
@@ -66,15 +85,20 @@ impl CidrEntry {
 
     #[inline]
     fn contains(&self, ip: &IpAddr) -> bool {
-        match (&self.network, ip) {
+        // 双栈监听时客户端地址可能是 IPv4-mapped IPv6（::ffff:a.b.c.d），
+        // 必须先归一化，否则 IPv4 白名单/受信代理规则会漏判
+        let ip = canonical_ip(ip);
+        match (&self.network, &ip) {
             (IpAddr::V4(net), IpAddr::V4(addr)) => {
                 if self.prefix_len == 0 { return true; }
-                let mask = u32::MAX.checked_shl(32 - self.prefix_len as u32).unwrap_or(0);
+                if self.prefix_len >= 32 { return net == addr; }
+                let mask = u32::MAX << (32 - self.prefix_len as u32);
                 (u32::from(*net) & mask) == (u32::from(*addr) & mask)
             }
             (IpAddr::V6(net), IpAddr::V6(addr)) => {
                 if self.prefix_len == 0 { return true; }
-                let mask = u128::MAX.checked_shl(128 - self.prefix_len as u32).unwrap_or(0);
+                if self.prefix_len >= 128 { return net == addr; }
+                let mask = u128::MAX << (128 - self.prefix_len as u32);
                 (u128::from(*net) & mask) == (u128::from(*addr) & mask)
             }
             _ => false,
