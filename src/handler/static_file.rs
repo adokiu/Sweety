@@ -7,6 +7,7 @@
 //! - 三者均仅对 ≤ 1MB 小文件做内存预压缩，大文件直接流式传输
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::debug;
 use bytes::Bytes;
@@ -242,6 +243,11 @@ pub async fn handle_sweety(
             }
             return resp;
         }
+        // ── 元数据缓存命中（Nginx open_file_cache 模型）：零 canonicalize / 零 stat / 零分配 ──
+        if let Some(resp) = meta_fast_path(root, &path, method, req_headers, is_range_req, is_head, location).await {
+            return resp;
+        }
+
         // 缓存未命中：做完整安全检查，然后读文件并缓存
         let canonical_root_ref = site.canonical_root.as_deref();
         let file_path = match resolve_safe_path_fast(root, &path, canonical_root_ref) {
@@ -275,6 +281,24 @@ pub async fn handle_sweety(
             Some(v) => v,
             None => return make_error(StatusCode::INTERNAL_SERVER_ERROR, ""),
         };
+        // 大于内容缓存阈值：立刻转入元数据缓存路径（fd + sendfile），
+        // 后续请求由 meta_fast_path 命中，不再 canonicalize / stat / 格式化日期
+        if file_size > FILE_CACHE_MAX_BYTES {
+            let fd = match std::fs::File::open(&file_path) {
+                Ok(f) => Arc::new(f),
+                Err(e) => {
+                    tracing::error!("打开文件失败 {}: {}", file_path.display(), e);
+                    return make_error(StatusCode::INTERNAL_SERVER_ERROR, "");
+                }
+            };
+            let meta = Arc::new(cache::FileMeta::new(file_path, fd, file_size, modified_secs));
+            let mut kbuf = [0u8; 1024];
+            if let Some(k) = cache::meta_key(root, &path, &mut kbuf) {
+                cache::meta_insert(k, meta.clone());
+            }
+            return serve_meta(&meta, method, req_headers, is_range_req, is_head, location).await;
+        }
+
         let etag_val      = generate_etag(file_size, modified_secs);
 
         if let Some(resp) = check_preconditions(method, req_headers, &etag_val, modified_secs, || {
@@ -601,6 +625,127 @@ pub async fn handle_sweety(
     }
 }
 
+
+/// 元数据缓存快路径：命中则直接出响应，未命中返回 None 交给慢路径
+#[allow(clippy::too_many_arguments)]
+async fn meta_fast_path(
+    root: &Path,
+    rel: &str,
+    method: &str,
+    req_headers: &HeaderMap,
+    is_range_req: bool,
+    is_head: bool,
+    location: &LocationConfig,
+) -> Option<WebResponse> {
+    let mut kbuf = [0u8; 1024];
+    let key = cache::meta_key(root, rel, &mut kbuf)?;
+    let meta = cache::meta_get(key)?;
+    // 极小文件仍走内存内容缓存（少一次 syscall）
+    if meta.size <= FILE_CACHE_MAX_BYTES {
+        return None;
+    }
+    Some(serve_meta(&meta, method, req_headers, is_range_req, is_head, location).await)
+}
+
+/// 用元数据缓存直接产出响应（预构建头 + sendfile(2)，无用户态内容拷贝）
+async fn serve_meta(
+    meta: &Arc<cache::FileMeta>,
+    method: &str,
+    req_headers: &HeaderMap,
+    is_range_req: bool,
+    is_head: bool,
+    location: &LocationConfig,
+) -> WebResponse {
+    let size  = meta.size;
+    let etag  = meta.etag.as_ref();
+    let mtime = meta.mtime;
+
+    // 条件请求（RFC 9110 §13.2.2）：304 / 412
+    if let Some(resp) = check_preconditions(method, req_headers, etag, mtime, || {
+        let mut r = WebResponse::new(ResponseBody::none());
+        *r.status_mut() = StatusCode::NOT_MODIFIED;
+        apply_meta_headers(r.headers_mut(), meta, None, location);
+        r
+    }) {
+        return resp;
+    }
+
+    // HEAD：只回头（RFC 9110 §9.3.2，表示头与 GET 一致）
+    if is_head {
+        let mut resp = WebResponse::new(ResponseBody::none());
+        resp.headers_mut().reserve(8);
+        apply_meta_headers(resp.headers_mut(), meta, Some(size), location);
+        return resp;
+    }
+
+    // Range（单区间；不可满足 → 416）
+    if is_range_req {
+        match decide_range(req_headers, method, size, etag, mtime) {
+            RangeDecision::NotSatisfiable => return range_not_satisfiable(size),
+            RangeDecision::Partial(s, e) => {
+                let len = e - s + 1;
+                const PREAD_INLINE_MAX: u64 = 4 * 1024 * 1024;
+                let body = if len <= PREAD_INLINE_MAX {
+                    match crate::handler::sendfile::async_read_range(&meta.fd, s, len as usize).await {
+                        Ok(buf) => ResponseBody::from(buf),
+                        Err(_) => return make_error(StatusCode::INTERNAL_SERVER_ERROR, ""),
+                    }
+                } else {
+                    ResponseBody::box_stream(crate::handler::sendfile::pread_stream(meta.fd.clone(), s, len))
+                };
+                let mut resp = WebResponse::new(body);
+                *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+                apply_meta_headers(resp.headers_mut(), meta, Some(len), location);
+                if let Some(v) = content_range_value(s, e, size) {
+                    resp.headers_mut().insert(CONTENT_RANGE, v);
+                }
+                return resp;
+            }
+            RangeDecision::Full => {}
+        }
+    }
+
+    // 完整响应：fd + sendfile(2)
+    let stream = crate::handler::sendfile::pread_stream(meta.fd.clone(), 0, size);
+    let mut resp = WebResponse::new(ResponseBody::box_stream(stream));
+    resp.headers_mut().reserve(8);
+    apply_meta_headers(resp.headers_mut(), meta, Some(size), location);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    resp.extensions_mut().insert(sweety_web::SendFileInfo {
+        fd: meta.fd.clone(),
+        offset: 0,
+        len: size,
+    });
+    resp
+}
+
+/// 套用元数据缓存里预构建的头（避免每请求 from_str 分配与 HTTP 日期格式化）
+fn apply_meta_headers(
+    h: &mut HeaderMap,
+    meta: &cache::FileMeta,
+    content_len: Option<u64>,
+    location: &LocationConfig,
+) {
+    for (k, v) in &meta.base_headers {
+        // location 级 Cache-Control 覆盖
+        if *k == CACHE_CONTROL {
+            if let Some(cc) = location.cache_control.as_deref() {
+                if let Ok(v) = HeaderValue::from_str(cc) {
+                    h.insert(CACHE_CONTROL, v);
+                }
+                continue;
+            }
+        }
+        h.insert(k.clone(), v.clone());
+    }
+    if let Some(n) = content_len {
+        if let Ok(v) = HeaderValue::from_str(itoa::Buffer::new().format(n)) {
+            h.insert(CONTENT_LENGTH, v);
+        }
+    }
+    h.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    h.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
+}
 
 /// 设置静态文件响应头（Content-Type / ETag / Last-Modified / Cache-Control）
 fn set_file_headers(

@@ -13,7 +13,7 @@ use sweety_web::http::header::HeaderValue;
 // ─────────────────────────────────────────────
 
 pub(super) const GZIP_MAX_INLINE: u64    = 1024 * 1024;      // 1 MB
-pub(super) const FILE_CACHE_MAX_BYTES: u64 = 16 * 1024;      // 16 KB（实测 10KB 走内存缓存比走 fd+pread 快 35%）
+pub(super) const FILE_CACHE_MAX_BYTES: u64 = 4 * 1024;       // 4 KB：极小文件走内存内容缓存，其余全部 fd + sendfile
 
 /// 运行时缓存参数（由 `init_cache_limits` 从 GlobalConfig 初始化）
 static CACHE_LIMITS: OnceLock<CacheLimits> = OnceLock::new();
@@ -439,4 +439,107 @@ mod tests {
         assert!(file_cache().get(src).is_none());
         assert!(file_cache().get(alias).is_none());
     }
+}
+
+// ─────────────────────────────────────────────
+// 元数据缓存（等价 Nginx open_file_cache：fd + stat + 预构建响应头）
+//
+// 与内容缓存不同，这里只缓存 fd、stat 结果和已经格式化好的响应头，
+// 文件内容始终留在 OS page cache，通过 sendfile(2) 零用户态拷贝发出。
+// 缓存是「每 worker 线程私有」的（thread_local），因此热路径上没有任何锁。
+// ─────────────────────────────────────────────
+
+use std::collections::HashMap;
+use sweety_web::http::header::{CONTENT_TYPE, ETAG, LAST_MODIFIED, CACHE_CONTROL, HeaderName};
+
+/// 元数据缓存条目：一次 canonicalize + stat + open 之后长期复用
+pub(super) struct FileMeta {
+    /// 已做符号链接逃逸校验的磁盘路径
+    pub(super) path:       std::path::PathBuf,
+    pub(super) fd:         Arc<std::fs::File>,
+    pub(super) size:       u64,
+    pub(super) mtime:      u64,
+    /// 用于条件请求比较的 ETag 字符串
+    pub(super) etag:       Box<str>,
+    /// 预构建响应头（Content-Type / ETag / Last-Modified / Cache-Control）
+    pub(super) base_headers: [(HeaderName, HeaderValue); 4],
+    /// 上次 stat 校验时刻（unix 秒）
+    pub(super) validated_at: u64,
+}
+
+impl FileMeta {
+    pub(super) fn new(
+        path: std::path::PathBuf,
+        fd: Arc<std::fs::File>,
+        size: u64,
+        mtime: u64,
+    ) -> Self {
+        let etag = crate::middleware::cache::generate_etag(size, mtime);
+        let ext  = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let mime = crate::middleware::cache::mime_type_for(ext);
+        let cc   = crate::middleware::cache::default_cache_control(ext);
+        let mk = |v: &str| HeaderValue::from_str(v).unwrap_or_else(|_| HeaderValue::from_static(""));
+        let base_headers = [
+            (CONTENT_TYPE,   mk(mime)),
+            (ETAG,           mk(&etag)),
+            (LAST_MODIFIED,  mk(&httpdate::fmt_http_date(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(mtime)))),
+            (CACHE_CONTROL,  mk(cc)),
+        ];
+        Self {
+            path,
+            fd,
+            size,
+            mtime,
+            etag: Box::from(etag.as_str()),
+            base_headers,
+            validated_at: crate::middleware::cache::to_unix_secs(std::time::SystemTime::now()),
+        }
+    }
+}
+
+thread_local! {
+    /// 每 worker 私有的元数据缓存（无锁）。容量按 worker 计，超出整体清空（等价 inactive 淘汰）。
+    static META: std::cell::RefCell<HashMap<Box<str>, Arc<FileMeta>>> =
+        std::cell::RefCell::new(HashMap::with_capacity(256));
+}
+
+const META_MAX_ENTRIES: usize = 2048;
+
+/// 栈上拼 `root/relative` 作为缓存 key（零分配）
+#[inline]
+pub(super) fn meta_key<'a>(root: &Path, relative: &str, buf: &'a mut [u8; 1024]) -> Option<&'a str> {
+    let rb = root.as_os_str().as_encoded_bytes();
+    let rel = relative.as_bytes();
+    let total = rb.len() + 1 + rel.len();
+    if total > buf.len() { return None; }
+    buf[..rb.len()].copy_from_slice(rb);
+    buf[rb.len()] = b'/';
+    buf[rb.len() + 1..total].copy_from_slice(rel);
+    std::str::from_utf8(&buf[..total]).ok()
+}
+
+/// 命中且未过 `open_file_cache_valid` 才返回；过期则回退慢路径重新 stat
+#[inline]
+pub(super) fn meta_get(key: &str) -> Option<Arc<FileMeta>> {
+    let valid = CACHE_VALID_SECS.load(std::sync::atomic::Ordering::Relaxed);
+    let now = crate::middleware::cache::to_unix_secs(std::time::SystemTime::now());
+    META.with(|c| {
+        let map = c.borrow();
+        let e = map.get(key)?;
+        if valid > 0 && now.saturating_sub(e.validated_at) >= valid {
+            return None;
+        }
+        Some(Arc::clone(e))
+    })
+}
+
+pub(super) fn meta_insert(key: &str, meta: Arc<FileMeta>) {
+    META.with(|c| {
+        let mut map = c.borrow_mut();
+        if map.len() >= META_MAX_ENTRIES && !map.contains_key(key) {
+            map.clear();
+        }
+        map.insert(Box::from(key), meta);
+    });
 }
