@@ -281,9 +281,16 @@ fn upsert_site_to_resolvers(site: &SiteConfig, ctx: &HotReloadContext) {
 }
 
 /// 从 SniResolver 中删除站点证书条目
+///
+/// 只删该站点自己监听端口上的 resolver。原实现遍历**所有**端口，而
+/// upsert_site_to_resolverss 只往本端口写，于是：两个站点在不同端口共用同一个
+/// server_name 时，其中一个改证书会把另一个的证书条目一并删掉（该端口的 TLS
+/// 握手随后回落到默认证书，SNI 匹配失败）。
 fn remove_site_from_resolvers(_name: &str, site: &SiteConfig, ctx: &HotReloadContext) {
-    for resolver in ctx.sni_resolvers.values() {
-        resolver.remove_site(&site.server_name);
+    for (port, resolver) in &ctx.sni_resolvers {
+        if site.listen_tls.contains(port) {
+            resolver.remove_site(&site.server_name);
+        }
     }
 }
 
