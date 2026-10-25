@@ -333,7 +333,11 @@ where
             // 大文件内核本来就会发满 MSS，多两次 setsockopt 纯属浪费（nginx 默认 tcp_nopush off）
             const CORK_MAX_LEN: u64 = 64 * 1024 * 1024;
             // 非 Linux 平台没有 TCP_CORK，但 sendfile 仍可用，need_cork 仅控制 setsockopt
-            let need_cork = matches!(&sf_fast, Some((sf, _)) if sf.len <= CORK_MAX_LEN);
+            // SWEETY_NO_CORK=1 可关闭 cork（诊断/调优用）
+            static NO_CORK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let no_cork = *NO_CORK.get_or_init(|| std::env::var_os("SWEETY_NO_CORK").is_some());
+            let need_cork = !no_cork
+                && matches!(&sf_fast, Some((sf, _)) if sf.len <= CORK_MAX_LEN);
             #[cfg(target_os = "linux")]
             if need_cork {
                 if let Some((_, fd)) = &sf_fast {

@@ -187,6 +187,13 @@ tempfile = "3"
 # ─────────────────────────────────────────────
 # 编译优化
 # ─────────────────────────────────────────────
+# 性能剖析专用：与 release 同样的优化，但保留符号（perf/bpftrace 需要）
+# 用法：cargo build --profile profiling --target x86_64-unknown-linux-musl
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = 1
+
 [profile.release]
 opt-level       = 3
 lto             = "fat"
