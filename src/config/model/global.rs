@@ -14,6 +14,7 @@ fn default_client_header_buffer_size() -> usize { 32 }
 fn default_client_body_buffer_size() -> usize { 512 }
 fn default_open_file_cache_valid() -> u64 { 60 }
 fn default_worker_max_blocking_threads() -> usize { 16 }
+fn default_client_header_timeout() -> u64 { 60 }
 fn default_gzip_min_length() -> usize { 1 }
 fn default_gzip_comp_level() -> u32 { 5 }
 fn default_prometheus_path() -> String { "/metrics".into() }
@@ -136,6 +137,11 @@ pub struct GlobalConfig {
     #[serde(default)]
     pub listen_recv_buffer: usize,
 
+    /// 读取请求头的超时（秒，等价 Nginx client_header_timeout，默认 60）
+    /// 防御 slowloris：慢速发请求头的连接会被断开
+    #[serde(default = "default_client_header_timeout")]
+    pub client_header_timeout: u64,
+
     /// 每个 worker 的阻塞线程池上限（默认 16，等价 Nginx 每 worker 无额外阻塞线程的模型）
     #[serde(default = "default_worker_max_blocking_threads")]
     pub worker_max_blocking_threads: usize,
@@ -204,6 +210,7 @@ impl Default for GlobalConfig {
             client_body_buffer_size: default_client_body_buffer_size(),
             open_file_cache_valid: default_open_file_cache_valid(),
             worker_max_blocking_threads: default_worker_max_blocking_threads(),
+            client_header_timeout: default_client_header_timeout(),
             gzip: false,
             gzip_min_length: default_gzip_min_length(),
             gzip_comp_level: default_gzip_comp_level(),

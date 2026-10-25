@@ -235,6 +235,11 @@ impl SweetyServer {
         );
         server = server.keep_alive_timeout(ka_timeout);
 
+        // 请求头读取超时（等价 Nginx client_header_timeout，防 slowloris）
+        server = server.request_head_timeout(std::time::Duration::from_secs(
+            cfg.global.client_header_timeout.max(1),
+        ));
+
         // HTTP/2 配置（对标 Nginx http2_max_concurrent_streams）
         server = server.h2_max_concurrent_streams(cfg.global.h2_max_concurrent_streams);
         if cfg.global.h2_max_pending_per_conn > 0 {

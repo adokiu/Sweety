@@ -24,6 +24,8 @@ max_connections = 0
 # Keep-Alive timeout in seconds (0 = disabled)
 # Equivalent to Nginx: keepalive_timeout
 keepalive_timeout = 60
+# 请求头读取超时（秒，等价 Nginx client_header_timeout，防 slowloris）
+# client_header_timeout = 60
 
 # FastCGI connect timeout (seconds)
 # Equivalent to Nginx: fastcgi_connect_timeout
