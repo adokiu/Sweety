@@ -97,14 +97,15 @@ pub async fn sendfile_to_io_corked<St: sweety_io_compat::io::AsyncIo>(
             need_ready = false;
         }
 
+        let want = rem.min(1 << 24);
         #[cfg(target_os = "linux")]
         let n = unsafe {
-            libc::sendfile(sock_fd, file_fd, &mut off, rem.min(1 << 24))
+            libc::sendfile(sock_fd, file_fd, &mut off, want)
         };
 
         #[cfg(target_os = "macos")]
         let n = {
-            let mut sent_len = rem.min(1 << 24) as libc::off_t;
+            let mut sent_len = want as libc::off_t;
             let ret = unsafe {
                 libc::sendfile(file_fd, sock_fd, off, &mut sent_len, std::ptr::null_mut(), 0)
             };
@@ -124,7 +125,13 @@ pub async fn sendfile_to_io_corked<St: sweety_io_compat::io::AsyncIo>(
             set_cork(sock_fd, false);
         }
         match n {
-            n if n > 0 => rem -= n as usize,
+            n if n > 0 => {
+                // 注意：这里**不能**因为"短写"就去等可写事件。
+                // 实测（2026-10）：加上等待后吞吐从 1,203 MB/s 崩到 10 MB/s——
+                // 短写在接收端略慢时是常态，每次都等"队列降到一半"的唤醒会让
+                // 传输停滞。短写后立即重试才是正确做法。
+                rem -= n as usize;
+            }
             0 => break,
             _ => {
                 let e = std::io::Error::last_os_error();
