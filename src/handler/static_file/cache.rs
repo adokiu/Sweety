@@ -13,7 +13,7 @@ use sweety_web::http::header::HeaderValue;
 // ─────────────────────────────────────────────
 
 pub(super) const GZIP_MAX_INLINE: u64    = 1024 * 1024;      // 1 MB
-pub(super) const FILE_CACHE_MAX_BYTES: u64 = 64 * 1024;      // 64 KB（单文件缓存上限）
+pub(super) const FILE_CACHE_MAX_BYTES: u64 = 16 * 1024;      // 16 KB（实测 10KB 走内存缓存比走 fd+pread 快 35%）
 
 /// 运行时缓存参数（由 `init_cache_limits` 从 GlobalConfig 初始化）
 static CACHE_LIMITS: OnceLock<CacheLimits> = OnceLock::new();
