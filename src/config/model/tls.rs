@@ -13,6 +13,7 @@ fn default_h3_max_concurrent_bidi_streams() -> u32 { 200 }
 fn default_h3_max_concurrent_uni_streams() -> u32 { 100 }
 fn default_h3_idle_timeout_ms() -> u64 { 30_000 }
 fn default_h3_keep_alive_interval_ms() -> u64 { 10_000 }
+fn default_h3_initial_mtu() -> u16 { 1200 }
 fn default_h3_receive_window() -> u64 { 8 * 1024 * 1024 }
 fn default_h3_stream_receive_window() -> u64 { 2 * 1024 * 1024 }
 fn default_h3_send_window() -> u64 { 8 * 1024 * 1024 }
@@ -119,6 +120,11 @@ pub struct Http3Config {
     #[serde(default = "default_true")]
     pub mtu_discovery: bool,
 
+    /// 初始 QUIC 数据报大小（字节，默认 1200 = RFC 9000 最小值）
+    /// 值越大每包载荷越多、包数越少；需要路径 MTU 支持（loopback/内网可设 1400~8940）
+    #[serde(default = "default_h3_initial_mtu")]
+    pub initial_mtu: u16,
+
     /// 初始 RTT 估算（毫秒，默认 333ms = quinn 默认值）
     #[serde(default = "default_h3_initial_rtt_ms")]
     pub initial_rtt_ms: u64,
@@ -141,6 +147,7 @@ impl Default for Http3Config {
             send_window:                 default_h3_send_window(),
             enable_0rtt:                 false,
             mtu_discovery:               true,
+            initial_mtu:                 default_h3_initial_mtu(),
             initial_rtt_ms:              default_h3_initial_rtt_ms(),
             max_ack_delay_ms:            default_h3_max_ack_delay_ms(),
         }

@@ -353,6 +353,10 @@ fn apply_transport_config(
     if !h3.mtu_discovery {
         tc.mtu_discovery_config(None);
     }
+    // 初始数据报大小：默认 1200（RFC 9000 最小），大 MTU 路径（loopback/内网）可调大
+    if h3.initial_mtu != 1200 {
+        tc.initial_mtu(h3.initial_mtu.max(1200));
+    }
 
     // initial_rtt 只在用户显式配置时才覆盖，默认让 quinn 使用 333ms 并自动收敛
     if h3.initial_rtt_ms != 333 {
