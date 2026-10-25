@@ -500,8 +500,9 @@ impl FileMeta {
 
 thread_local! {
     /// 每 worker 私有的元数据缓存（无锁）。容量按 worker 计，超出整体清空（等价 inactive 淘汰）。
-    static META: std::cell::RefCell<HashMap<Box<str>, Arc<FileMeta>>> =
-        std::cell::RefCell::new(HashMap::with_capacity(256));
+    /// 用 FxHashMap：键是短路径字符串，SipHash 的每请求开销在这里没必要。
+    static META: std::cell::RefCell<rustc_hash::FxHashMap<Box<str>, Arc<FileMeta>>> =
+        std::cell::RefCell::new(rustc_hash::FxHashMap::default());
 }
 
 const META_MAX_ENTRIES: usize = 2048;

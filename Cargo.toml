@@ -108,6 +108,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt",
 
 # ── 并发数据结构 ──────────────────────────────
 dashmap = "6"
+rustc-hash   = "2"
 arc-swap = "1"
 
 # ── CLI 参数 ──────────────────────────────────

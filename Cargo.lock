@@ -2860,6 +2860,7 @@ dependencies = [
  "rcgen",
  "regex",
  "reqwest",
+ "rustc-hash",
  "rustls",
  "rustls-pemfile",
  "serde",
