@@ -313,7 +313,7 @@ pub use app::{App, AppObject, NestApp};
 pub use body::BodyStream;
 pub use context::WebContext;
 #[cfg(feature = "__server")]
-pub use server::HttpServer;
+pub use server::{set_listen_socket_buffers, HttpServer};
 
 pub use sweety_http_core::bytes;
 pub use sweety_http_core::set_proxy_protocol_ports;

@@ -9,7 +9,7 @@ mod worker;
 
 pub mod net;
 
-pub use builder::Builder;
+pub use builder::{set_listen_socket_buffers, Builder};
 pub use server::{ServerFuture, ServerHandle};
 
 #[cfg(all(not(target_os = "linux"), feature = "io-uring"))]

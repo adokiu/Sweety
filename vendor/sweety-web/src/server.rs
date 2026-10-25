@@ -7,6 +7,9 @@ use sweety_http_core::{
     config::{DEFAULT_HEADER_LIMIT, DEFAULT_READ_BUF_LIMIT, DEFAULT_WRITE_BUF_LIMIT, HttpServiceConfig},
 };
 use sweety_server::{Builder, ServerFuture, net::IntoListener};
+
+/// 透传 sweety-server 的监听 socket 缓冲区设置（0 = 内核 autotune）
+pub use sweety_server::set_listen_socket_buffers;
 use sweety_service::ServiceExt;
 
 use crate::{

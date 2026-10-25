@@ -27,7 +27,7 @@ struct CacheLimits {
 impl Default for CacheLimits {
     fn default() -> Self {
         Self {
-            file_cache_total_bytes: 512 * 1024 * 1024, // 512 MB
+            file_cache_total_bytes: 64 * 1024 * 1024, // 64 MB（与 open_file_cache_total_mb 默认一致）
             file_cache_max_entries: 200000,
             fd_cache_max_entries: 25000,
         }
@@ -137,6 +137,23 @@ pub(super) struct FdCacheEntry {
 // ─────────────────────────────────────────────
 
 static FILE_CACHE: OnceLock<DashMap<Arc<str>, Arc<FileCacheEntry>>> = OnceLock::new();
+
+/// FILE_CACHE 当前占用字节数（O(1) 维护，避免每次插入都 iter().sum() 全表扫描）
+static FILE_CACHE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[inline]
+fn entry_bytes(e: &FileCacheEntry) -> usize {
+    e.data.len()
+        + e.gz.as_ref().map(|b| b.len()).unwrap_or(0)
+        + e.br.as_ref().map(|b| b.len()).unwrap_or(0)
+        + e.zst.as_ref().map(|b| b.len()).unwrap_or(0)
+}
+
+fn cache_bytes_sub(n: usize) {
+    if n > 0 {
+        FILE_CACHE_BYTES.fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 static FD_CACHE:   OnceLock<DashMap<Arc<str>, FdCacheEntry>>   = OnceLock::new();
 
 /// stat 结果缓存（等价 nginx open_file_cache 的 stat 部分）
@@ -206,7 +223,9 @@ pub(super) fn purge_file_cache_for_source(source: &str) {
         .map(|e| e.key().clone())
         .collect();
     for k in &to_remove {
-        cache.remove(k.as_ref());
+        if let Some((_, old)) = cache.remove(k.as_ref()) {
+            cache_bytes_sub(entry_bytes(&old));
+        }
     }
     if !to_remove.is_empty() {
         tracing::debug!("文件缓存已淡化: {} ({} 个 key)", source, to_remove.len());
@@ -276,17 +295,20 @@ pub(super) async fn fd_cache_get_or_open_arc(
     file_size: u64,
     modified_secs: u64,
 ) -> Option<Arc<std::fs::File>> {
-    let key: Arc<str> = Arc::from(path.to_str().unwrap_or(""));
-    if let Some(entry) = fd_cache_get(&key) {
+    let Some(path_str) = path.to_str() else { return None };
+    // 热路径：直接用 &str 查 DashMap（Arc<str>: Borrow<str>），不再每请求分配一个 Arc<str>
+    if let Some(entry) = fd_cache().get(path_str) {
         if entry.modified_secs == modified_secs {
-            return Some(entry.fd);
+            let fd = entry.fd.clone();
+            return Some(fd);
         }
-        fd_cache().remove(key.as_ref());
+        drop(entry);
+        fd_cache().remove(path_str);
     }
     match std::fs::File::open(path) {
         Ok(f) => {
             let arc = Arc::new(f);
-            fd_cache_insert_arc(key, arc.clone(), file_size, modified_secs);
+            fd_cache_insert_arc(Arc::from(path_str), arc.clone(), file_size, modified_secs);
             Some(arc)
         }
         Err(_) => None,
@@ -318,23 +340,28 @@ pub(super) fn fd_cache_insert_arc(
 // ─────────────────────────────────────────────
 
 pub(super) fn cache_insert(key: Arc<str>, entry: FileCacheEntry) {
+    use std::sync::atomic::Ordering;
+    let size = entry_bytes(&entry);
     let entry = Arc::new(entry);
     let cache = file_cache();
     let lim = limits();
-    let total: usize = cache.iter().map(|e| {
-        e.data.len()
-            + e.gz.as_ref().map(|b| b.len()).unwrap_or(0)
-            + e.br.as_ref().map(|b| b.len()).unwrap_or(0)
-            + e.zst.as_ref().map(|b| b.len()).unwrap_or(0)
-    }).sum();
-    if total + entry.data.len() > lim.file_cache_total_bytes || cache.len() >= lim.file_cache_max_entries {
+    // O(1)：用原子计数器代替每次 iter().sum()（原实现每插入一次就全表扫描）
+    let total = FILE_CACHE_BYTES.load(Ordering::Relaxed);
+    if total + size > lim.file_cache_total_bytes || cache.len() >= lim.file_cache_max_entries {
         let to_remove: Vec<_> = cache.iter()
             .take(lim.file_cache_max_entries / 4)
             .map(|e| e.key().clone())
             .collect();
-        for k in to_remove { cache.remove(&k); }
+        for k in to_remove {
+            if let Some((_, old)) = cache.remove(&k) {
+                cache_bytes_sub(entry_bytes(&old));
+            }
+        }
     }
-    cache.insert(key, entry);
+    if let Some(old) = cache.insert(key, entry) {
+        cache_bytes_sub(entry_bytes(&old));
+    }
+    FILE_CACHE_BYTES.fetch_add(size, Ordering::Relaxed);
 }
 
 // ─────────────────────────────────────────────

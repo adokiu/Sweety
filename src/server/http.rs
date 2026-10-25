@@ -340,6 +340,12 @@ impl SweetyServer {
         );
         crate::handler::static_file::init_cache_valid_secs(cfg.global.open_file_cache_valid);
 
+        // 监听 socket 缓冲区：0 = 不设置，交给内核 autotune（等价 Nginx）
+        sweety_web::set_listen_socket_buffers(
+            cfg.global.listen_recv_buffer,
+            cfg.global.listen_send_buffer,
+        );
+
         // 启动文件缓存 notify 监听：文件修改时自动淘汰内存缓存，无需每请求 stat
         {
             let roots: Vec<std::path::PathBuf> = cfg.sites.iter()

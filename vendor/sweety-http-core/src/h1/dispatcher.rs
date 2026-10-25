@@ -297,19 +297,48 @@ where
                 || (self.ctx.is_connect_method() && parts.status.is_success());
 
             let encoder = &mut self.encode_head(parts, &body)?;
-            self.io.drain_write().await?;
             let no_body = matches!(encoder, TransferCoding::Eof);
-            let mut body = pin!(body);
 
             // sendfile(2) 快路径：通过 sendfile_fd() 编译期 dispatch
-            // 裸 TCP socket 返回 Some(fd)，TLS 等封装类型返回 None（编译期单态化，零开销）
+            // 裸 TCP socket 返回 Some(fd)，TLS 等封装类型返回 None（编译期单态化，零开销）。
+            //
+            // 判定提前到 drain_write 之前：这样可以在写响应头之前打 TCP_CORK，
+            // 让「响应头 + 文件数据」连续发出（等价 Nginx tcp_nopush on）。
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let sf_fast: Option<(crate::sendfile_ext::SendFileInfo, i32)> =
+                if no_body || is_tunnel {
+                    None
+                } else {
+                    match (send_file_info, self.io.io.sendfile_fd()) {
+                        (Some(sf), Some(fd)) => Some((sf, fd)),
+                        _ => None,
+                    }
+                };
+            #[cfg(target_os = "linux")]
+            if let Some((_, fd)) = &sf_fast {
+                crate::sendfile_ext::set_cork(*fd, true);
+            }
+
+            // 出错时也必须解 cork，否则内核会一直攒着不发
+            let drain_res = self.io.drain_write().await;
+            #[cfg(target_os = "linux")]
+            if drain_res.is_err() {
+                if let Some((_, fd)) = &sf_fast {
+                    crate::sendfile_ext::set_cork(*fd, false);
+                }
+            }
+            drain_res?;
+            let mut body = pin!(body);
+
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             let did_sendfile = 'sf: {
-                if no_body || is_tunnel { break 'sf false; }
-                let Some(sf) = send_file_info else { break 'sf false; };
-                let Some(sock_fd) = self.io.io.sendfile_fd() else { break 'sf false; };
-                self.io.drain_write().await?;
-                crate::sendfile_ext::sendfile_to_io(self.io.io, sock_fd, &sf.fd, sf.offset, sf.len).await?;
+                let Some((sf, sock_fd)) = sf_fast else { break 'sf false; };
+                let r = crate::sendfile_ext::sendfile_to_io(
+                    self.io.io, sock_fd, &sf.fd, sf.offset, sf.len,
+                ).await;
+                #[cfg(target_os = "linux")]
+                crate::sendfile_ext::set_cork(sock_fd, false);
+                r?;
                 true
             };
             #[cfg(not(any(target_os = "linux", target_os = "macos")))]

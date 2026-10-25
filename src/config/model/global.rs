@@ -20,7 +20,7 @@ fn default_prometheus_path() -> String { "/metrics".into() }
 fn default_log_level() -> String { "info".into() }
 fn default_open_file_cache_max() -> usize { 200000 }
 fn default_open_file_cache_inactive() -> u64 { 60 }
-fn default_open_file_cache_total_mb() -> usize { 512 }
+fn default_open_file_cache_total_mb() -> usize { 64 }
 fn default_h2_max_concurrent_streams() -> u32 { 128 }
 fn default_h2_max_concurrent_reset_streams() -> usize { 200 }
 fn default_h2_max_frame_size() -> u32 { 65535 }
@@ -127,6 +127,15 @@ pub struct GlobalConfig {
     #[serde(default = "default_open_file_cache_valid")]
     pub open_file_cache_valid: u64,
 
+    /// 监听 socket 发送缓冲区（字节，默认 0 = 不设置，交给内核 autotune，与 Nginx 行为一致）
+    /// 显式设置会关闭内核 autotuning，通常只在特定高 BDP 链路才需要
+    #[serde(default)]
+    pub listen_send_buffer: usize,
+
+    /// 监听 socket 接收缓冲区（字节，默认 0 = 不设置，交给内核 autotune）
+    #[serde(default)]
+    pub listen_recv_buffer: usize,
+
     /// 每个 worker 的阻塞线程池上限（默认 16，等价 Nginx 每 worker 无额外阻塞线程的模型）
     #[serde(default = "default_worker_max_blocking_threads")]
     pub worker_max_blocking_threads: usize,
@@ -208,6 +217,8 @@ impl Default for GlobalConfig {
             open_file_cache_max: default_open_file_cache_max(),
             open_file_cache_inactive: default_open_file_cache_inactive(),
             open_file_cache_total_mb: default_open_file_cache_total_mb(),
+            listen_send_buffer: 0,
+            listen_recv_buffer: 0,
             h2_max_concurrent_streams: default_h2_max_concurrent_streams(),
             h2_max_pending_per_conn: 0,
             h2_max_concurrent_reset_streams: default_h2_max_concurrent_reset_streams(),

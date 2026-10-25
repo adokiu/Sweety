@@ -1,4 +1,25 @@
-﻿use std::{collections::HashMap, future::Future, io, pin::Pin, time::Duration};
+﻿
+/// 监听 socket 收发缓冲区（字节）。0 表示不设置，交给内核 autotune。
+///
+/// 全局只设置一次（启动时），worker 工厂闭包里读取，避免每条连接一次原子读以外无开销。
+static LISTEN_RECV_BUF: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static LISTEN_SEND_BUF: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 设置监听 socket 的收发缓冲区大小（0 = 保持内核默认/autotune）。
+pub fn set_listen_socket_buffers(recv: usize, send: usize) {
+    LISTEN_RECV_BUF.store(recv, std::sync::atomic::Ordering::Relaxed);
+    LISTEN_SEND_BUF.store(send, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn listen_socket_buffer_sizes() -> (usize, usize) {
+    (
+        LISTEN_RECV_BUF.load(std::sync::atomic::Ordering::Relaxed),
+        LISTEN_SEND_BUF.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+use std::{collections::HashMap, future::Future, io, pin::Pin, time::Duration};
 
 #[cfg(not(target_family = "wasm"))]
 use std::net;
@@ -246,9 +267,15 @@ impl Builder {
                 .with_time(std::time::Duration::from_secs(75))
                 .with_interval(std::time::Duration::from_secs(15));
             socket.set_tcp_keepalive(&ka)?;
-            // SO_RCVBUF/SO_SNDBUF 1MB
-            let _ = socket.set_recv_buffer_size(1024 * 1024);
-            let _ = socket.set_send_buffer_size(1024 * 1024);
+            // SO_RCVBUF/SO_SNDBUF：默认(0)不设置，交给内核 autotune（等价 Nginx 行为）。
+            // 一旦显式 setsockopt，内核就停止自动调优，高 BDP 链路与 loopback 大文件吞吐都会下降。
+            let (rbuf, sbuf) = listen_socket_buffer_sizes();
+            if rbuf > 0 {
+                let _ = socket.set_recv_buffer_size(rbuf);
+            }
+            if sbuf > 0 {
+                let _ = socket.set_send_buffer_size(sbuf);
+            }
             socket.bind(&addr.into())?;
             socket.listen(backlog as _)?;
 
