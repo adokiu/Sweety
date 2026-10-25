@@ -519,6 +519,9 @@ where
             let mut body = pin!(res_body);
             let waker = futures_util::task::noop_waker();
             let mut cx = Context::from_waker(&waker);
+            // 快路：单块 body 且长度正好等于 Content-Length 时直接发送，
+            // 省掉 BytesMut 的一次分配 + 一次 memcpy（静态小文件是绝大多数场景）
+            let mut single: Option<Bytes> = None;
             let mut buf = BytesMut::with_capacity(n as usize);
 
             loop {
@@ -527,6 +530,13 @@ where
                         if let Err(reason) = state.record(bytes.len()) {
                             reset_message(&mut tx, reason);
                             return Ok(());
+                        }
+                        if buf.is_empty() && single.is_none() && bytes.len() == n as usize {
+                            single = Some(bytes); // 单块直发，不复制
+                            continue;
+                        }
+                        if let Some(prev) = single.take() {
+                            buf.extend_from_slice(&prev);
                         }
                         buf.extend_from_slice(&bytes);
                         if buf.len() >= INLINE_SEND_MAX {
@@ -542,7 +552,9 @@ where
                             reset_message(&mut tx, reason);
                             return Ok(());
                         }
-                        if !buf.is_empty() {
+                        if let Some(b) = single.take() {
+                            tx.send_data(b).await?;
+                        } else if !buf.is_empty() {
                             tx.send_data(buf.freeze()).await?;
                         }
                         if finish_h3_stream(&mut tx, staged_trailers, deferred_trailers).await.is_err() {
@@ -555,7 +567,9 @@ where
             }
 
             // 仍有后续异步数据：先发送已聚合部分，再回退到流式发送
-            if !buf.is_empty() {
+            if let Some(b) = single.take() {
+                tx.send_data(b).await?;
+            } else if !buf.is_empty() {
                 tx.send_data(buf.freeze()).await?;
             }
 
