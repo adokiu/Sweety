@@ -167,6 +167,10 @@ pub struct RateLimiter {
     ip_shards: Option<Arc<IpBucketShards>>,
     /// 其他维度令牌桶（DashMap）
     buckets: Arc<DashMap<String, TokenBucket>>,
+
+    /// 上次清理时间（unix 秒）。0 表示还没清理过。
+    /// 原来 cleanup_expired 只在测试里调用，线上 bucket 表（含 per-UA key）只增不减。
+    last_cleanup: std::sync::atomic::AtomicU64,
 }
 
 impl RateLimiter {
@@ -185,7 +189,7 @@ impl RateLimiter {
         } else {
             None
         };
-        Self { rule, path_regex, ip_shards, buckets: Arc::new(DashMap::new()) }
+        Self { rule, path_regex, ip_shards, buckets: Arc::new(DashMap::new()), last_cleanup: std::sync::atomic::AtomicU64::new(0) }
     }
 
     /// 检查请求是否允许通过
@@ -196,6 +200,9 @@ impl RateLimiter {
         headers: &std::collections::HashMap<String, String>,
         user_agent: &str,
     ) -> RateLimitResult {
+        // 机会式清理：每 60s 最多一次，避免 bucket 表无界增长（内存 DoS）
+        self.maybe_cleanup();
+
         // IP 维度：走低竞争分片 Mutex，不经过 DashMap
         if let Some(shards) = &self.ip_shards {
             return match shards.check(client_ip, self.rule.rate, self.rule.burst, self.rule.nodelay) {
@@ -278,6 +285,25 @@ impl RateLimiter {
                 Some(k)
             }
         }
+    }
+
+    /// 每 60 秒触发一次过期桶清理（热路径开销：一次 relaxed 原子读）
+    #[inline]
+    fn maybe_cleanup(&self) {
+        use std::sync::atomic::Ordering;
+        let now = crate::middleware::cache::to_unix_secs(std::time::SystemTime::now());
+        let last = self.last_cleanup.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < 60 {
+            return;
+        }
+        // CAS 竞争失败说明别的线程已经在清理，直接放行
+        if self.last_cleanup
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        self.cleanup_expired(300);
     }
 
     /// 清理长时间未使用的令牌桶（防内存泄漏，建议每分钟调用一次）

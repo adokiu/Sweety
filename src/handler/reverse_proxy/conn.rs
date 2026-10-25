@@ -104,9 +104,10 @@ pub async fn forward_request(
     }
 
     for attempt in 0..2u8 {
+        let mut reused = false;
         let (conn, created_at, req_count) = if attempt == 0 {
             match pool.acquire(&key) {
-                Some((c, ca, rc)) => { debug!("复用 idle 连接: {}", addr_display); (c, ca, rc) }
+                Some((c, ca, rc)) => { debug!("复用 idle 连接: {}", addr_display); reused = true; (c, ca, rc) }
                 None => {
                     let c = new_conn(upstream_addr, use_tls, tls_sni, tls_insecure, connect_timeout_secs, send_proxy_protocol, client_addr).await?;
                     (c, Instant::now(), 0u64)
@@ -142,9 +143,18 @@ pub async fn forward_request(
                 return Ok(resp);
             }
             Err((e, body_consumed)) => {
-                if attempt == 0 && retry_safe && !body_consumed {
-                    // body 还未消费（请求头阶段失败），可安全重试
-                    debug!("连接失效（body 未消费），重试: {}", e);
+                // 复用连接失效重试（等价 Nginx proxy_next_upstream error + 幂等请求）：
+                // 上游在 keepalive 期间关掉连接时，我们写入成功但读不到响应，直接回 502
+                // 会给客户端制造偶发错误。幂等请求 + 复用的 idle 连接 + 连接级错误 → 重试一次。
+                // 复用 idle 连接 + 幂等请求：无论错误形态都重试一次（等价 Nginx
+                // proxy_next_upstream error，且仅对幂等方法生效）
+                let stale_reuse = reused && retry_safe;
+                if attempt == 0 && retry_safe && (!body_consumed || stale_reuse) {
+                    debug!(
+                        "上游连接失效（body_consumed={}, reused={}），重试新建连接: {}",
+                        body_consumed, reused, e
+                    );
+                    debug!("错误是否属于连接级失效: {}", is_stale_conn_error(&e));
                     continue;
                 }
                 return Err(e);
@@ -152,6 +162,31 @@ pub async fn forward_request(
         }
     }
     unreachable!()
+}
+
+/// 是否属于"复用的 idle 连接已被上游关闭"这类可安全重试的错误
+fn is_stale_conn_error(e: &anyhow::Error) -> bool {
+    for cause in e.chain() {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            return matches!(
+                io_err.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::NotConnected
+            );
+        }
+        let msg = cause.to_string();
+        if msg.contains("early eof")
+            || msg.contains("connection closed")
+            || msg.contains("incomplete message")
+            || msg.contains("connection reset")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// 请求体流式写入上游

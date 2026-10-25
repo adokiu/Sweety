@@ -72,6 +72,27 @@ pub fn cmd_start(config: &PathBuf, pid_file: &PathBuf) {
     }
 }
 
+/// 判断 pid 对应的进程是否确实是 sweety（防止 PID 复用误杀）
+///
+/// Linux 下读取 `/proc/<pid>/exe`；进程不存在或不可读时返回 false，
+/// 调用方会按"PID 文件过期"处理。非 Linux 平台无法可靠判断，返回 true 保持旧行为。
+fn pid_looks_like_sweety(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
+            return false;
+        };
+        let name = exe.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        // 覆盖 `<路径>/sweety`、`sweety (deleted)`、`sweety.exe` 等情况
+        name.to_ascii_lowercase().contains("sweety")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
 /// 停止后台运行的 Sweety（读取 PID 文件，发送 SIGTERM / taskkill）
 pub fn cmd_stop(pid_file: &PathBuf) {
     let pid_str = match std::fs::read_to_string(pid_file) {
@@ -88,6 +109,17 @@ pub fn cmd_stop(pid_file: &PathBuf) {
             std::process::exit(1);
         }
     };
+
+    // PID 复用保护：PID 文件可能是上一次运行留下的，期间该 PID 可能已被系统
+    // 分配给别的进程（尤其共享机器上）。先确认它确实是 sweety，否则只清文件。
+    if !pid_looks_like_sweety(pid) {
+        eprintln!(
+            "[WARN] PID {} 不是 Sweety 进程（PID 文件已过期），清理 PID 文件后退出",
+            pid
+        );
+        let _ = std::fs::remove_file(pid_file);
+        return;
+    }
 
     #[cfg(unix)]
     {
