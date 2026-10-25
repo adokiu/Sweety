@@ -455,7 +455,7 @@ async fn load_or_create_account(
         .context("创建 ACME 账号失败")?;
 
     let json = serde_json::to_string(&creds).context("序列化 ACME 账号凭据失败")?;
-    std::fs::write(&creds_path, json)
+    write_secret_file(&creds_path, json.as_bytes())
         .with_context(|| format!("保存 ACME 账号凭据失败: {}", creds_path.display()))?;
     Ok(account)
 }
@@ -722,6 +722,33 @@ pub async fn acme_renew_now(
     (triggered, skipped, errors)
 }
 
+/// 以 0600 权限写文件（覆盖已有文件时同样收紧权限）
+#[cfg(unix)]
+fn write_secret_file(path: &Path, data: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(data)?;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_secret_file(path: &Path, data: &[u8]) -> Result<()> {
+    std::fs::write(path, data)?;
+    Ok(())
+}
+
+/// ACME 账户私钥 / 证书私钥：0600
+fn write_private_key(path: &Path, pem: &[u8]) -> Result<()> {
+    write_secret_file(path, pem)
+}
+
 /// 保存证书文件到磁盘
 pub(super) fn save_cert_files(
     cert_path: &Path,
@@ -733,6 +760,7 @@ pub(super) fn save_cert_files(
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(cert_path, cert_pem)?;
-    std::fs::write(key_path, key_pem)?;
+    // 私钥必须 0600：std::fs::write 按 umask(022) 建成 0644，本机任何用户都能读走
+    write_private_key(key_path, key_pem)?;
     Ok(())
 }

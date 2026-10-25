@@ -123,8 +123,13 @@ async fn try_files_resolve_inner(
                 Some(p) => p,
                 None => continue,
             };
-            if file_path.is_file() {
-                return TryFilesResult::File(file_path);
+            // 同样防符号链接逃逸：解析后必须仍在 root 内
+            let base = match root.canonicalize() {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            if let Some(real) = secure_under(&base, &file_path) {
+                return TryFilesResult::File(real);
             }
         }
     }
@@ -133,13 +138,27 @@ async fn try_files_resolve_inner(
 }
 
 pub(super) async fn find_index(dir: &Path, index_files: &[String]) -> Option<PathBuf> {
+    let base = dir.canonicalize().ok()?;
     for name in index_files {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
+        if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+            continue;
+        }
+        // is_file() 会跟随符号链接：必须 canonicalize 后确认仍在 dir 之内
+        if let Some(real) = secure_under(&base, &dir.join(name)) {
+            return Some(real);
         }
     }
     None
+}
+
+/// 校验 candidate 解析后仍位于 base 之内且是常规文件（防符号链接逃逸）
+fn secure_under(base_real: &Path, candidate: &Path) -> Option<PathBuf> {
+    let real = candidate.canonicalize().ok()?;
+    if real.starts_with(base_real) && real.is_file() {
+        Some(real)
+    } else {
+        None
+    }
 }
 
 // ─────────────────────────────────────────────

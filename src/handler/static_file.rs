@@ -244,7 +244,7 @@ pub async fn handle_sweety(
             return resp;
         }
         // ── 元数据缓存命中（Nginx open_file_cache 模型）：零 canonicalize / 零 stat / 零分配 ──
-        if let Some(resp) = meta_fast_path(root, &path, method, req_headers, is_range_req, is_head, location).await {
+        if let Some(resp) = meta_fast_path(ctx, site, root, &path, method, req_headers, is_range_req, is_head, location).await {
             return resp;
         }
 
@@ -261,14 +261,12 @@ pub async fn handle_sweety(
 
         // 目录：按 site.index 列表查找默认文档
         let file_path = if meta.is_dir() {
-            let mut found: Option<PathBuf> = None;
-            for name in &site.index {
-                let candidate = file_path.join(name);
-                if candidate.is_file() {
-                    found = Some(candidate);
-                    break;
-                }
-            }
+            let found = resolve_index_file(
+                root,
+                site.canonical_root.as_deref(),
+                &file_path,
+                &site.index,
+            );
             match found {
                 Some(p) => p,
                 None => return make_error(StatusCode::FORBIDDEN, "Directory listing not allowed"),
@@ -296,7 +294,7 @@ pub async fn handle_sweety(
             if let Some(k) = cache::meta_key(root, &path, &mut kbuf) {
                 cache::meta_insert(k, meta.clone());
             }
-            return serve_meta(&meta, method, req_headers, is_range_req, is_head, location).await;
+            return serve_meta(ctx, site, &meta, method, req_headers, is_range_req, is_head, location).await;
         }
 
         let etag_val      = generate_etag(file_size, modified_secs);
@@ -508,14 +506,12 @@ pub async fn handle_sweety(
 
     // 目录：按 site.index 列表查找默认文档
     let file_path = if meta.is_dir() {
-        let mut found: Option<PathBuf> = None;
-        for name in &site.index {
-            let candidate = file_path.join(name);
-            if candidate.is_file() {
-                found = Some(candidate);
-                break;
-            }
-        }
+        let found: Option<PathBuf> = resolve_index_file(
+            root,
+            site.canonical_root.as_deref(),
+            &file_path,
+            &site.index,
+        );
         match found {
             Some(p) => p,
             None => return make_error(StatusCode::FORBIDDEN, "Directory listing not allowed"),
@@ -626,9 +622,48 @@ pub async fn handle_sweety(
 }
 
 
+/// 解析目录默认文档（index / index.html ...）
+///
+/// 安全：默认文档必须最终落在站点 root 之内。原实现直接 `candidate.is_file()`，
+/// 而 `is_file()` 会跟随符号链接——攻击者在可写目录里放一个 `index.html -> /etc/passwd`
+/// 就能读任意文件。这里对候选路径做 `canonicalize` 再校验前缀，并拒绝含分隔符/`..` 的索引名。
+fn resolve_index_file(
+    root: &Path,
+    canonical_root: Option<&Path>,
+    dir: &Path,
+    index: &[String],
+) -> Option<PathBuf> {
+    let root_real: Option<std::borrow::Cow<'_, Path>> = match canonical_root {
+        Some(r) => Some(std::borrow::Cow::Borrowed(r)),
+        None => root.canonicalize().ok().map(std::borrow::Cow::Owned),
+    };
+    for name in index {
+        if name.is_empty()
+            || name.contains('/')
+            || name.contains('\\')
+            || name.contains("..")
+        {
+            continue;
+        }
+        let candidate = dir.join(name);
+        let Ok(real) = candidate.canonicalize() else { continue };
+        if let Some(r) = root_real.as_deref() {
+            if !real.starts_with(r) {
+                continue;
+            }
+        }
+        if real.is_file() {
+            return Some(real);
+        }
+    }
+    None
+}
+
 /// 元数据缓存快路径：命中则直接出响应，未命中返回 None 交给慢路径
 #[allow(clippy::too_many_arguments)]
 async fn meta_fast_path(
+    ctx: &WebContext<'_, AppState>,
+    site: &SiteInfo,
     root: &Path,
     rel: &str,
     method: &str,
@@ -644,11 +679,14 @@ async fn meta_fast_path(
     if meta.size <= FILE_CACHE_MAX_BYTES {
         return None;
     }
-    Some(serve_meta(&meta, method, req_headers, is_range_req, is_head, location).await)
+    Some(serve_meta(ctx, site, &meta, method, req_headers, is_range_req, is_head, location).await)
 }
 
 /// 用元数据缓存直接产出响应（预构建头 + sendfile(2)，无用户态内容拷贝）
+#[allow(clippy::too_many_arguments)]
 async fn serve_meta(
+    ctx: &WebContext<'_, AppState>,
+    site: &SiteInfo,
     meta: &Arc<cache::FileMeta>,
     method: &str,
     req_headers: &HeaderMap,
@@ -659,6 +697,73 @@ async fn serve_meta(
     let size  = meta.size;
     let etag  = meta.etag.as_ref();
     let mtime = meta.mtime;
+
+    // ── 内容协商（RFC 9110 §12.5.3）──────────────────────────────────────
+    // 走 sendfile 的路径必须先把压缩判定做完，否则 gzip/br/zstd 对大文件会失效。
+    if !is_range_req {
+        let global = &ctx.state().cfg.load().global;
+        let eff = site.compress.resolve(&global.compress);
+        let gz_enabled = eff.gzip || site.gzip.unwrap_or(global.gzip);
+        if stream_compressible(&meta.path, size, eff.min_length as u64) {
+            if let Some(name) = crate::handler::compress::pick_best_encoding_sized(
+                req_headers, gz_enabled, eff.brotli, eff.zstd, Some(size),
+            ) {
+                let enc = match name {
+                    "br"   => CompressEncoding::Brotli(eff.brotli_level),
+                    "zstd" => CompressEncoding::Zstd(eff.zstd_level),
+                    _      => CompressEncoding::Gzip(eff.gzip_level),
+                };
+                if is_head {
+                    let mut resp = WebResponse::new(ResponseBody::none());
+                    resp.headers_mut().reserve(8);
+                    apply_meta_headers(resp.headers_mut(), meta, None, location);
+                    if let Ok(v) = HeaderValue::from_str(name) {
+                        resp.headers_mut().insert(CONTENT_ENCODING, v);
+                    }
+                    return resp;
+                }
+                // 小文件一次性压缩到内存，带 Content-Length（与改动前行为一致，
+                // 也避免为几 KB 内容走 chunked 分块传输）
+                const INLINE_COMPRESS_MAX: u64 = 1024 * 1024;
+                if size <= INLINE_COMPRESS_MAX {
+                    let raw = match crate::handler::sendfile::async_read_range(&meta.fd, 0, size as usize).await {
+                        Ok(b) => b,
+                        Err(_) => return make_error(StatusCode::INTERNAL_SERVER_ERROR, ""),
+                    };
+                    let compressed = match name {
+                        "br" => brotli_compress(&raw, eff.brotli_level).await,
+                        "zstd" => zstd_compress(&raw, eff.zstd_level).await,
+                        _ => {
+                            let lvl = eff.gzip_level;
+                            match tokio::task::spawn_blocking(move || {
+                                gzip_compress(&raw, lvl)
+                            }).await {
+                                Ok(r) => r,
+                                Err(_) => return make_error(StatusCode::INTERNAL_SERVER_ERROR, ""),
+                            }
+                        }
+                    };
+                    let body = match compressed {
+                        Ok(b) => b,
+                        Err(_) => return make_error(StatusCode::INTERNAL_SERVER_ERROR, ""),
+                    };
+                    let mut resp = WebResponse::new(ResponseBody::from(body.clone()));
+                    resp.headers_mut().reserve(8);
+                    apply_meta_headers(resp.headers_mut(), meta, Some(body.len() as u64), location);
+                    if let Ok(v) = HeaderValue::from_str(name) {
+                        resp.headers_mut().insert(CONTENT_ENCODING, v);
+                    }
+                    return resp;
+                }
+                return stream_file_response_compressed(
+                    meta.fd.clone(), &meta.path, size, etag, mtime, location, Some(enc),
+                );
+            }
+        }
+        if !crate::handler::compress::identity_acceptable(req_headers) {
+            return make_error(StatusCode::NOT_ACCEPTABLE, "");
+        }
+    }
 
     // 条件请求（RFC 9110 §13.2.2）：304 / 412
     if let Some(resp) = check_preconditions(method, req_headers, etag, mtime, || {

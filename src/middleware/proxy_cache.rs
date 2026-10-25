@@ -506,6 +506,11 @@ impl ProxyCache {
         status: u16,
         resp_headers: &[(String, String)],
     ) -> bool {
+        // RFC 9111 §4.1：Vary 含 `*` 的响应明确声明"不可复用"，
+        // 允许存储会让不同请求命中同一份表示，必须直接放弃缓存。
+        if parse_vary_fields(resp_headers).iter().any(|f| f == "*") {
+            return false;
+        }
         self.request_allows_store(req_headers) && self.is_cacheable(status, resp_headers)
     }
 
