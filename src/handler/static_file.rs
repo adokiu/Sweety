@@ -270,15 +270,11 @@ pub async fn handle_sweety(
         } else {
             file_path
         };
-        let meta = match tokio::fs::metadata(&file_path).await {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::error!("读取文件元数据失败 {}: {}", file_path.display(), e);
-                return make_error(StatusCode::INTERNAL_SERVER_ERROR, "");
-            }
+        // 性能：stat 走 open_file_cache_valid 的 TTL 缓存，避免每请求一次 metadata
+        let (file_size, modified_secs) = match cache::stat_cached(&file_path).await {
+            Some(v) => v,
+            None => return make_error(StatusCode::INTERNAL_SERVER_ERROR, ""),
         };
-        let file_size     = meta.len();
-        let modified_secs = to_unix_secs(meta.modified().unwrap_or(SystemTime::UNIX_EPOCH));
         let etag_val      = generate_etag(file_size, modified_secs);
 
         if let Some(resp) = check_preconditions(method, req_headers, &etag_val, modified_secs, || {

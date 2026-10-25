@@ -139,6 +139,35 @@ pub(super) struct FdCacheEntry {
 static FILE_CACHE: OnceLock<DashMap<Arc<str>, Arc<FileCacheEntry>>> = OnceLock::new();
 static FD_CACHE:   OnceLock<DashMap<Arc<str>, FdCacheEntry>>   = OnceLock::new();
 
+/// stat 结果缓存（等价 nginx open_file_cache 的 stat 部分）
+/// key = 绝对路径，value = (size, mtime_secs, validated_at_secs)
+static STAT_CACHE: OnceLock<DashMap<std::path::PathBuf, (u64, u64, u64)>> = OnceLock::new();
+
+fn stat_cache() -> &'static DashMap<std::path::PathBuf, (u64, u64, u64)> {
+    STAT_CACHE.get_or_init(|| DashMap::with_capacity(4096))
+}
+
+/// 带 TTL 的 stat：`open_file_cache_valid` 秒内命中直接返回，避免每请求一次
+/// tokio::fs::metadata（syscall + blocking 线程调度）。
+pub(super) async fn stat_cached(path: &Path) -> Option<(u64, u64)> {
+    use std::sync::atomic::Ordering;
+    let now = crate::middleware::cache::to_unix_secs(std::time::SystemTime::now());
+    let valid = CACHE_VALID_SECS.load(Ordering::Relaxed);
+    if valid > 0 {
+        if let Some(e) = stat_cache().get(path) {
+            let (size, mtime, at) = *e.value();
+            if now.saturating_sub(at) < valid {
+                return Some((size, mtime));
+            }
+        }
+    }
+    let meta = tokio::fs::metadata(path).await.ok()?;
+    let size = meta.len();
+    let mtime = crate::middleware::cache::to_unix_secs(meta.modified().ok()?);
+    stat_cache().insert(path.to_path_buf(), (size, mtime, now));
+    Some((size, mtime))
+}
+
 pub(super) fn file_cache() -> &'static DashMap<Arc<str>, Arc<FileCacheEntry>> {
     FILE_CACHE.get_or_init(|| DashMap::with_capacity(limits().file_cache_max_entries.min(4096)))
 }
