@@ -26,12 +26,30 @@ pub async fn sendfile_to_io<St: sweety_io_compat::io::AsyncIo>(
     offset: u64,
     len: u64,
 ) -> std::io::Result<()> {
+    sendfile_to_io_corked(io, sock_fd, file, offset, len, false).await
+}
+
+/// 同 [`sendfile_to_io`]，但可在**首次 sendfile 之后**立即解除 TCP_CORK。
+///
+/// 为什么：cork 期间内核不发数据，发送窗口无法推进，单次 sendfile 只能推 ~26KB，
+/// 之后每 26KB 就要等一次可写事件（实测 100MB = 4053 次调用）。先用 cork 把
+/// 「响应头 + 首段数据」合成一个报文，再解除 cork 让剩余数据按 MSS/窗口自由发送。
+#[allow(unsafe_code)]
+pub async fn sendfile_to_io_corked<St: sweety_io_compat::io::AsyncIo>(
+    io: &mut St,
+    sock_fd: i32,
+    file: &std::sync::Arc<std::fs::File>,
+    offset: u64,
+    len: u64,
+    uncork_after_first: bool,
+) -> std::io::Result<()> {
     use std::os::unix::io::AsRawFd;
     use sweety_io_compat::io::Interest;
 
     let file_fd = file.as_raw_fd();
     let mut off = offset as libc::off_t;
     let mut rem = len as usize;
+    let mut calls = 0usize;
 
     // 关键：先直接发起 sendfile(2)，只有返回 EAGAIN 时才 await 可写事件。
     // 每次循环都先 ready() 会多一次 reactor 往返（等价 Nginx 中先 poll 再 write，
@@ -65,6 +83,11 @@ pub async fn sendfile_to_io<St: sweety_io_compat::io::AsyncIo>(
             }
         };
 
+        calls += 1;
+        if uncork_after_first && calls == 1 {
+            #[cfg(target_os = "linux")]
+            set_cork(sock_fd, false);
+        }
         match n {
             n if n > 0 => rem -= n as usize,
             0 => break,
@@ -77,6 +100,9 @@ pub async fn sendfile_to_io<St: sweety_io_compat::io::AsyncIo>(
                 need_ready = !matches!(e.raw_os_error(), Some(libc::EINTR));
             }
         }
+    }
+    if std::env::var_os("SWEETY_DEBUG_SENDFILE").is_some() {
+        eprintln!("[sf] sent len={} calls={} avg={}", len, calls, if calls > 0 { len / calls as u64 } else { 0 });
     }
     Ok(())
 }

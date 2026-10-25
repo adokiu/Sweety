@@ -355,8 +355,8 @@ where
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             let did_sendfile = 'sf: {
                 let Some((sf, sock_fd)) = sf_fast else { break 'sf false; };
-                let r = crate::sendfile_ext::sendfile_to_io(
-                    self.io.io, sock_fd, &sf.fd, sf.offset, sf.len,
+                let r = crate::sendfile_ext::sendfile_to_io_corked(
+                    self.io.io, sock_fd, &sf.fd, sf.offset, sf.len, need_cork,
                 ).await;
                 #[cfg(target_os = "linux")]
                 if need_cork {
@@ -371,6 +371,10 @@ where
             // 隧道（WebSocket 等）：响应 body 期间必须继续读取客户端 socket，
             // 否则 client → upstream 方向在握手后永久停滞（RFC 9110 §7.8 / RFC 6455 双向全双工）
             if !did_sendfile && !no_body {
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                if std::env::var_os("SWEETY_DEBUG_SENDFILE").is_some() {
+                    eprintln!("[sf] fallback-body used");
+                }
                 use super::proto::encode::encode_informational_response;
                 // 响应体写出期间 interleave 103/100 等 1xx（与 H2/H3 dispatcher 一致）
                 loop {
