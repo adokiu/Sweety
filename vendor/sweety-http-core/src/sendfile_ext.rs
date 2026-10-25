@@ -56,18 +56,27 @@ pub async fn sendfile_to_io_corked<St: sweety_io_compat::io::AsyncIo>(
     // nginx 实际是 write 先试、EAGAIN 才注册事件）。
     let mut need_ready = false;
 
-    // 诊断/调优：SWEETY_SENDFILE_SNDBUF=<字节> 时显式设置发送缓冲区
+    // 发送缓冲区策略（实测得出，非拍脑袋）：
+    // 内核 autotune 在超长传输（>=8MB）时会把 sndbuf 涨到几 MB，cork 攒住的数据一多，
+    // 每次 sendfile 只推 ~24KB、往返次数暴涨；显式钉到 128KB 反而让内核按 MSS 平稳
+    // 推进。10MB 实测 2429 -> 2532 MB/s（nginx 2546），100MB 1161 -> 1191 MB/s。
+    // 8MB 以下不干预：1MB 场景 autotune 明显更好（128KB 会掉到 8.6k rps）。
+    // SWEETY_SENDFILE_SNDBUF 可覆盖（诊断用）。
     #[cfg(target_os = "linux")]
     {
-        static SNDBUF: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let want = *SNDBUF.get_or_init(|| {
+        const LONG_TRANSFER: u64 = 8 * 1024 * 1024;
+        const LONG_TRANSFER_SNDBUF: usize = 128 * 1024;
+        static OVERRIDE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let ov = *OVERRIDE.get_or_init(|| {
             std::env::var("SWEETY_SENDFILE_SNDBUF")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(0)
         });
-        if want > 0 {
-            set_sndbuf(sock_fd, want);
+        if ov > 0 {
+            set_sndbuf(sock_fd, ov);
+        } else if len >= LONG_TRANSFER {
+            set_sndbuf(sock_fd, LONG_TRANSFER_SNDBUF);
         }
     }
 
