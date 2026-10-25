@@ -116,13 +116,25 @@ pub(super) async fn multi_site_handler(ctx: &WebContext<'_, AppState>) -> WebRes
         .unwrap_or(path_raw);
     let is_https = ctx.req().body().is_tls();
 
-    // HTTPS 严格匹配：无精确/通配符匹配时返回 421
+    // HTTPS：先严格匹配（含通配符）。未匹配时**不能**直接回 421——
+    // RFC 9110 §15.5.20 的 421 语义是"连接被复用到别的 authority，请在
+    // 新连接上重试"，客户端收到会重连重试，永远匹配不上的 Host 会形成重试风暴。
+    // 与 Nginx 一致：单站点直接路由到唯一站点（IP 直连场景），多站点回 404。
     let site = if is_https {
         match state.registry.lookup_by_host_strict(host) {
             Some(s) => s,
             None => {
-                state.metrics.record_status(421);
-                return make_error_resp(StatusCode::MISDIRECTED_REQUEST);
+                if state.registry.site_count() == 1 {
+                    if let Some(only) = state.registry.all_sites().into_iter().next() {
+                        only
+                    } else {
+                        state.metrics.record_status(404);
+                        return make_error_resp(StatusCode::NOT_FOUND);
+                    }
+                } else {
+                    state.metrics.record_status(404);
+                    return make_error_resp(StatusCode::NOT_FOUND);
+                }
             }
         }
     } else {
