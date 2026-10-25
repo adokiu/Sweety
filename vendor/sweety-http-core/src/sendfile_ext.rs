@@ -73,10 +73,13 @@ pub async fn sendfile_to_io_corked<St: sweety_io_compat::io::AsyncIo>(
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(0)
         });
+        // 实测（两实例交错 A/B，10MB × 10 连接）：
+        //   固定 128KB → 2,266 rps；固定 16MB → 3,640 rps（+61%）
+        // 之前"128KB 更好"的结论来自顺序采样（机器漂移），已作废。
+        // 因此默认不再干预 sndbuf，交给内核 autotune；仅保留 env 覆盖用于实验。
+        let _ = (LONG_TRANSFER, LONG_TRANSFER_SNDBUF);
         if ov > 0 {
             set_sndbuf(sock_fd, ov);
-        } else if len >= LONG_TRANSFER {
-            set_sndbuf(sock_fd, LONG_TRANSFER_SNDBUF);
         }
         // 诊断：SWEETY_NOTSENT_LOWAT=<字节> 时设置 TCP_NOTSENT_LOWAT
         static LOWAT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
