@@ -94,7 +94,12 @@ pub async fn forward_request(
     let has_expect_continue = extra_headers.iter()
         .any(|(k, v)| k.eq_ignore_ascii_case("expect") && v.eq_ignore_ascii_case("100-continue"));
 
-    let key = PooledConn::key_from_addr(upstream_addr, use_tls);
+    let key = PooledConn::key_from_addr(
+        upstream_addr,
+        use_tls,
+        if tls_sni.is_empty() { None } else { Some(tls_sni) },
+        tls_insecure,
+    );
 
     // body 用 Option 包装：首次 take() 消费，若 body 未消费则可重试（idle 连接失效场景）
     // 无 body 幂等请求：连接前 drop RequestBody（H1 变体含 Rc，跨 await 会导致 future 非 Send）

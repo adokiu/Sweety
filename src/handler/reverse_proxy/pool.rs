@@ -144,12 +144,31 @@ impl PooledConn {
     }
 
     /// 从 UpstreamAddr 生成连接池 key，区分 tcp/tls/unix/tls-unix
-    pub fn key_from_addr(addr: &UpstreamAddr, tls: bool) -> String {
+    /// 生成连接池 key
+    ///
+    /// TLS 连接必须把 **SNI 与证书校验开关** 一起放进 key：同一个 IP:port 用不同
+    /// SNI / 不同 `tls_insecure` 配置连接时，握手结果（证书、ALPN）完全不同，
+    /// 复用同一条连接会让第二个站点拿到别人 SNI 的证书，或绕过本该做的校验。
+    pub fn key_from_addr(
+        addr: &UpstreamAddr,
+        tls: bool,
+        sni: Option<&str>,
+        insecure: bool,
+    ) -> String {
         match addr {
             UpstreamAddr::Tcp(s) => {
-                let prefix = if tls { "tls:" } else { "tcp:" };
-                let mut k = String::with_capacity(prefix.len() + s.len());
-                k.push_str(prefix);
+                if !tls {
+                    let mut k = String::with_capacity(4 + s.len());
+                    k.push_str("tcp:");
+                    k.push_str(s);
+                    return k;
+                }
+                let sni = sni.unwrap_or("");
+                let mut k = String::with_capacity(16 + sni.len() + s.len());
+                k.push_str("tls:");
+                k.push_str(sni);
+                k.push(':');
+                k.push_str(if insecure { "insecure:" } else { "verify:" });
                 k.push_str(s);
                 k
             }
