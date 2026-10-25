@@ -154,13 +154,19 @@ pub async fn forward_request(
                 // 复用 idle 连接 + 幂等请求：无论错误形态都重试一次（等价 Nginx
                 // proxy_next_upstream error，且仅对幂等方法生效）
                 let stale_reuse = reused && retry_safe;
-                if attempt == 0 && retry_safe && (!body_consumed || stale_reuse) {
+                // 复用的 idle 连接已被上游关闭时，写/flush 会直接 BrokenPipe，
+                // 请求根本没送到上游，重试是安全的（不管 retry_safe 如何判定）
+                let dead_reuse = reused && is_stale_conn_error(&e);
+                if attempt == 0 && ((retry_safe && (!body_consumed || stale_reuse)) || dead_reuse) {
                     debug!(
                         "上游连接失效（body_consumed={}, reused={}），重试新建连接: {}",
                         body_consumed, reused, e
                     );
                     debug!("错误是否属于连接级失效: {}", is_stale_conn_error(&e));
                     continue;
+                }
+                if std::env::var_os("SWEETY_DEBUG_PROXY").is_some() {
+                    eprintln!("[proxy] 最终失败 attempt={attempt} reused={reused} body_consumed={body_consumed}: {e:#}");
                 }
                 return Err(e);
             }
