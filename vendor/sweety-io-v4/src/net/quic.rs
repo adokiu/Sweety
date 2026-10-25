@@ -108,9 +108,27 @@ impl QuicListenerBuilder {
             socket.set_nonblocking(true)?;
             // 显式设置大缓冲区，避免沿用 rmem_default(256KB) 导致高并发握手时 kernel 丢包
             // rmem_max 已由 sysctl_tune.sh 设为 128MB，这里取 16MB 做实际 socket 级设置
-            let _ = socket.set_recv_buffer_size(16 * 1024 * 1024);
-            let _ = socket.set_send_buffer_size(4 * 1024 * 1024);
+            let want_recv = 16 * 1024 * 1024usize;
+            let want_send = 4 * 1024 * 1024usize;
+            let _ = socket.set_recv_buffer_size(want_recv);
+            let _ = socket.set_send_buffer_size(want_send);
             socket.bind(&addr.into())?;
+
+            // 内核会用 net.core.rmem_max 截断 SO_RCVBUF（Debian 默认仅 208 KiB），
+            // 缓冲区一满就丢 QUIC 数据包，表现为吞吐骤降 + 大量重传。这里把实际生效值
+            // 打出来，并把可执行的修复命令写给运维，避免"配了 16MB 却只有 208KB"。
+            let eff_recv = socket.recv_buffer_size().unwrap_or(0);
+            if eff_recv < want_recv / 2 {
+                let need_kb = want_recv / 1024;
+                let have_kb = eff_recv / 1024;
+                let msg = format!(
+                    "UDP 接收缓冲区被内核限制为 {} KiB（期望 {} KiB）：net.core.rmem_max 太小，\
+高并发 HTTP/3 会丢包。请执行: sysctl -w net.core.rmem_max={} net.core.wmem_max={} \
+（写入 /etc/sysctl.d/99-sweety.conf 持久化）",
+                    have_kb, need_kb, want_recv, want_send
+                );
+                eprintln!("[sweety][QUIC] {msg}");
+            }
 
             let std_udp: std::net::UdpSocket = socket.into();
             let runtime = quinn::default_runtime()
