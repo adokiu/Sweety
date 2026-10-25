@@ -22,7 +22,11 @@ fn hdr_end(b: &[u8]) -> Option<usize> { b.windows(4).position(|w| w == b"\r\n\r\
 fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
     for line in head.split("\r\n") {
         if line.len() >= name.len() && line[..name.len()].eq_ignore_ascii_case(name) {
-            return Some(line[name.len()..].trim());
+            // 注意：切片保留的是 ": value"，必须去掉冒号再 trim，
+            // 否则 "value" 变成 ": 1024"，parse 失败 → 被当成没有 Content-Length
+            let rest = line[name.len()..].trim_start();
+            let rest = rest.strip_prefix(':').unwrap_or(rest).trim();
+            return Some(rest);
         }
     }
     None
@@ -68,6 +72,9 @@ async fn worker(
             let chunked = header_value(head, "transfer-encoding")
                 .map(|v| v.eq_ignore_ascii_case("chunked")).unwrap_or(false);
 
+            if std::env::var_os("LG_DEBUG").is_some() {
+                eprintln!("[lg] head={:?} cl={:?} chunked={}", head, content_len, chunked);
+            }
             let mut total = hdr.len();
             let mut done = false;
 
