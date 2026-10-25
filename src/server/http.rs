@@ -240,6 +240,11 @@ impl SweetyServer {
             cfg.global.client_header_timeout.max(1),
         ));
 
+        // 静态文件发送缓冲区（0 = autotune）
+        if cfg.global.sendfile_sndbuf_kb > 0 {
+            sweety_web::set_sendfile_sndbuf(cfg.global.sendfile_sndbuf_kb * 1024);
+        }
+
         // HTTP/2 配置（对标 Nginx http2_max_concurrent_streams）
         server = server.h2_max_concurrent_streams(cfg.global.h2_max_concurrent_streams);
         if cfg.global.h2_max_pending_per_conn > 0 {

@@ -73,13 +73,16 @@ pub async fn sendfile_to_io_corked<St: sweety_io_compat::io::AsyncIo>(
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(0)
         });
-        // 实测（两实例交错 A/B，10MB × 10 连接）：
-        //   固定 128KB → 2,266 rps；固定 16MB → 3,640 rps（+61%）
-        // 之前"128KB 更好"的结论来自顺序采样（机器漂移），已作废。
-        // 因此默认不再干预 sndbuf，交给内核 autotune；仅保留 env 覆盖用于实验。
+        // 默认不干预 sndbuf（交给内核 autotune）。显式设置可通过
+        // global.sendfile_sndbuf_kb 或 SWEETY_SENDFILE_SNDBUF 覆盖：
+        // 实测 1MB × 400 连接时 autotune 8,044 rps、16MB 8,499 rps（+5.7%），
+        // 代价是高并发/慢客户端场景放大的内核发送队列内存。
         let _ = (LONG_TRANSFER, LONG_TRANSFER_SNDBUF);
+        let cfg = SENDFILE_SNDBUF.load(std::sync::atomic::Ordering::Relaxed);
         if ov > 0 {
             set_sndbuf(sock_fd, ov);
+        } else if cfg > 0 {
+            set_sndbuf(sock_fd, cfg);
         }
         // 诊断：SWEETY_NOTSENT_LOWAT=<字节> 时设置 TCP_NOTSENT_LOWAT
         static LOWAT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -171,6 +174,14 @@ pub fn set_sndbuf(sock_fd: i32, bytes: usize) {
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         );
     }
+}
+
+/// 全局发送缓冲区覆盖（字节，0 = 不干预，交给内核 autotune）
+static SENDFILE_SNDBUF: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 设置静态文件的发送缓冲区（启动时调用一次；0 = autotune）
+pub fn set_sendfile_sndbuf(bytes: usize) {
+    SENDFILE_SNDBUF.store(bytes, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Linux `TCP_NOTSENT_LOWAT`：限制内核中"未发送字节"的低水位。

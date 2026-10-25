@@ -137,6 +137,12 @@ pub struct GlobalConfig {
     #[serde(default)]
     pub listen_recv_buffer: usize,
 
+    /// 静态文件响应的发送缓冲区（KiB，0 = 交给内核 autotune，默认 0）
+    /// 大文件高并发场景设置 4096~16384 可提升吞吐（实测 1MB@400 连接 +5.7%），
+    /// 代价是高并发/慢客户端时内核发送队列占用的内存上升
+    #[serde(default)]
+    pub sendfile_sndbuf_kb: usize,
+
     /// 读取请求头的超时（秒，等价 Nginx client_header_timeout，默认 60）
     /// 防御 slowloris：慢速发请求头的连接会被断开
     #[serde(default = "default_client_header_timeout")]
@@ -211,6 +217,7 @@ impl Default for GlobalConfig {
             open_file_cache_valid: default_open_file_cache_valid(),
             worker_max_blocking_threads: default_worker_max_blocking_threads(),
             client_header_timeout: default_client_header_timeout(),
+            sendfile_sndbuf_kb: 0,
             gzip: false,
             gzip_min_length: default_gzip_min_length(),
             gzip_comp_level: default_gzip_comp_level(),

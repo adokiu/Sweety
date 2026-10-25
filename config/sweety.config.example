@@ -24,6 +24,11 @@ max_connections = 0
 # Keep-Alive timeout in seconds (0 = disabled)
 # Equivalent to Nginx: keepalive_timeout
 keepalive_timeout = 60
+
+# 静态文件发送缓冲区（KiB，0 = 交给内核 autotune）
+# 大文件高并发场景可设 4096~16384 提升吞吐（1MB@400 连接实测 +6.7%），
+# 代价是高并发/慢客户端时内核发送队列内存上升
+sendfile_sndbuf_kb = 0
 # 请求头读取超时（秒，等价 Nginx client_header_timeout，防 slowloris）
 # client_header_timeout = 60
 
