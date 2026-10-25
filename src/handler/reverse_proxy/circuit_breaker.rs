@@ -25,6 +25,15 @@ pub struct CircuitBreaker {
     window_start: AtomicU64,
     /// 熔断开始时间（Unix 秒）
     open_since: AtomicU64,
+    /// 进入 HalfOpen 的时间（Unix 秒）。用于回收"探测请求被中途丢弃"的僵尸探测态：
+    /// is_available() 会做 OPEN→HALF_OPEN 的 CAS，但如果该节点最终没有被选中，
+    /// 就没有人调用 record_success/record_failure，状态会永远停在 HALF_OPEN
+    /// （此后 allow() 恒为 false），该上游被永久摘除。
+    half_open_since: AtomicU64,
+    /// 进入 HalfOpen 的时间（Unix 秒）。用于回收"探测请求被中途丢弃"的僵尸探测态：
+    /// is_available() 会做 OPEN→HALF_OPEN 的 CAS，但如果该节点最终没有被选中（负载
+    /// 均衡选了别的节点），就没有人调用 record_success/record_failure，状态会永远
+    /// 停在 HALF_OPEN（此后 allow() 恒为 false），节点被永久摘除。
     /// 配置：时间窗口内最大失败次数
     max_failures: u32,
     /// 配置：时间窗口大小（秒）
@@ -40,6 +49,7 @@ impl CircuitBreaker {
             failure_count: AtomicU32::new(0),
             window_start: AtomicU64::new(now_secs()),
             open_since: AtomicU64::new(0),
+            half_open_since: AtomicU64::new(0),
             max_failures,
             window_secs,
             fail_timeout,
@@ -55,15 +65,31 @@ impl CircuitBreaker {
                 let open_since = self.open_since.load(Ordering::Relaxed);
                 if now_secs().saturating_sub(open_since) >= self.fail_timeout {
                     // CAS 转 HalfOpen，只允许一个请求通过探测
-                    self.state.compare_exchange(
+                    let ok = self.state.compare_exchange(
                         CB_OPEN, CB_HALF_OPEN,
                         Ordering::AcqRel, Ordering::Relaxed
-                    ).is_ok()
+                    ).is_ok();
+                    if ok {
+                        self.half_open_since.store(now_secs(), Ordering::Relaxed);
+                    }
+                    ok
                 } else {
                     false
                 }
             }
-            CB_HALF_OPEN => false, // 探测期间只放一个请求，其余拒绝
+            CB_HALF_OPEN => {
+                // 探测态超过 fail_timeout 仍未结算（探测请求没落到这个节点上，
+                // 或调用方中途放弃）→ 回收成 Open 重新计时，避免节点被永久摘除
+                let since = self.half_open_since.load(Ordering::Relaxed);
+                if now_secs().saturating_sub(since) >= self.fail_timeout {
+                    let _ = self.state.compare_exchange(
+                        CB_HALF_OPEN, CB_OPEN,
+                        Ordering::AcqRel, Ordering::Relaxed
+                    );
+                    self.open_since.store(now_secs(), Ordering::Relaxed);
+                }
+                false // 探测期间只放一个请求，其余拒绝
+            }
             _ => true,
         }
     }

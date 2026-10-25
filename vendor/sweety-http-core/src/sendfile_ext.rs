@@ -78,6 +78,17 @@ pub async fn sendfile_to_io_corked<St: sweety_io_compat::io::AsyncIo>(
         } else if len >= LONG_TRANSFER {
             set_sndbuf(sock_fd, LONG_TRANSFER_SNDBUF);
         }
+        // 诊断：SWEETY_NOTSENT_LOWAT=<字节> 时设置 TCP_NOTSENT_LOWAT
+        static LOWAT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let lowat = *LOWAT.get_or_init(|| {
+            std::env::var("SWEETY_NOTSENT_LOWAT")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(0)
+        });
+        if lowat > 0 {
+            set_notsent_lowat(sock_fd, lowat);
+        }
     }
 
     while rem > 0 {
@@ -148,6 +159,28 @@ pub fn set_sndbuf(sock_fd: i32, bytes: usize) {
             libc::SO_SNDBUF,
             &v as *const libc::c_int as *const libc::c_void,
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
+
+/// Linux `TCP_NOTSENT_LOWAT`：限制内核中"未发送字节"的低水位。
+///
+/// 调小（如 128KB）会让内核更积极地把数据推出去，减少"sndbuf 里堆着一大坨、
+/// 但对方迟迟收不到"的情况，对超长传输的平滑度有帮助。
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+pub fn set_notsent_lowat(sock_fd: i32, bytes: u32) {
+    if sock_fd <= 0 || bytes == 0 {
+        return;
+    }
+    let v: libc::c_uint = bytes;
+    unsafe {
+        libc::setsockopt(
+            sock_fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_NOTSENT_LOWAT,
+            &v as *const libc::c_uint as *const libc::c_void,
+            std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
         );
     }
 }
