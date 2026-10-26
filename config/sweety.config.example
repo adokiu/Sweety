@@ -111,6 +111,13 @@ log_level = "info"
 # Higher values benefit CDN nodes or multi-site deployments
 # Equivalent to Nginx: open_file_cache max=N
 open_file_cache_max = 200000
+# Interval (seconds) between stat() validations of a cached file.
+# Equivalent to Nginx: open_file_cache_valid (default 60)
+# open_file_cache_valid = 60
+#
+# Max blocking threads per worker (default 16). Nginx uses no extra blocking
+# threads; a large value causes thread churn under load.
+# worker_max_blocking_threads = 16
 
 # Inactivity timeout for cached entries (seconds)
 # Entries not accessed within this period are eligible for eviction
